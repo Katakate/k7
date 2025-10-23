@@ -164,6 +164,11 @@ Current task: Reminder about logging out and back in for group changes
 
 Optionally pass `-v` for a verbose output.
 
+> It will also tell you which raw disk was auto-selected for the LVM thin-pool. If you prefer, specify the disk explicitly:
+> ```bash
+> k7 install --disk /dev/nvme2n1
+> ```
+
 This will install and most importantly connect together the following components:
 - Kubernetes (K3s prod-ready distribution)
 - Kata (for container virtualization)

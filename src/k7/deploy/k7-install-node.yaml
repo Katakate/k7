@@ -523,6 +523,74 @@
                       | regex_replace('p?[0-9]+$','') }}"
       tags: ['lvm']
 
+    - name: Use provided disk override (if any)
+      set_fact:
+        requested_disk: "{{ k7_disk | default('') }}"
+      tags: ['lvm']
+
+    - name: Normalize requested disk path
+      set_fact:
+        requested_disk_basename: "{{ requested_disk | regex_replace('^/dev/', '') }}"
+        requested_disk_path: "/dev/{{ requested_disk | regex_replace('^/dev/', '') }}"
+      when: requested_disk != ''
+      tags: ['lvm']
+
+    - name: Validate requested disk exists and is a block device
+      stat:
+        path: "{{ requested_disk_path }}"
+      register: requested_disk_stat
+      when: requested_disk != ''
+      tags: ['lvm']
+
+    - name: Fail if requested disk not present or not a block device
+      fail:
+        msg: "Specified k7_disk '{{ requested_disk_path }}' does not exist or is not a block device"
+      when: requested_disk != '' and (not requested_disk_stat.stat.exists or not requested_disk_stat.stat.isblk)
+      tags: ['lvm']
+
+    - name: Ensure requested disk is a whole disk (not a partition)
+      command: lsblk -dn -o TYPE "{{ requested_disk_path }}"
+      register: lsblk_type
+      changed_when: false
+      when: requested_disk != ''
+      tags: ['lvm']
+
+    - name: Fail if requested disk is not a whole disk
+      fail:
+        msg: "Specified k7_disk '{{ requested_disk_path }}' is not a whole disk (TYPE={{ lsblk_type.stdout | trim }})"
+      when: requested_disk != '' and (lsblk_type.stdout is not defined or (lsblk_type.stdout | trim) != 'disk')
+      tags: ['lvm']
+
+    - name: Pull ansible facts for requested disk
+      set_fact:
+        requested_disk_facts: "{{ ansible_devices.get(requested_disk_basename) | default(None) }}"
+      when: requested_disk != ''
+      tags: ['lvm']
+
+    - name: Fail if requested disk not found in ansible_devices
+      fail:
+        msg: "Device '{{ requested_disk_path }}' not visible in ansible_devices facts"
+      when: requested_disk != '' and (requested_disk_facts is not defined or requested_disk_facts is none)
+      tags: ['lvm']
+
+    - name: Fail if requested disk has partitions
+      fail:
+        msg: "Device '{{ requested_disk_path }}' has partitions; wipe it with utils/wipe-disk.sh or choose another disk"
+      when: requested_disk != '' and (requested_disk_facts.partitions is defined and (requested_disk_facts.partitions | length) > 0)
+      tags: ['lvm']
+
+    - name: Fail if requested disk appears to be the root disk
+      fail:
+        msg: "Device '{{ requested_disk_path }}' appears to be the root disk; choose a different disk"
+      when: requested_disk != '' and (requested_disk_basename == (root_disk | basename))
+      tags: ['lvm']
+
+    - name: Use requested disk as kata_block
+      set_fact:
+        kata_block: "{{ requested_disk_path }}"
+      when: requested_disk != ''
+      tags: ['lvm']
+
     - name: Find an empty secondary disk (skip loop, mapper, CD-ROM, zram, etc.)
       set_fact:
         kata_block: >-
@@ -541,9 +609,13 @@
             | map('regex_replace', '^', '/dev/')
             | first | default('')
           }}
+      when: requested_disk == ''
       tags: ['lvm']
 
-
+    - name: Show selected disk for LVM thin-pool
+      debug:
+        msg: "Using disk for K7 LVM thin-pool: {{ kata_block }} {{ '(user-specified)' if requested_disk != '' else '(auto-detected)' }}"
+      tags: ['lvm']
 
     - name: Fail if no spare block device is available
       fail:
@@ -551,7 +623,7 @@
           No empty secondary disk found.  
           K7 expects a dedicated data drive for the LVM thin-pool.
           Attach an extra NVMe/SSD (e.g. /dev/nvme2n1) and re-run the playbook.
-      when: kata_block == ''
+      when: requested_disk == '' and kata_block == ''
       tags: ['lvm']
     # ──── END spare-disk check ────
 

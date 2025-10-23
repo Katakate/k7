@@ -278,6 +278,7 @@ class K7Core:
         verbose: bool = False,
         progress_callback: Optional[Callable[[Dict], None]] = None,
         stream_output: bool = False,
+        extra_vars: Optional[Dict] = None,
     ) -> OperationResult:
         """Install K7 on target nodes using Ansible."""
         try:
@@ -304,6 +305,16 @@ class K7Core:
                 )
                 inventory_path = inventory_file.name
 
+            # If any Ansible extra-vars are provided, write them to a temp file and pass via -e @file
+            extra_vars_path: Optional[str] = None
+            if extra_vars:
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as evf:
+                        yaml.safe_dump(extra_vars, evf, default_flow_style=False)
+                        extra_vars_path = evf.name
+                except Exception:
+                    extra_vars_path = None
+
             total_tasks = self._count_playbook_tasks(playbook_content)
             if progress_callback:
                 try:
@@ -312,6 +323,8 @@ class K7Core:
                     pass
 
             cmd = ["ansible-playbook", "-i", inventory_path, playbook_path]
+            if extra_vars_path:
+                cmd += ["-e", f"@{extra_vars_path}"]
             if verbose:
                 cmd.append("-v")
 
@@ -365,6 +378,11 @@ class K7Core:
                     pass
                 try:
                     os.unlink(inventory_path)
+                except Exception:
+                    pass
+                try:
+                    if extra_vars_path:
+                        os.unlink(extra_vars_path)
                 except Exception:
                     pass
 
