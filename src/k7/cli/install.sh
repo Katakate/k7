@@ -5,7 +5,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-PKG=$(ls -1t dist/k7_*_amd64.deb 2>/dev/null | head -n1 || true)
+# Detect architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64)
+    DEB_ARCH="amd64"
+    ;;
+  aarch64|arm64)
+    DEB_ARCH="arm64"
+    ;;
+  *)
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+    ;;
+esac
+
+PKG=$(ls -1t dist/k7_*_${DEB_ARCH}.deb 2>/dev/null | head -n1 || true)
 BIN="dist/k7"
 
 # Check if uninstall was requested

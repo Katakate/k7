@@ -5,6 +5,11 @@
   vars:
     target_user: "{{ ansible_user }}"
     helm_version: "v3.15.2"
+    # Map ansible_architecture to Debian/Kata arch format
+    arch_map:
+      x86_64: amd64
+      aarch64: arm64
+    deb_arch: "{{ arch_map[ansible_architecture] | default(ansible_architecture) }}"
 
   tasks:
     - name: Gather facts (ensures ansible_distribution_release is available)
@@ -346,26 +351,26 @@
       shell: |
         KATA_VERSION=$(curl -sSL https://api.github.com/repos/kata-containers/kata-containers/releases/latest | jq -r .tag_name)
         mkdir -p /opt/kata
-        
+
         # Try .tar.zst first (newer format)
-        TARBALL_ZST="kata-static-${KATA_VERSION}-amd64.tar.zst"
+        TARBALL_ZST="kata-static-${KATA_VERSION}-{{ deb_arch }}.tar.zst"
         URL_ZST="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/${TARBALL_ZST}"
-        
+
         if curl -fsSL "$URL_ZST" -o "/tmp/$TARBALL_ZST" 2>/dev/null; then
           echo "Downloaded $TARBALL_ZST, extracting with zstd..."
           if command -v zstd >/dev/null 2>&1; then
-            zstd -d "/tmp/$TARBALL_ZST" -o "/tmp/kata-static-${KATA_VERSION}-amd64.tar"
-            tar -xvf "/tmp/kata-static-${KATA_VERSION}-amd64.tar" -C /
+            zstd -d "/tmp/$TARBALL_ZST" -o "/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar"
+            tar -xvf "/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar" -C /
           else
             echo "Installing zstd..."
             apt-get update && apt-get install -y zstd
-            zstd -d "/tmp/$TARBALL_ZST" -o "/tmp/kata-static-${KATA_VERSION}-amd64.tar"
-            tar -xvf "/tmp/kata-static-${KATA_VERSION}-amd64.tar" -C /
+            zstd -d "/tmp/$TARBALL_ZST" -o "/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar"
+            tar -xvf "/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar" -C /
           fi
         else
           # Fallback to .tar.xz (older format)
           echo "Trying fallback to .tar.xz format..."
-          TARBALL_XZ="kata-static-${KATA_VERSION}-amd64.tar.xz"
+          TARBALL_XZ="kata-static-${KATA_VERSION}-{{ deb_arch }}.tar.xz"
           URL_XZ="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/${TARBALL_XZ}"
           curl -fsSL "$URL_XZ" -o "/tmp/$TARBALL_XZ"
           tar -xvf "/tmp/$TARBALL_XZ" -C /

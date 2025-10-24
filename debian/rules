@@ -14,8 +14,8 @@ override_dh_auto_build:
 	else \
 		if command -v docker >/dev/null 2>&1; then \
 			echo "Building k7 binary via Docker (src/k7/cli/Dockerfile.cli)..."; \
-			docker build --platform=linux/amd64 -t k7-cli-builder -f src/k7/cli/Dockerfile.cli .; \
-			cid=$$(docker create --platform=linux/amd64 k7-cli-builder); \
+			docker build -t k7-cli-builder -f src/k7/cli/Dockerfile.cli .; \
+			cid=$$(docker create k7-cli-builder); \
 			docker cp "$$cid":/app/k7.bin ./dist/k7 || docker cp "$$cid":/app/k7.cli.bin ./dist/k7; \
 			docker rm -v "$$cid" >/dev/null; \
 			chmod 0755 dist/k7; \

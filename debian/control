@@ -18,7 +18,7 @@ Homepage: https://katakate.org
 Rules-Requires-Root: no
 
 Package: k7
-Architecture: amd64
+Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Recommends: docker.io, docker-compose-plugin, kubectl | k3s, ansible
 Description: K7 CLI for sandbox management
