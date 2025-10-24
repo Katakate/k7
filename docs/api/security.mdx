@@ -90,8 +90,8 @@ Use `egress_whitelist` to control outbound traffic. The policy is applied after 
 
 Behavior:
 - Omit `egress_whitelist`: egress open (external internet allowed).
-- `[]`: full egress block (DNS to CoreDNS allowed on TCP/UDP 53).
-- `["CIDR", ...]`: allow only listed CIDR blocks (+ DNS to CoreDNS).
+- `[]`: full egress block (no DNS resolution; no outbound IPs).
+- `["CIDR", ...]`: allow only listed CIDR blocks; DNS is blocked.
 
 Examples:
 
@@ -105,20 +105,30 @@ Partial isolation (no inter-VM communication, but external internet allowed):
 { "name": "partial-isolation", "image": "alpine:latest" }
 ```
 
-Whitelist specific external services:
+Whitelist specific external services (avoid public DNS resolvers):
 ```json
 {
   "name": "egress-restricted",
   "image": "alpine:latest",
-  "egress_whitelist": ["1.1.1.1/32", "8.8.8.8/32"]
+  "egress_whitelist": ["10.0.0.5/32"]
 }
 ```
 
 <Info>
 **Network Policy Details:**
 - **Ingress**: Blocked by default (inter-VM isolation) - system services and kubectl exec still work
-- **DNS allowance**: When locking down egress, DNS to CoreDNS inside the cluster is always allowed
+- **DNS**: When egress is locked down, DNS resolution is blocked by default (no CoreDNS exception)
 - **Administrative access**: `kubectl exec`, `k7 shell`, and API operations bypass network policies
 </Info>
+
+<Warning>
+Do not whitelist public DNS resolver IPs (e.g., 1.1.1.1, 8.8.8.8). Because K7's `egress_whitelist` is CIDR-only (no L7/port rules), allowing those IPs enables outbound DNS (UDP/TCP 53) and DNS-over-HTTPS (443), which can be used for exfiltration. If you want an egress deny with whitelisting, prefer whitelisting only your own egress proxy/gateway IP and enforce DNS/DoH policy at that proxy. Later, whenever we integrate Cilium (a roadmap feature), it will be much simpler as you'll be able to whitelist domain names directly.
+</Warning>
+
+### Mitigations when DNS is blocked
+
+- Use IP/CIDR whitelisting only (no domains post-lockdown)
+- Pre-resolve/fetch in `before_script` (runs before lockdown with open egress)
+- If you must allow DNS temporarily, consider an operational override at cluster level (not provided by K7 config)
 
 

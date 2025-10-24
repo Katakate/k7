@@ -190,10 +190,9 @@ name: my-sandbox-123
 image: alpine:latest
 namespace: default
 
-# Optional: restrict egress
+# Optional: restrict egress (safe pattern: whitelist only your own egress proxy IP)
 egress_whitelist:
-  - "1.1.1.1/32"      # Cloudflare DNS
-  - "8.8.8.8/32"      # Google DNS
+  - "10.0.0.5/32"     # Your private egress proxy/gateway
 
 # Optional: resource limits
 limits:
@@ -387,7 +386,7 @@ K7 sandboxes are hardened by default with multiple layers of security:
 - **Network policies**: Complete network isolation for VM sandboxes
   - **Ingress isolation**: All inter-VM communication is blocked by default to prevent sandbox-to-sandbox access
   - **Egress lockdown**: Control outbound traffic with CIDR-based restrictions using Kubernetes NetworkPolicies
-  - DNS to CoreDNS always allowed when egress is locked down
+  - **DNS is blocked** when egress is locked down; only IPs/CIDRs in `egress_whitelist` are reachable
   - Administrative access via `kubectl exec` and `k7 shell` is preserved (uses Kubernetes API, not pod networking)
   - Soon to come: Cilium integration for domain name whitelisting
 

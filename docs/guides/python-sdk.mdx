@@ -22,7 +22,7 @@ sb = k7.create({
     "image": "alpine:latest",
     # optional: "namespace": "default",
     # optional: "env_file": ".env",
-    # optional: "egress_whitelist": ["1.1.1.1/32", "8.8.8.8/32"],
+    # optional: "egress_whitelist": ["10.0.0.5/32"],  # private egress proxy
     # optional: "limits": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "2Gi"},
     # optional: "before_script": "apk add curl"
 })
@@ -67,11 +67,10 @@ sb = k7.create({
 
     # Network egress control
     #   - Omit key to keep egress open
-    #   - [] blocks all egress (DNS to CoreDNS still allowed)
-    #   - [CIDRs] allows only those CIDRs (+ DNS)
+    #   - [] blocks all egress (DNS blocked)
+    #   - [CIDRs] allows only those CIDRs (DNS still blocked)
     "egress_whitelist": [
-        "1.1.1.1/32",
-        "8.8.8.8/32",
+        "10.0.0.5/32",   # private egress proxy
         "203.0.113.0/24"
     ],
 

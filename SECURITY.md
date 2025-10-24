@@ -22,7 +22,7 @@ We aim to acknowledge reports within 72 hours and provide a remediation plan or 
 
 - Nodes run K3s + Kata + Firecracker; containers run as non-root with restricted capabilities.
 - API uses API keys with hashed storage and expiry; file-backed by default.
-- Egress network restrictions via Kubernetes NetworkPolicies (IP-based whitelists). DNS to kube-dns is allowed for name resolution only.
+- Egress network restrictions via Kubernetes NetworkPolicies (IP-based whitelists). When egress lockdown is enabled, DNS resolution is blocked by default.
 - All ingress network blocked by default to avoid default K8s pod to pod communications; this doesn't affect kubectl exec / k7 shell into sandboxes which are based on the k8s API. 
 
 Known limitations (pre-0.1.0):

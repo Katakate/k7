@@ -631,24 +631,7 @@ class K7Core:
                         )
                     )
 
-                # Always allow DNS to CoreDNS (kube-dns) inside the cluster when locking egress
-                dns_allow_peer = client.V1NetworkPolicyPeer(
-                    namespace_selector=client.V1LabelSelector(
-                        match_labels={"kubernetes.io/metadata.name": "kube-system"}
-                    ),
-                    pod_selector=client.V1LabelSelector(
-                        match_labels={"k8s-app": "kube-dns"}
-                    ),
-                )
-                egress_rules.append(
-                    client.V1NetworkPolicyEgressRule(
-                        to=[dns_allow_peer],
-                        ports=[
-                            client.V1NetworkPolicyPort(protocol="UDP", port=53),
-                            client.V1NetworkPolicyPort(protocol="TCP", port=53),
-                        ],
-                    )
-                )
+                
 
                 network_policy = client.V1NetworkPolicy(
                     metadata=client.V1ObjectMeta(

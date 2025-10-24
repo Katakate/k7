@@ -32,14 +32,14 @@ Body example:
 }
 ```
 
-Body example with egress whitelist:
+Body example with egress whitelist (safe pattern: proxy IP only):
 
 ```json
 {
   "name": "my-restricted-sandbox",
   "image": "alpine:latest",
   "namespace": "default",
-  "egress_whitelist": ["1.1.1.1/32", "8.8.8.8/32"],
+  "egress_whitelist": ["10.0.0.5/32"],
   "limits": {"cpu": "500m", "memory": "512Mi"}
 }
 ```
