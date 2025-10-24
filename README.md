@@ -185,10 +185,9 @@ name: my-sandbox-123
 image: alpine:latest
 namespace: default
 
-# Optional: restrict egress
+# Optional: restrict egress (safe pattern: whitelist only your own egress proxy IP)
 egress_whitelist:
-  - "1.1.1.1/32"      # Cloudflare DNS
-  - "8.8.8.8/32"      # Google DNS
+  - "10.0.0.5/32"     # Your private egress proxy/gateway
 
 # Optional: resource limits
 limits:

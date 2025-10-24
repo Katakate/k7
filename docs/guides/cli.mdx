@@ -32,7 +32,7 @@ k7 create -f k7.yaml
 # or
 k7 create --name my-sb --image alpine:latest \
   --cpu 1 --memory 1Gi --storage 2Gi \
-  --env-file .env --egress 1.1.1.1/32 --egress 8.8.8.8/32 \
+  --env-file .env --egress 10.0.0.5/32 \
   --before-script "apk add curl"
 ```
 
@@ -63,8 +63,7 @@ name: project-build
 image: alpine:latest
 namespace: default
 egress_whitelist:
-  - "1.1.1.1/32"      # Cloudflare DNS
-  - "8.8.8.8/32"      # Google DNS
+  - "10.0.0.5/32"      # Private egress proxy/gateway
 limits:
   cpu: "1"
   memory: "1Gi"
@@ -81,6 +80,8 @@ cap_add:
 ```
 
 <Warning>
+Do not whitelist public DNS resolvers (e.g., 1.1.1.1, 8.8.8.8). Doing so re-enables DNS exfiltration (UDP/TCP 53 and DoH over 443). Prefer whitelisting only your own egress proxy IP and enforce DNS/DoH policies at the proxy.
+
 If using package managers that require root (e.g., `apk add`, `apt-get install`) in `before_script` make sure you didn't add security policies that prevent it such as running the pod or container as non-root. Check Security & Networking section in the API reference for more.
 </Warning>
 
