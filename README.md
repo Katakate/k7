@@ -109,7 +109,7 @@ We provide a:
 
 ### For the node(s)
 
-- Ubuntu (amd64) host.
+- Ubuntu (amd64 or arm64) host.
 - Hardware virtualization (KVM) available and accessible
   - Check: `ls /dev/kvm` should exist.
   - This is typically available on your own Linux machine.
@@ -117,7 +117,7 @@ We provide a:
     - Hetzner (the only one I tested so far)  yes for their `Robot` instances only, i.e. "dedicated": robot.hetzner.com. 
     - AWS: only `.metal` EC2 instances. 
     - GCP: virtualization friendly, most instances, with `--enable-nested-virtualization` flag.
-    - Azure: Dv3, Ev3, Dv4, Ev4, Dv5, Ev5. Must be Intel/AMD x86, not ARM.
+    - Azure: Dv3, Ev3, Dv4, Ev4, Dv5, Ev5 (Intel/AMD x86) or Dpdsv5, Dpldsv5, Epsv5 (ARM64).
     - DigitalOcean: Premium Intel and AMD droplets with nested virtualization enabled.
     - Others: in general, hardware virtualization is not exposed on cloud VPS, so you'll likely want a dedicated / bare metal.
 - One raw disk (unformatted, unpartitioned) for the thin-pool that k7 will provision for efficient disk usage of sandboxes.
@@ -134,7 +134,7 @@ We provide a:
   ```
 
 Already tested setups:
-  - Hetzner Robot instance with Ubuntu 24.04, x86_64 arch, booked with 1 extra empty disk `nvme2n1` for the thin-pool provisioning. See the setup guide (PDF): [tutorials/k7_hetzner_node_setup.pdf](tutorials/k7_hetzner_node_setup.pdf).
+  - Hetzner Robot instance with Ubuntu 24.04, x86_64 or ARM64 arch, booked with 1 extra empty disk `nvme2n1` for the thin-pool provisioning. See the setup guide (PDF): [tutorials/k7_hetzner_node_setup.pdf](tutorials/k7_hetzner_node_setup.pdf).
 
 ### For the client
 
@@ -400,7 +400,7 @@ More security features are currently on the roadmap, including integrating AppAr
 - Root packaging targets the `katakate` SDK only; assets under `src/k7/` are not part of the PyPI distribution.
 - `MANIFEST.in` (for the `katakate` SDK) should include essentials like `LICENSE` and `README.md` only; deploy assets from `src/k7/deploy/*` belong to the Debian/CLI packaging flow, not to the PyPI package.
 - `setup.py` for `katakate` lives at repo root; packages from `src/`.
-- The CLI Debian package is built via `src/k7/cli/build.sh` and produces `dist/k7_<version>_amd64.deb`.
+- The CLI Debian package is built via `src/k7/cli/build.sh` and produces `dist/k7_<version>_amd64.deb` and `dist/k7_<version>_arm64.deb`.
 - CI (tags `v*`) can publish the PyPI SDK and upload the `.deb` artifact.
 
 

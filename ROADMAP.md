@@ -9,11 +9,11 @@ It helps contributors and users understand where the project is heading.
 
 Core stability and foundational runtime improvements.
 
-- [ ] Add `--disk` argument to `k7 install` to specify external disk path explicitly for thin pool provisioning, and test it  
-- [ ] Test if removing DNS resolution completely doesn't break functionality (to protect against DNS exfiltration)
-- [ ] Add pause/resume support for sandboxes 
+- [x] Add `--disk` argument to `k7 install` to specify external disk path explicitly for thin pool provisioning, and test it (merged PR #5)  
+- [x] Test if removing DNS resolution completely doesn't break functionality (to protect against DNS exfiltration) (merged PR #6)
+- [ ] Add pause/resume/fork/clone support for sandboxes 
 - [ ] Fix jailer functionality (known issue)
-- [ ] Add multi-node support (currently single K3s node supported) 
+- [ ] Add multi-node support (currently single K3s node supported)
 
 
 
@@ -23,10 +23,11 @@ Core stability and foundational runtime improvements.
 
 Broader compatibility and container integration.
 
-- [ ] Add ARM support for Linux Debian  
+- [x] Add ARM support for Linux Debian (merged PR #4, big thanks to @spullara)
 - [ ] Add Docker build / run / compose capabilities in VM sandboxes (major feature!)
 - [ ] Integrate Cilium networking  
 - [ ] Implement Docker pull deny/whitelist  
+
 
 ---
 
@@ -35,6 +36,7 @@ Broader compatibility and container integration.
 Cross-platform support and continuous delivery.
 
 - [ ] Add QEMU support (macOS ARM, GPU support)  
+- [ ] Cross-node mobility of snapshots (dependent on multi-node + sandbox snapshot/resume/fork features)
 - [ ] Add AppArmor integration  
 - [ ] Add CI/CD and deployment tests  
 
