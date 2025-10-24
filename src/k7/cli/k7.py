@@ -184,6 +184,11 @@ def install(
     inventory: Optional[str] = typer.Option(
         None, "-i", "--inventory", help="Path to custom Ansible inventory"
     ),
+    disk: Optional[str] = typer.Option(
+        None,
+        "--disk",
+        help="Block device to use for LVM thin-pool (e.g., /dev/nvme2n1)",
+    ),
     verbose: bool = typer.Option(
         False, "-v", "--verbose", help="Enable verbose output"
     ),
@@ -269,12 +274,14 @@ def install(
                 pass
 
         # Kick off install and update UI as lines arrive
+        extra_vars = {"k7_disk": disk} if disk else None
         result = core.install_node(
             playbook_content,
             inventory_content,
             verbose,
             progress_callback=on_progress,
             stream_output=verbose,  # only print full ansible output when -v is used
+            extra_vars=extra_vars,
         )
 
         # Final update to 100% if succeeded; otherwise leave as-is and show error
