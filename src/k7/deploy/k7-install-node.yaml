@@ -301,6 +301,7 @@
       loop: "{{ firecracker_binaries.files }}"
       when: >
         'firecracker' in item.path and
+        not item.path.endswith('.debug') and
         lookup('pipe', 'file ' ~ item.path) is search('ELF .* executable')
 
     - name: Find jailer binary
@@ -319,6 +320,7 @@
       loop: "{{ jailer_binaries.files }}"
       when: >
         'jailer' in item.path and
+        not item.path.endswith('.debug') and
         lookup('pipe', 'file ' ~ item.path) is search('ELF .* executable')
 
     - name: Remove bundled Firecracker & jailer
