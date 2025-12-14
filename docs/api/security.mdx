@@ -72,6 +72,59 @@ Override drop policy (not recommended unless you know why):
 }
 ```
 
+### Common capability requirements
+
+When you encounter permission errors in `before_script` or during container execution, you may need to add specific capabilities. Here are common use cases:
+
+**Package managers (apt-get, yum, dnf):**
+```json
+{
+  "name": "install-packages",
+  "image": "ubuntu:22.04",
+  "cap_add": ["SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE"],
+  "before_script": "apt-get update && apt-get install -y git curl"
+}
+```
+- `SETUID`/`SETGID`: Required for package managers to drop privileges during installation
+- `CHOWN`: Needed for changing file ownership during package installation
+- `DAC_OVERRIDE`: Allows bypassing file permission checks (needed for installing packages)
+
+**Alpine package manager (apk):**
+```json
+{
+  "name": "alpine-packages",
+  "image": "alpine:latest",
+  "cap_add": ["SETUID", "SETGID", "CHOWN"],
+  "before_script": "apk add --no-cache git curl"
+}
+```
+
+**File operations requiring ownership changes:**
+```json
+{
+  "name": "file-ops",
+  "image": "alpine:latest",
+  "cap_add": ["CHOWN", "FOWNER"],
+  "before_script": "chown -R user:group /some/path"
+}
+```
+
+**Network operations (raw sockets, packet capture):**
+```json
+{
+  "name": "network-tools",
+  "image": "alpine:latest",
+  "cap_add": ["NET_RAW", "NET_ADMIN"]
+}
+```
+<Warning>
+Adding `NET_RAW` or `NET_ADMIN` significantly reduces isolation. Only use when absolutely necessary for network debugging or specialized tools.
+</Warning>
+
+<Info>
+**Best practice**: Pre-build custom images with dependencies installed rather than installing packages at runtime. This improves security, reproducibility, and startup time.
+</Info>
+
 ## Network isolation and egress lockdown
 
 ### Ingress isolation (Default: Enabled)
