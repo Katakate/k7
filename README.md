@@ -4,6 +4,7 @@
   </span>
 </p>
 
+
 <p align="center" style="font-weight: bold; font-size: 20px; ">
   Self-hosted secure VM sandboxes for AI compute at scale
 </p>
@@ -20,13 +21,16 @@
 
 <p align="center">
   <a href="https://news.ycombinator.com/item?id=45656952">
-    <img src="https://img.shields.io/badge/Show%20HN-%231%20🔥-orange" alt="Show HN #1">
+    <img src="https://img.shields.io/badge/Show%20HN-%231%20🔥-FF6600" alt="Show HN #1">
   </a>
   <a href="assets/show-hn_nb1_post-id-45656952.png" title="Screenshot proof">📸</a>
   <a href="https://console.dev">
-    <img src="https://img.shields.io/badge/Featured%20on-Console.dev-blue" alt="Featured on Console.dev">
+    <img src="https://img.shields.io/badge/Featured-Console.dev-4F39F5" alt="Featured on Console.dev">
   </a>
   <a href="assets/k7-console-dev.png" title="Screenshot proof">📸</a>
+  <a href="https://changelog.com/news/169">
+    <img src="https://img.shields.io/badge/Featured-Changelog-59B287" alt="Featured on Changelog">
+  </a>
   <a href="https://www.youtube.com/watch?v=2tgqzZvmbak">
     <img src="https://img.shields.io/badge/GitHub%20Trending-Oct%2023%2C%202025-black?logo=github" alt="GitHub Trending (Oct 23, 2025)">
   </a>
@@ -334,6 +338,26 @@ sudo make uninstall
 
 Note: we recommend running `make uninstall` before reinstalling if it is not your first install, to avoid stale copies of cached files in the .deb package.
 
+### Fast development workflow
+
+For faster development iterations when working on the CLI, you can use `dev.sh` to run `k7` commands directly without rebuilding the binary:
+
+```shell
+# Basic commands
+./src/k7/cli/dev.sh install
+./src/k7/cli/dev.sh list
+./src/k7/cli/dev.sh create
+
+# Install with options
+./src/k7/cli/dev.sh install -v
+./src/k7/cli/dev.sh install --disk /dev/nvme2n1
+./src/k7/cli/dev.sh install --storage-backend longhorn
+
+# Create sandbox with options
+./src/k7/cli/dev.sh create --name test --image alpine:latest
+```
+
+This script uses `uv run` to execute the CLI with all dependencies, so you can test changes immediately without running `make build` every time. This is especially useful when iterating on CLI code changes.
 
 ### Build and run the API container
 
