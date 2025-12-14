@@ -463,12 +463,16 @@ class K7Core:
                         )
 
             # Build main container command with optional before_script that runs inside the main container
-            before_done_file = "/tmp/k7_before_done"
+            # Use sandbox name to avoid race conditions when multiple sandboxes run simultaneously
+            before_done_file = f"/tmp/k7_before_done_{config.name}"
             if config.before_script:
                 # Ensure failures halt startup; mark completion to drive readiness
+                # Since -o pipefail is not supported in all shells, we use a fallback approach
                 script_block = config.before_script.strip()
                 main_cmd = (
-                    f"set -euo pipefail; rm -f {before_done_file}; "
+                    f"(set -o pipefail) 2>/dev/null && set -o pipefail; "
+                    f"set -eu; "
+                    f"rm -f {before_done_file}; "
                     f"{script_block}; "
                     f"touch {before_done_file}; exec sleep 365d"
                 )
