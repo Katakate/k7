@@ -351,7 +351,7 @@ For faster development iterations when working on the CLI, you can use `dev.sh` 
 # Install with options
 ./src/k7/cli/dev.sh install -v
 ./src/k7/cli/dev.sh install --disk /dev/nvme2n1
-./src/k7/cli/dev.sh install --storage-backend longhorn
+
 
 # Create sandbox with options
 ./src/k7/cli/dev.sh create --name test --image alpine:latest
