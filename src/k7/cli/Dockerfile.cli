@@ -18,6 +18,7 @@ RUN python3 -m nuitka \
     --include-module=yaml \
     --include-module=rich \
     --include-module=typer \
+    --include-package=click \
     --include-module=kubernetes \
     --include-package=kubernetes_asyncio \
     --include-package=httpx \
