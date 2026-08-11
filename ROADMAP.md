@@ -1,64 +1,57 @@
-# 🗺️ Project Roadmap
+# Project Roadmap
 
-This document outlines the upcoming milestones, goals, and long-term vision for **K7**.  
-It helps contributors and users understand where the project is heading.
-
----
-
-## 🚀 Current Focus
-
-Core stability and foundational runtime improvements.
-
-- [x] Add `--disk` argument to `k7 install` to specify external disk path explicitly for thin pool provisioning, and test it (merged PR #5)  
-- [x] Test if removing DNS resolution completely doesn't break functionality (to protect against DNS exfiltration) (merged PR #6)
-- [ ] Add pause/resume/fork/clone support for sandboxes 
-- [ ] Fix jailer functionality (known issue)
-- [ ] Add multi-node support (currently single K3s node supported)
-
-
+Where **K7** is headed — for contributors and operators.
 
 ---
 
-## 🧩 Next Goals
+## Current focus
 
-Broader compatibility and container integration.
-
-- [x] Add ARM support for Linux Debian (merged PR #4, big thanks to @spullara)
-- [ ] Add Docker build / run / compose capabilities in VM sandboxes (major feature!)
-- [ ] Integrate Cilium networking  
-- [ ] Implement Docker pull deny/whitelist  
-
+Release engineering: apt/PPA, GHCR `k7-api`, and PyPI `k7-sdk`, after the
+sibling [`Katakate/k7d`](https://github.com/Katakate/k7d) v0.1.0 artifact
+exists (default install URL depends on it).
 
 ---
 
-## ⚙️ Future Work
+## Recently shipped
 
-Cross-platform support and continuous delivery.
-
-- [ ] Add QEMU support (macOS ARM, GPU support)  
-- [ ] Cross-node mobility of snapshots (dependent on multi-node + sandbox snapshot/resume/fork features)
-- [ ] Add AppArmor integration  
-- [ ] Add CI/CD and deployment tests  
-
----
-
-## 🔐 Advanced Features
-
-Security, customization, and extended runtime capabilities.
-
-- [ ] Add TEE (Trusted Execution Environment) support  
-- [ ] Add custom rootfs support (lighter, alternative images)  
+- [x] Multi-node Ansible, Longhorn topology, HA / cross-node tests
+- [x] Cilium CNI + FQDN egress
+- [x] API + SDK parity: pause / resume / fork
+- [x] Snapshot lifecycle + GC; restore from VolumeSnapshot
+- [x] CLI → API by default; `k7 api` / `k7 dev api rebuild`
+- [x] Docker-in-VM sidecar + bench harness
+- [x] Firecracker jailer
+- [x] Python SDK as **`k7-sdk`** / `k7_sdk` (`katakate` deprecated)
+- [x] `k7d` backend install path (artifact URL / local override)
 
 ---
 
-## 💬 How to Contribute
+## Next goals
 
-We welcome ideas and feedback!  
-If you'd like to suggest a feature or help with one listed above:
-1. Open a [Discussion](https://github.com/katakate/k7/discussions) or [Issue](https://github.com/katakate/k7/issues)
-2. Reference the relevant roadmap item
-3. Let's collaborate on the design or implementation
+- [ ] PPA (`apt install k7`), GHCR `k7-api`, PyPI `k7-sdk`
+- [ ] Default `k7d` install from public `Katakate/k7d` GitHub Releases
+- [ ] Optional macOS CLI artifacts (tarball / Homebrew) — after the above
 
 ---
 
-📅 *Last updated: October 2025*
+## Future work
+
+- [ ] GPU passthrough support
+- [ ] Cross-node mobility of snapshots / forks for the `k7d` backend
+  (`kql` already moves state across nodes via Longhorn)
+- [ ] AppArmor integration
+- [ ] CI/CD deployment tests on every public tag
+- [ ] TEE support; custom rootfs; persistent in-API interpreter
+
+---
+
+## How to contribute
+
+1. Open a [Discussion](https://github.com/Katakate/k7/discussions) or
+   [Issue](https://github.com/Katakate/k7/issues)
+2. Reference the roadmap item
+3. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
+
+---
+
+*Last updated: August 2026*

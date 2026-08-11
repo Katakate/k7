@@ -1,5 +1,6 @@
 include LICENSE
 include README.md
+recursive-include src/k7/deploy/manifests *.yaml
 
 # Exclude common junk
 global-exclude __pycache__ *.py[cod] *.so *.dylib *.dll .DS_Store .idea .vscode

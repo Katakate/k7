@@ -39,7 +39,7 @@ uv pip install -r requirements.txt
 uv pip install -e ../..
 
 # or from the PyPI registry:
-uv pip install katakate
+uv pip install k7-sdk
 ```
 
 ## Run

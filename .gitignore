@@ -37,6 +37,10 @@ coverage.xml
 # IDE/editor
 .vscode/
 .idea/
+editor-config/plans/
+
+# Temporary files
+tmp/
 
 # Work directories (ignore any 'work' dir at any depth)
 **/work/**
@@ -44,3 +48,14 @@ debian/prebuilt/
 
 # macOS metadata
 **/.DS_Store
+
+# Kata osbuilder (external dependency, cloned by build scripts)
+osbuilder/
+
+# Rootfs build artifacts
+kata-rootfs/
+rootfs-qemu-lh.img*
+
+# SSH keys (temporary baked key, will move to K8s Secrets)
+k7-vm-ssh-key
+k7-vm-ssh-key.pub

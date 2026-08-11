@@ -9,18 +9,35 @@ RUN uv venv /app/.venv && \
     . /app/.venv/bin/activate && \
     uv pip install --no-cache -r requirements.txt
 
+# crictl (pinned): k7d VM ops (pause/resume/fork) resolve a pod to its CRI
+# sandbox id via `crictl pods` against the node's containerd socket, which
+# the k7-api deployment hostPath-mounts (spec 18f issue 2). The node's own
+# /usr/local/bin/crictl is a k3s symlink and can't be mounted usefully.
+ARG CRICTL_VERSION=v1.31.1
+ARG CRICTL_SHA256=0a03ba6b1e4c253d63627f8d210b2ea07675a8712587e697657b236d06d7d231
+RUN curl -fsSL -o /tmp/crictl.tar.gz \
+      "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" && \
+    echo "${CRICTL_SHA256}  /tmp/crictl.tar.gz" | sha256sum -c - && \
+    tar -C /usr/local/bin -xzf /tmp/crictl.tar.gz crictl && \
+    rm /tmp/crictl.tar.gz
+
 FROM python:3.12-slim AS runtime
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app"
 WORKDIR /app
 
+# lvm2: the k7-agent DaemonSet (same image, `k7.api.agent:app`) reports the
+# kfd thin-pool utilization via `lvs` (spec 18g) — needs the privileged
+# agent container with /dev hostPath-mounted.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    lvm2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/.venv /app/.venv
 COPY --from=build /app/k7 /app/k7
+COPY --from=build /usr/local/bin/crictl /usr/local/bin/crictl
 
 RUN useradd -m -u 1000 k7user && chown -R k7user:k7user /app
 USER k7user

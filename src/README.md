@@ -1,2 +1,2 @@
-- `k7` is the .deb package containing the CLI and API, aimed to be used on the node(s), installable with `apt get`.
-- `katakate` is the PyPI package containing the Python SDK, aimed to be used remotely e.g. from local, installable with `pip install katakate`. The SDK client talks to the API deployed on the node.
+- `k7` is the Debian package containing the CLI (and embedded installer playbook), used on Linux nodes: `apt install k7`.
+- `k7-sdk` is the PyPI package (`import k7_sdk`) for the HTTP API client from your laptop or apps. The legacy `katakate` name is a one-release deprecation shim.

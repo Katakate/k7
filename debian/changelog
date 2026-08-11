@@ -1,3 +1,9 @@
+k7 (0.2.0) noble; urgency=medium
+
+  * Release 0.2.0.
+
+ -- Katakate <hi@katakate.org>  Tue, 11 Aug 2026 23:29:02 +0200
+
 k7 (0.0.3) noble; urgency=medium
 
   * Fix Docker image name to use lowercase (ghcr.io/katakate/k7-api)

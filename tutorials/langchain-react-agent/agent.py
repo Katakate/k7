@@ -13,7 +13,7 @@ from langchain.tools import Tool
 from langchain_openai import ChatOpenAI
 
 # K7 SDK
-from katakate import Client, SandboxProxy
+from k7_sdk import Client, SandboxProxy
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 

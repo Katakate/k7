@@ -1,12 +1,7 @@
+<h1 align="center">k7</h1>
+
 <p align="center">
-<span style="font-family: 'Georgia', sans-serif; font-weight: bold; font-size: 48px; font-style: italic; color: #ef672b; vertical-align: middle; margin-left: 10px;">
-    KATAKATE
-  </span>
-</p>
-
-
-<p align="center" style="font-weight: bold; font-size: 20px; ">
-  Self-hosted secure VM sandboxes for AI compute at scale
+  <b>Self-hosted secure VM sandboxes for AI compute at scale</b>
 </p>
 
 
@@ -21,16 +16,13 @@
 
 <p align="center">
   <a href="https://news.ycombinator.com/item?id=45656952">
-    <img src="https://img.shields.io/badge/Show%20HN-%231%20🔥-FF6600" alt="Show HN #1">
+    <img src="https://img.shields.io/badge/Show%20HN-%231%20🔥-orange" alt="Show HN #1">
   </a>
   <a href="assets/show-hn_nb1_post-id-45656952.png" title="Screenshot proof">📸</a>
   <a href="https://console.dev">
-    <img src="https://img.shields.io/badge/Featured-Console.dev-4F39F5" alt="Featured on Console.dev">
+    <img src="https://img.shields.io/badge/Featured%20on-Console.dev-blue" alt="Featured on Console.dev">
   </a>
   <a href="assets/k7-console-dev.png" title="Screenshot proof">📸</a>
-  <a href="https://changelog.com/news/169">
-    <img src="https://img.shields.io/badge/Featured-Changelog-59B287" alt="Featured on Changelog">
-  </a>
   <a href="https://www.youtube.com/watch?v=2tgqzZvmbak">
     <img src="https://img.shields.io/badge/GitHub%20Trending-Oct%2023%2C%202025-black?logo=github" alt="GitHub Trending (Oct 23, 2025)">
   </a>
@@ -48,7 +40,7 @@
   </a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"></a>
   <img src="https://img.shields.io/badge/install%20with-apt-blue?logo=debian">
-  <img src="https://img.shields.io/pypi/v/katakate">
+  <img src="https://img.shields.io/pypi/v/k7-sdk">
 </p> 
 
 
@@ -61,12 +53,12 @@
 
 
 
-<i><b>Katakate</b></i> aims to make it easy to create, manage and orchestrate lightweight safe VM sandboxes for executing untrusted code, at scale. It is built on battle-tested VM isolation with Kata, Firecracker and Kubernetes. It is orignally motivated by AI agents that need to run arbitrary code at scale but it is also great for:
+<i><b>Katakate</b></i> aims to make it easy to create, manage and orchestrate lightweight safe VM sandboxes for executing untrusted code, at scale. It is built on battle-tested VM isolation with Kata, Firecracker, QEMU, Longhorn, and Kubernetes — plus Katakate's own <i><b>k7d</b></i> runtime. It is orignally motivated by AI agents that need to run arbitrary code at scale but it is also great for:
 - Custom serverless (like AWS Fargate, but yours)
 - Hardened CI/CD runners (no Docker-in-Docker risks)
 - Blockchain execution layers for AI dApps
 
-> <b>100% open‑source</b> (Apache‑2.0). For technical support, write us at: hi@katakate.org</b>
+> <b>100% open‑source</b> (Apache‑2.0). For technical support, write us at: hi@katakate.org
 
 <h3 align="left">
 The Tech Stack
@@ -75,21 +67,47 @@ The Tech Stack
 <i><b>Katakate</b></i> is built on:
 - <i><b>Kubernetes</b></i> for orchestration, with K3s which is prod-ready and a great choice for edge nodes,
 - <i><b>Kata</b></i> to encapsulate containers into light-weight virtual-machines,
-- <i><b>Firecracker</b></i> as the chosen VM, for super-fast boots, light footprints and minimal attack surface,
-- <i><b>Devmapper Snapshotter</b></i> with <i><b>thin-pool provisioning of logical volumes</b></i> for efficient use of disk space shared by dozens of VMs per node.
-
+- <i><b>Firecracker</b></i> (`kfd`) for super-fast boots, light footprints and minimal attack surface (with the jailer),
+- <i><b>Devmapper Snapshotter</b></i> with <i><b>thin-pool provisioning of logical volumes</b></i> for efficient disk use across many Firecracker VMs per node,
+- <i><b>QEMU</b></i> (`kql`) via Kata when you want a fuller VMM and durable sandbox disks,
+- <i><b>Longhorn</b></i> for replicated PVC-backed root disks on the QEMU path — named snapshots, restore, disk-only fork, and cross-node mobility,
+- <i><b>k7d</b></i> — Katakate's own microVM runtime daemon (<a href="https://github.com/Katakate/k7d">katakate/k7d</a>) with VM-level warm fork (CoW disk+memory) and in-place pause/resume.
 
 <h3 align="left">
-Coming Soon
+Sandbox backends
 </h3>
 
+`k7 install --backend <kfd|kql|k7d>` provisions one or more backends per node; `k7 create --backend …` picks one per sandbox. See [docs/BACKENDS.md](docs/BACKENDS.md) for the architecture and [PERFORMANCE.md](PERFORMANCE.md) for the full measurements (Hetzner AX41 node, medians).
 
-- 🛠️ Docker <code>build</code> / <code>run</code> / <code>compose</code> support <b><i>inside the VM sandbox</i></b>
-- 🌐 Multi-node cluster capabilities for distributed workloads
-- 🔍 Cilium FQDN-based DNS resolution to safely whitelist domains, not just IP blocks
-- ⚙️ Support other VMM such as Qemu for GPU workloads
+| | `kfd` (kata-firecracker-devmapper) | `kql` (kata-qemu-longhorn) | `k7d` |
+|---|---|---|---|
+| VMM | Firecracker (Kata) | QEMU (Kata) | k7d (custom KVM VMM) |
+| RuntimeClass | `kata` | `kata-qemu` | `k7` |
+| Sandbox storage | devmapper thin-pool (needs a spare raw disk) | Longhorn PVC (replicated, persistent) | erofs images + reflink XFS + guest tmpfs |
+| Create → Ready* | not re-measured† | 17.1s | **2.1s** |
+| Named snapshot* | — | 6.5s (Longhorn, disk-only) | — (VM snapshot trees via the k7d API) |
+| Fork → usable* | — | 46.7s (disk clone + cold boot) | **~5 ms VM CoW fork**; **~2.4 s** end-to-end via k7/k8s (pod Ready + exec) |
+| Pause / resume* | scale to 0 / 1 | 1.3s / 4.1s (disk survives) | **0.2s / 0.3s (VM frozen in place, memory survives)** |
+| Docker-in-VM sidecar | ✅ (ephemeral docker data) | ✅ (persistent docker data; fastest `docker pull`) | ✅ (VM-lifetime docker data) |
+| Cross-pod persistence | ✗ | ✅ snapshots/restore | ✗ (fork carries state instead) |
 
-📋 **See [ROADMAP.md](ROADMAP.md) for the complete feature roadmap and project priorities.**
+\* medians of 3 on one Hetzner AX41 node — methodology, ranges, and the docker-sidecar
+numbers are in [PERFORMANCE.md](PERFORMANCE.md).
+† kfd needs a spare raw disk the benchmark node didn't have; its docker-workload numbers
+are in the [PERFORMANCE.md](PERFORMANCE.md) spec-10b section.
+
+<h3 align="left">
+Also available today
+</h3>
+
+- 🛠️ Docker <code>build</code> / <code>run</code> inside VM sandboxes (docker sidecar on <b>kfd</b>, <b>kql</b>, and <b>k7d</b>; see [PERFORMANCE.md](PERFORMANCE.md))
+- ⚡ <b>Warm VM fork</b> on the k7d backend: <code>k7 fork</code> CoW-clones a running sandbox's disk <i>and memory</i> in ~5&nbsp;ms at the VMM; end-to-end through k7/Kubernetes is ~2&nbsp;s to a Ready pod
+- 🌐 Multi-node clusters (Ansible + Longhorn)
+- 🔍 Cilium CNI with FQDN egress policies
+- 📸 Pause / resume / fork / restore and <code>k7 snapshot</code> lifecycle
+- 🐍 Python SDK: <code>pip install k7-sdk</code> (<code>katakate</code> package deprecated)
+
+📋 **See [ROADMAP.md](ROADMAP.md) for upcoming work (GPU passthrough, …).**
 
 
 <p align="left" style="margin-top: 40px;  font-size: 14px;">
@@ -106,14 +124,17 @@ For usage you need:
 We provide a:
 
 - **CLI**: to use on the node(s) directly --> `apt install k7`
-- **API**: deployed on the (master) node(s) --> `k7 start-api`
-- **Python SDK**: Python client sync/async talking to API --> `pip install katakate`
+- **API**: deployed automatically by `k7 install` (toggle with `k7 api enable` / `k7 api disable`)
+- **Python SDK**: HTTP client sync/async --> `pip install k7-sdk`
 
 ## Current requirements
 
 ### For the node(s)
 
 - Ubuntu (amd64 or arm64) host.
+  - **`k7d` backend is amd64 / x86_64 only** (same ISA; Debian calls it `amd64`,
+    the release tarball is `*-x86_64-linux.tar.gz`). `kfd` and `kql` support
+    amd64 and arm64.
 - Hardware virtualization (KVM) available and accessible
   - Check: `ls /dev/kvm` should exist.
   - This is typically available on your own Linux machine.
@@ -138,11 +159,22 @@ We provide a:
   ```
 
 Already tested setups:
-  - Hetzner Robot instance with Ubuntu 24.04, x86_64 or ARM64 arch, booked with 1 extra empty disk `nvme2n1` for the thin-pool provisioning. See the setup guide (PDF): [tutorials/k7_hetzner_node_setup.pdf](tutorials/k7_hetzner_node_setup.pdf).
+  - Hetzner Robot dedicated with Ubuntu 24.04 and a **spare raw NVMe** for the `kfd` thin-pool. Dual-NVMe boxes (no third drive): install the OS on one disk only — see [tutorials/k7_hetzner_node_setup.md](tutorials/k7_hetzner_node_setup.md). (Older PDF that assumed an add-on third NVMe: [tutorials/k7_hetzner_node_setup.pdf](tutorials/k7_hetzner_node_setup.pdf).)
 
 ### For the client
 
-Just recent Python.
+Recent Python, or the **`k7`** CLI / **`k7-sdk`** from a Linux node or your laptop (API URL + key).
+
+#### Development on macOS
+
+The **`.deb` / PPA package is Linux-only** (amd64/arm64). On a MacBook:
+
+- **CLI from source:** `./src/k7/cli/dev.sh` (same commands as `k7`; uses `uv` + `PYTHONPATH=src`)
+- **API client from laptop:** set `K7_API_URL` and `K7_API_KEY`, then `dev.sh create` / `dev.sh list` (no `--core`)
+- **`k7 install`** targets Linux servers with KVM — run on the node or via SSH, not on macOS locally
+- **`pip install k7-sdk`** for Python scripts only
+
+Do not install the Ubuntu `.deb` on macOS.
 
 ## Quick Start
 
@@ -168,20 +200,20 @@ Current task: Reminder about logging out and back in for group changes
 
 Optionally pass `-v` for a verbose output.
 
-> It will also tell you which raw disk was auto-selected for the LVM thin-pool. If you prefer, specify the disk explicitly:
+> It will also tell you which raw disk was auto-selected for the LVM thin-pool. If you prefer, specify the disk explicitly (on a dual-NVMe Hetzner box this is usually the spare, e.g. `/dev/nvme1n1`):
 > ```bash
-> k7 install --disk /dev/nvme2n1
+> k7 install --disk /dev/nvme1n1
 > ```
 
-This will install and most importantly connect together the following components:
+This will install and most importantly connect together the following components (depending on `--backend`):
 - Kubernetes (K3s prod-ready distribution)
 - Kata (for container virtualization)
-- Firecracker (as Virtual Machine Manager)
-- Jailer (to secure Firecracker VMs further into a chroot)
-- devmapper snapshotter with thin-pool provisioning of logical volumes for VM efficient disk memory usage
+- Firecracker + Jailer + devmapper thin-pool (`kfd`)
+- QEMU via Kata + Longhorn PVC-backed roots (`kql`)
+- k7d daemon + `containerd-shim-k7-v1` + RuntimeClass `k7` (`k7d`)
 
 
-Careful design: config updates will not touch your existing Docker or containerd setups. We chose to use K3s' own containerd for minimal disruption. Installation may however overwrite existing installations of K3s, Kata, Firecracker, Jailer. 
+Careful design: config updates will not touch your existing Docker or containerd setups. We chose to use K3s' own containerd for minimal disruption. Installation may however overwrite existing installations of K3s, Kata, Firecracker, Jailer, QEMU/Kata config, or Longhorn. 
 
 ### CLI Usage
 
@@ -220,6 +252,9 @@ env_file: path/to/your/secrets/.env
 # Create a sandbox (uses k7.yaml in the current directory by default, but you can also pass: -f myfile.yaml)
 k7 create
 
+# Or pick a backend explicitly (kfd | kql | k7d — aliases for the full names)
+k7 create -f k7.yaml --backend k7d
+
 # List sandboxes
 k7 list
 
@@ -230,21 +265,59 @@ k7 delete my-sandbox-123
 k7 delete-all
 ```
 
+#### Fork / pause / snapshot
+
+```bash
+# Warm CoW fork (disk + memory) — source must be a k7d sandbox
+k7 create -f k7.yaml --backend k7d          # name from yaml, e.g. my-sandbox-123
+k7 exec my-sandbox-123 sh -c 'echo hi > /tmp/state.txt'
+k7 fork my-sandbox-123 branch-a
+k7 exec branch-a cat /tmp/state.txt        # inherited memory + disk
+
+# Disk-only fork (cold boot from cloned PVC) — kql / kata-qemu-longhorn
+k7 create -f k7.yaml --backend kql
+k7 fork my-sandbox-123 branch-b
+# optional: pin the Longhorn VolumeSnapshot name used for the clone
+k7 fork my-sandbox-123 branch-c --snapshot my-snap
+
+# Parallel branches from one base
+for i in $(seq 0 7); do k7 fork my-sandbox-123 exp-$i & done; wait
+
+# Pause / resume (kql keeps the PVC; k7d freezes the live VM)
+k7 pause my-sandbox-123
+k7 resume my-sandbox-123
+
+# Named disk snapshot without pausing (kql)
+k7 snapshot create my-sandbox-123 my-named-snap
+```
+
+On **k7d**, the VMM fork itself is ~5&nbsp;ms; end-to-end through Kubernetes
+to a Ready pod is ~2&nbsp;s. On **kql**, fork is a Longhorn snapshot + PVC
+clone + cold boot (~45&nbsp;s). See [PERFORMANCE.md](PERFORMANCE.md) and
+[docs/BACKENDS.md](docs/BACKENDS.md).
+
 ### API usage
 
-If you'd like to manage workloads remotely, just use the API:
+The K7 API is deployed automatically by `k7 install` as the `k7-api`
+Deployment in `kube-system`. K3s keeps it running on its own; there's no
+separate "start" step.
 
 ```shell
-# Start API server (containerized and SSL support with Cloudflared)
-k7 start-api
+# Check status + endpoint
+k7 api status
+k7 api endpoint
 
 # Generate API key
 k7 generate-api-key my-key1
+
+# Temporarily disable / re-enable
+k7 api disable
+k7 api enable
 ```
 
-Make sure your user is in the `Docker` group to be allowed to start or stop the API.
+Generating / listing / revoking keys talks to `/etc/k7/api_keys.json`, so
+those subcommands need to run on the node (typically `sudo` or `root`).
 
-As for generating / listing / revoking keys, you might need `sudo` or `root`. 
 
 ### Python SDK Usage
 
@@ -252,43 +325,51 @@ After your k7 API is up, usage is very simple.
 
 Install the Python SDK via:
 ```shell
-pip install katakate
+pip install k7-sdk
 ```
 
 Or if you want async support:
 ```shell
-pip install "katakate[async-sdk]"
+pip install "k7-sdk[async]"
 ```
+
+The legacy `katakate` PyPI name remains as a one-release shim that re-exports `k7_sdk` with a deprecation warning.
 
 Then use with:
 ```python
-from katakate import Client
+from k7_sdk import Client
 
 k7 = Client(
   endpoint='https://<your-endpoint>', 
   api_key='your-key')
 
-# Create sandbox
+# Create sandbox (pick backend: kata-firecracker-devmapper | kata-qemu-longhorn | k7d)
 sb = k7.create({
-    "name": "my-sandbox",
-    "image": "alpine:latest"
+    "name": "base",
+    "image": "alpine:latest",
+    "backend": "k7d",
 })
 
 # Execute code
-result = sb.exec('echo "Hello World"')
+result = sb.exec('echo "Hello World" > /tmp/hi.txt && cat /tmp/hi.txt')
 print(result['stdout'])
 
-# List all sandboxes
-sandboxes = k7.list()
+# Fork: k7d = warm CoW (disk + memory); kql = disk clone + cold boot
+branch = sb.fork("branch-a")
+print(branch.exec("cat /tmp/hi.txt")["stdout"])  # still there on k7d
 
-# Delete sandbox
+# Parallel exploration
+forks = [sb.fork(f"exp-{i}") for i in range(4)]
+
+# List / delete
+sandboxes = k7.list()
 sb.delete()
 ```
 
 #### Async variant
 ```python
 import asyncio
-from katakate import AsyncClient
+from k7_sdk import AsyncClient
 
 async def main():
     k7 = AsyncClient(
@@ -338,26 +419,6 @@ sudo make uninstall
 
 Note: we recommend running `make uninstall` before reinstalling if it is not your first install, to avoid stale copies of cached files in the .deb package.
 
-### Fast development workflow
-
-For faster development iterations when working on the CLI, you can use `dev.sh` to run `k7` commands directly without rebuilding the binary:
-
-```shell
-# Basic commands
-./src/k7/cli/dev.sh install
-./src/k7/cli/dev.sh list
-./src/k7/cli/dev.sh create
-
-# Install with options
-./src/k7/cli/dev.sh install -v
-./src/k7/cli/dev.sh install --disk /dev/nvme2n1
-
-
-# Create sandbox with options
-./src/k7/cli/dev.sh create --name test --image alpine:latest
-```
-
-This script uses `uv run` to execute the CLI with all dependencies, so you can test changes immediately without running `make build` every time. This is especially useful when iterating on CLI code changes.
 
 ### Build and run the API container
 
@@ -371,7 +432,7 @@ make api-run-local
 ```
 
 
-### Build the katakate Python SDK from source
+### Build the k7-sdk Python SDK from source
 
 Preferred (uv):
 
@@ -389,9 +450,10 @@ uv pip install -e .
 
 K7 sandboxes are hardened by default with multiple layers of security:
 
-- **VM isolation**: Kata Containers provide hardware-level isolation via lightweight VMs with Firecracker
-  - VMs are further restricted into a chroot using Jailer
-  - Kata's Seccomp restrictions are enabled
+- **VM isolation**: Kata Containers (Firecracker or QEMU) or the k7d RuntimeClass provide hardware-level isolation via lightweight VMs
+  - On `kfd`, Firecracker processes are further restricted into a chroot using the Jailer
+  - Kata's Seccomp restrictions are enabled on the Kata backends
+  - `kql` uses QEMU + Longhorn for durable, cross-node-mobile disks; `k7d` has its own CoW-fork isolation trade-offs (see k7d `SECURITY.md`)
 
 - **Linux capabilities**: All capabilities are dropped by default (`drop: ALL`) for defense-in-depth
   - Only explicitly add back capabilities you need via `cap_add` parameter
@@ -409,26 +471,18 @@ K7 sandboxes are hardened by default with multiple layers of security:
 
 - **Network policies**: Complete network isolation for VM sandboxes
   - **Ingress isolation**: All inter-VM communication is blocked by default to prevent sandbox-to-sandbox access
-  - **Egress lockdown**: Control outbound traffic with CIDR-based restrictions using Kubernetes NetworkPolicies
-  - **DNS is blocked** when egress is locked down; only IPs/CIDRs in `egress_whitelist` are reachable
+  - **Egress lockdown**: per-sandbox allowlists — CIDRs via Kubernetes NetworkPolicy, or **FQDN / domain** allowlists via Cilium (`CiliumNetworkPolicy`; default CNI)
+  - **DNS is blocked** when egress is locked down; only entries in `egress_whitelist` (CIDR or domain) are reachable
   - Administrative access via `kubectl exec` and `k7 shell` is preserved (uses Kubernetes API, not pod networking)
-  - Soon to come: Cilium integration for domain name whitelisting
 
-More security features are currently on the roadmap, including integrating AppArmor.
+More security features are on the roadmap (e.g. AppArmor).
 
 ## Packaging & Releases
 
 - Layout uses `src/`:
   - CLI, API, core live under `src/k7/`
-  - SDK under `src/katakate/`
-- Root packaging targets the `katakate` SDK only; assets under `src/k7/` are not part of the PyPI distribution.
-- `MANIFEST.in` (for the `katakate` SDK) should include essentials like `LICENSE` and `README.md` only; deploy assets from `src/k7/deploy/*` belong to the Debian/CLI packaging flow, not to the PyPI package.
-- `setup.py` for `katakate` lives at repo root; packages from `src/`.
+  - SDK under `src/k7_sdk/` (PyPI package `k7-sdk`; `src/katakate/` is a deprecation shim)
+- Root `setup.py` publishes the SDK; assets under `src/k7/` belong to the Debian CLI / API image, not the PyPI wheel.
+- User docs: `~/docs/k7/` (Mintlify). See `docs/README.md` in this repo.
 - The CLI Debian package is built via `src/k7/cli/build.sh` and produces `dist/k7_<version>_amd64.deb` and `dist/k7_<version>_arm64.deb`.
 - CI (tags `v*`) can publish the PyPI SDK and upload the `.deb` artifact.
-
-
-
-## Known issues
-
-- Jailer seems to be currently ignored by Kata despite being passed correctly into its configuration, and despite the Jailer process being started. The use of Kubernetes secrets could be a reason of incompatibility. This is under investigation.  

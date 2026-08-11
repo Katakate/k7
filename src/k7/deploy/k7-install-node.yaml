@@ -1,10 +1,36 @@
-
-- name: Provision Bare Metal instance for K7
-  hosts: k7_nodes
-  become: yes
+- name: Provision Bare Metal instance(s) for K7
+  hosts: k7_cluster
+  become: true
   vars:
-    target_user: "{{ ansible_user }}"
-    helm_version: "v3.15.2"
+    target_user: "{{ ansible_user | default('root') }}"
+    k7_backend_default: "kata-firecracker-devmapper"
+    snapshotter_version: "v8.4.0"
+    kata_version: "3.24.0"
+    cni_plugins_version: "v1.9.0"
+    longhorn_version: "v1.10.1"
+    firecracker_version: "v1.14.0"
+    jailer_version: "v1.14.0"
+    # k7d backend (spec 9a M11): release artifact source. Override
+    # `k7d_artifact_local_path` (path on the Ansible controller) to install
+    # from a locally built tarball instead of the GitHub release.
+    k7d_version: "0.1.0"
+    k7d_artifact_url: "https://github.com/katakate/k7d/releases/download/v{{ k7d_version }}/k7d-v{{ k7d_version }}-x86_64-linux.tar.gz"
+    k7d_artifact_local_path: ""
+    # Sparse XFS (reflink=1) loopback image backing /var/lib/k7d/disks —
+    # k7d's writable volume images live there so warm forks can CoW-clone
+    # them with FICLONE reflinks. Per-node override in the inventory:
+    # `k7d_disks_image_size=64G`. Sizing + failure modes: docs/BACKENDS.md
+    # "Disk pool sizing" (spec 18f issue 5).
+    k7d_disks_image_size: "32G"
+    # Size of the LVM physical volume carved out of the spare disk for the
+    # kfd kata-vg/thin-pool (the rest of the disk stays unused). Per-node
+    # override in the inventory: `kata_thinpool_pv_size=400G`.
+    kata_thinpool_pv_size: "100G"
+    # CNI: "cilium" (default) enables FQDN egress via CiliumNetworkPolicy.
+    # "flannel" retains K3s's bundled CNI (CIDR-only egress).
+    k7_cni_default: "cilium"
+    cilium_cli_version: "v0.19.2"
+    cilium_version: "1.19.2"
     # Map ansible_architecture to Debian/Kata arch format
     arch_map:
       x86_64: amd64
@@ -13,23 +39,99 @@
 
   tasks:
     - name: Gather facts (ensures ansible_distribution_release is available)
-      setup:
+      ansible.builtin.setup:
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Compute per-host backend set + cluster role
+    # ──────────────────────────────────────────────────────────────────────
+    - name: Compute per-host backend list (raw)
+      ansible.builtin.set_fact:
+        k7_backends_raw: >-
+          {{
+            (k7_backends.split(',') | map('trim') | reject('equalto','') | list)
+            if (k7_backends is defined and k7_backends | length > 0)
+            else ([k7_backend] if (k7_backend is defined and k7_backend | length > 0)
+                  else [k7_backend_default])
+          }}
+
+    - name: Normalize deprecated backend aliases
+      ansible.builtin.set_fact:
+        k7_backends_list: >-
+          {{
+            k7_backends_raw
+            | map('regex_replace', '^(fd|kfd|firecracker-devmapper)$', 'kata-firecracker-devmapper')
+            | map('regex_replace', '^(ql|kql|qemu-longhorn)$', 'kata-qemu-longhorn')
+            | map('regex_replace', '^k7$', 'k7d')
+            | unique
+            | list
+          }}
+
+    - name: Warn on deprecated backend names
+      ansible.builtin.debug:
+        msg: >-
+          Deprecated backend name(s) in inventory were remapped:
+          {{ k7_backends_raw }} → {{ k7_backends_list }}.
+          Prefer kata-firecracker-devmapper (kfd) / kata-qemu-longhorn (kql).
+      when: k7_backends_raw != k7_backends_list
+
+    - name: Validate backends list
+      ansible.builtin.fail:
+        msg: "Unknown backend(s) in k7_backends={{ k7_backends_list }}; allowed: kata-firecracker-devmapper, kata-qemu-longhorn, k7d"
+      when: k7_backends_list | difference(['kata-firecracker-devmapper', 'kata-qemu-longhorn', 'k7d']) | length > 0
+
+    - name: Normalize CNI selection
+      ansible.builtin.set_fact:
+        k7_cni_effective: "{{ (k7_cni | default(k7_cni_default)) | lower }}"
+
+    - name: Validate CNI selection
+      ansible.builtin.fail:
+        msg: "Unknown CNI '{{ k7_cni_effective }}'; allowed: cilium, flannel"
+      when: k7_cni_effective not in ['cilium', 'flannel']
+
+    # The Kubernetes node object is named after the machine hostname, not
+    # the Ansible inventory alias — `k7 install` (no hosts) runs against
+    # `localhost`, which is never a valid node name on a host with a real
+    # hostname. Resolve the actual node name once and use it for every
+    # `kubectl get/label node` below.
+    - name: Resolve Kubernetes node name (hostname when installing via localhost)
+      ansible.builtin.set_fact:
+        k7_k8s_node_name: >-
+          {{ ansible_hostname if inventory_hostname in ['localhost', '127.0.0.1'] else inventory_hostname }}
+
+    - name: Compute cluster role and shortcuts
+      ansible.builtin.set_fact:
+        k7_servers_group: "{{ groups['k7_servers'] | default([]) }}"
+        k7_agents_group: "{{ groups['k7_agents'] | default([]) }}"
+        k7_node_role: "{{ 'server' if inventory_hostname in (groups['k7_servers'] | default([])) else 'agent' }}"
+        k7_first_master: "{{ (groups['k7_servers'] | default([inventory_hostname]))[0] }}"
+        longhorn_replicas_effective: "{{ longhorn_replicas | default([3, ((groups['k7_cluster'] | default([inventory_hostname])) | length)] | min) }}"
+        k7_has_devmapper: "{{ 'kata-firecracker-devmapper' in k7_backends_list }}"
+        k7_has_longhorn: "{{ 'kata-qemu-longhorn' in k7_backends_list }}"
+        k7_has_k7d: "{{ 'k7d' in k7_backends_list }}"
+        k7_cni_is_cilium: "{{ k7_cni_effective == 'cilium' }}"
+
+    - name: Show node configuration
+      ansible.builtin.debug:
+        msg: >-
+          host={{ inventory_hostname }} role={{ k7_node_role }}
+          backends={{ k7_backends_list }} first_master={{ k7_first_master }}
 
     - name: Update apt cache and upgrade all packages
       ansible.builtin.apt:
-        update_cache: yes
+        update_cache: true
         upgrade: dist
-        autoremove: yes
+        autoremove: true
       tags: ['system_update']
 
-    # ---- LVM utilities (needed for pvcreate/vgcreate/lvcreate) ----
+    # ---- LVM utilities (devmapper-only) ----
     - name: Install LVM2
       ansible.builtin.apt:
         name: lvm2
         state: present
+      when: k7_has_devmapper
       tags: ['lvm']
 
-    # Section: KVM Installation
+    # Section: KVM Installation (always — both backends use KVM)
     - name: Install required KVM and support utilities
       ansible.builtin.apt:
         name:
@@ -50,7 +152,7 @@
       ansible.builtin.lineinfile:
         path: /etc/modules-load.d/k7-kvm.conf
         line: "{{ item }}"
-        create: yes
+        create: true
         mode: '0644'
       loop:
         - kvm
@@ -67,121 +169,127 @@
       changed_when: false
       tags: ['kvm']
 
-    - name: Add target user {{ target_user }} to the KVM group
+    - name: Add target user to the KVM group
       ansible.builtin.user:
         name: "{{ target_user }}"
         groups: kvm
-        append: yes
+        append: true
       tags: ['kvm']
 
     - name: Check /dev/kvm ownership
-      stat:
+      ansible.builtin.stat:
         path: /dev/kvm
       register: kvm_dev
 
     - name: Fail if /dev/kvm is not owned by kvm group
-      fail:
+      ansible.builtin.fail:
         msg: "/dev/kvm must be owned by group 'kvm'. Check system configuration."
       when:
-      - kvm_dev.stat.exists
-      - kvm_dev.stat.grp is defined
-      - kvm_dev.stat.grp != 'kvm'
+        - kvm_dev.stat.exists
+        - kvm_dev.stat.grp is defined
+        - kvm_dev.stat.grp != 'kvm'
 
     # ---------------------------------------------------------------------------------------
-    # Force iptables/ip6tables legacy backend (slaves follow automatically) (this is for k3s)
+    # Force iptables/ip6tables legacy backend (this is for k3s)
     # ---------------------------------------------------------------------------------------
-    - name: Set iptables master alternative to legacy 
-      command: update-alternatives --set iptables /usr/sbin/iptables-legacy
+    - name: Set iptables master alternative to legacy
+      ansible.builtin.command: update-alternatives --set iptables /usr/sbin/iptables-legacy
       changed_when: "'link group' in result.stdout or result.rc == 0"
       register: result
       tags: ['iptables']
-            
+
     - name: Set ip6tables master alternative to legacy
-      command: update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+      ansible.builtin.command: update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
       changed_when: "'link group' in result.stdout or result.rc == 0"
       register: result
       tags: ['iptables']
 
     - name: Ensure xt_mark module loads at boot and now
-      lineinfile:
+      ansible.builtin.lineinfile:
         path: /etc/modules-load.d/k7.conf
         line: xt_mark
-        create: yes
+        create: true
+        mode: '0644'
       notify: Load xt_mark
       tags: ['iptables']
 
     - name: Load xt_mark module now
-      command: modprobe xt_mark
-      changed_when: false        # no “changed” output on reruns
+      ansible.builtin.command: modprobe xt_mark
+      changed_when: false
       tags: ['iptables']
 
-
     # ------------------------------------------------------------------
-    # Ensure the devmapper stanza is absent before first K3s start
+    # Pre-clean stale containerd config (we always rewrite it below)
     # ------------------------------------------------------------------
     - name: Remove devmapper snapshotter block (if present) early
-      blockinfile:
+      ansible.builtin.blockinfile:
         path: /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
         marker: "# {mark} ANSIBLE MANAGED DEVMAPPER"
         state: absent
-        create: yes
+        create: true
+        mode: '0644'
       tags: ['devmapper']
 
-    # ------------------------------------------------------------------
-    # Ensure no stale rendered config.toml forces devmapper on first boot
-    # ------------------------------------------------------------------
     - name: Remove previously rendered containerd config
-      file:
+      ansible.builtin.file:
         path: /var/lib/rancher/k3s/agent/etc/containerd/config.toml
         state: absent
       tags: ['k3s']
 
+    - name: Remove stale custom Kata QEMU config (when QEMU not in backends)
+      ansible.builtin.file:
+        path: /opt/kata/share/kata-containers/configuration-qemu.toml
+        state: absent
+      when: not k7_has_longhorn
+      tags: ['kata']
+
     # ------------------------------------------------------------------
-    # Minimal CNI so containerd’s CRI plugin can start on first boot
+    # CNI bootstrap (always)
     # ------------------------------------------------------------------
     - name: Download CNI plugin tarball early
-      get_url:
-        url: https://github.com/containernetworking/plugins/releases/download/v1.3.0/cni-plugins-linux-amd64-v1.3.0.tgz
+      ansible.builtin.get_url:
+        url: https://github.com/containernetworking/plugins/releases/download/{{ cni_plugins_version }}/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz
         dest: /tmp/cni-plugins.tgz
         mode: '0644'
+        timeout: 60
+      register: cni_dl
+      retries: 5
+      delay: 10
+      until: cni_dl is success
       tags: ['cni']
 
     - name: Ensure /opt/cni/bin exists
-      file:
+      ansible.builtin.file:
         path: /opt/cni/bin
         state: directory
         mode: '0755'
       tags: ['cni']
 
     - name: Extract CNI plugins early
-      unarchive:
+      ansible.builtin.unarchive:
         src: /tmp/cni-plugins.tgz
         dest: /opt/cni/bin
-        remote_src: yes
+        remote_src: true
       tags: ['cni']
 
-    # ─── CNI bootstrap (single-file loopback) ─────────────────────────────
-
     - name: Wipe CNI conf dirs before first k3s start
-      file:
+      ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
         - /etc/cni/net.d
-        - /var/lib/rancher/k3s/agent/etc/cni/net.d   # ← just in case
-      tags: [cni]
+        - /var/lib/rancher/k3s/agent/etc/cni/net.d
+      tags: ['cni']
 
-    # Recreate the single dir that containerd will read
     - name: Re-create /etc/cni/net.d directory
-      file:
+      ansible.builtin.file:
         path: /etc/cni/net.d
         state: directory
         mode: '0755'
-      tags: [cni]
+      tags: ['cni']
 
-    # Drop exactly one minimal loop-back config
     - name: Drop loop-back CNI config
-      copy:
+      ansible.builtin.copy:
         dest: /etc/cni/net.d/99-loopback.conf
         mode: '0644'
         content: |
@@ -190,34 +298,47 @@
             "name": "loopback",
             "type": "loopback"
           }
-      tags: [cni]
+      tags: ['cni']
 
-    # NEW fix
     - name: Disable nftables FORWARD rules (they conflict with iptables)
-      shell: |
+      ansible.builtin.shell: |
         nft flush ruleset || true
         systemctl mask nftables || true
+      changed_when: false
       tags: ['network']
+
+    - name: Check if Docker is installed
+      ansible.builtin.command: docker --version  # noqa: command-instead-of-module
+      register: docker_installed
+      changed_when: false
+      failed_when: false
+      tags: ['docker']
+
+    - name: Install Docker via official convenience script
+      ansible.builtin.shell: curl -fsSL https://get.docker.com | sh  # noqa: command-instead-of-shell command-instead-of-module
+      when: docker_installed.rc != 0
+      changed_when: true
+      tags: ['docker']
 
     - name: Restart Docker to recreate iptables chains (after switching to legacy / flushing nft)
       ansible.builtin.systemd:
         name: docker
         state: restarted
-      tags: ['docker','iptables']
+      tags: ['docker', 'iptables']
 
     - name: Detect systemd-resolved resolv.conf
-      stat:
+      ansible.builtin.stat:
         path: /run/systemd/resolve/resolv.conf
       register: resolved_resolv
       tags: ['dns']
 
     - name: Set k3s resolv.conf path
-      set_fact:
-        k3s_resolv_conf: "{{ resolved_resolv.stat.exists | ternary('/run/systemd/resolve/resolv.conf','/etc/resolv.conf') }}"
+      ansible.builtin.set_fact:
+        k3s_resolv_conf: "{{ resolved_resolv.stat.exists | ternary('/run/systemd/resolve/resolv.conf', '/etc/resolv.conf') }}"
       tags: ['dns']
 
     - name: Persist iptables FORWARD rules for CNI traffic
-      iptables:
+      ansible.builtin.iptables:
         chain: FORWARD
         in_interface: cni0
         jump: ACCEPT
@@ -227,7 +348,7 @@
       tags: ['network']
 
     - name: Persist iptables FORWARD rules for return CNI traffic
-      iptables:
+      ansible.builtin.iptables:
         chain: FORWARD
         out_interface: cni0
         ctstate: ESTABLISHED,RELATED
@@ -237,32 +358,121 @@
         state: present
       tags: ['network']
 
+    # ------------------------------------------------------------------
+    # K3s install (role-aware) — server-init / server-join / agent
+    # ------------------------------------------------------------------
+    - name: Compute K3s install env
+      ansible.builtin.set_fact:
+        k3s_common_exec: >-
+          --write-kubeconfig-mode 644
+          --cluster-cidr=10.42.0.0/16
+          --service-cidr=10.43.0.0/16
+          {{ '--flannel-backend=none --disable-network-policy --disable-kube-proxy' if k7_cni_is_cilium else '' }}
 
-    - name: Install K3s (but do NOT start it yet)
-      shell: |
-        curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true K3S_RESOLV_CONF={{ k3s_resolv_conf }} INSTALL_K3S_EXEC='--disable=traefik --write-kubeconfig-mode 644 --cluster-cidr=10.42.0.0/16 --service-cidr=10.43.0.0/16' sh -
+    - name: Install K3s on first master (cluster-init)  # noqa: command-instead-of-module
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_SKIP_START=true \
+          K3S_RESOLV_CONF={{ k3s_resolv_conf }} \
+          INSTALL_K3S_EXEC='server --cluster-init --disable=traefik {{ k3s_common_exec }}' \
+          sh -
       args:
         creates: /usr/local/bin/k3s
+      register: k3s_init
+      retries: 5
+      delay: 10
+      until: k3s_init is success
+      when:
+        - k7_node_role == 'server'
+        - inventory_hostname == k7_first_master
       tags: ['k3s']
 
-    # 📦 Section: Firecracker + Jailer Installation
-    - name: Get latest Firecracker release tag
-      uri:
-        url: https://api.github.com/repos/firecracker-microvm/firecracker/releases/latest
-        return_content: yes
-      register: firecracker_release_info
-      tags: ['firecracker']
+    # First-master needs to boot once so the join token exists for other masters/agents.
+    - name: Start K3s on first master to initialise cluster (one-shot)
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: true
+      when:
+        - k7_node_role == 'server'
+        - inventory_hostname == k7_first_master
+      tags: ['k3s']
 
-    - name: Set Firecracker version
-      set_fact:
-        firecracker_version: "{{ firecracker_release_info.json.tag_name }}"
-      tags: ['firecracker']
+    - name: Wait for K3s server token on first master
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/k3s/server/node-token
+        timeout: 180
+      when:
+        - k7_node_role == 'server'
+        - inventory_hostname == k7_first_master
+      tags: ['k3s']
 
+    - name: Read K3s token on first master
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_b64
+      when:
+        - k7_node_role == 'server'
+        - inventory_hostname == k7_first_master
+      tags: ['k3s']
+
+    - name: Distribute K3s token + master URL to all hosts
+      ansible.builtin.set_fact:
+        k3s_token: "{{ hostvars[k7_first_master]['k3s_token_b64']['content'] | b64decode | trim }}"
+        k3s_url: "https://{{ hostvars[k7_first_master]['ansible_host'] | default(k7_first_master) }}:6443"
+      tags: ['k3s']
+
+    - name: Install K3s on additional master nodes (server join)  # noqa: command-instead-of-module
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_SKIP_START=true \
+          K3S_TOKEN='{{ k3s_token }}' \
+          K3S_RESOLV_CONF={{ k3s_resolv_conf }} \
+          INSTALL_K3S_EXEC='server --server {{ k3s_url }} --disable=traefik {{ k3s_common_exec }}' \
+          sh -
+      args:
+        creates: /usr/local/bin/k3s
+      register: k3s_join
+      retries: 5
+      delay: 10
+      until: k3s_join is success
+      when:
+        - k7_node_role == 'server'
+        - inventory_hostname != k7_first_master
+      tags: ['k3s']
+
+    - name: Install K3s on agent nodes  # noqa: command-instead-of-module
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_SKIP_START=true \
+          K3S_URL='{{ k3s_url }}' \
+          K3S_TOKEN='{{ k3s_token }}' \
+          K3S_RESOLV_CONF={{ k3s_resolv_conf }} \
+          sh -
+      args:
+        creates: /usr/local/bin/k3s
+      register: k3s_agent
+      retries: 5
+      delay: 10
+      until: k3s_agent is success
+      when: k7_node_role == 'agent'
+      tags: ['k3s']
+
+    # Section: Firecracker + Jailer Installation (only if FD backend on this host)
     - name: Download Firecracker & Jailer binaries
-      get_url:
-        url: "https://github.com/firecracker-microvm/firecracker/releases/download/{{ firecracker_version }}/firecracker-{{ firecracker_version }}-{{ ansible_architecture }}.tgz"
-        dest: "/tmp/firecracker-{{ firecracker_version }}-{{ ansible_architecture }}.tgz"
+      vars:
+        fc_tgz: "firecracker-{{ firecracker_version }}-{{ ansible_architecture }}.tgz"
+        fc_base: "https://github.com/firecracker-microvm/firecracker/releases/download"
+      ansible.builtin.get_url:
+        url: "{{ fc_base }}/{{ firecracker_version }}/{{ fc_tgz }}"
+        dest: "/tmp/{{ fc_tgz }}"
         mode: '0644'
+        timeout: 60
+      register: fc_dl
+      retries: 5
+      delay: 10
+      until: fc_dl is success
+      when: k7_has_devmapper
       tags: ['firecracker']
 
     - name: Create firecracker bin directory
@@ -270,178 +480,325 @@
         path: /opt/firecracker
         state: directory
         mode: '0755'
+      when: k7_has_devmapper
 
     - name: Extract Firecracker release
       ansible.builtin.unarchive:
         src: "/tmp/firecracker-{{ firecracker_version }}-{{ ansible_architecture }}.tgz"
         dest: "/opt/firecracker/"
-        remote_src: yes
+        remote_src: true
         extra_opts: [--strip-components=1]
+      when: k7_has_devmapper
       tags: ['firecracker']
 
     - name: Find firecracker binary
-      find:
+      ansible.builtin.find:
         paths: /opt/firecracker
         patterns: "firecracker*"
-        recurse: no
+        recurse: false
       register: firecracker_binaries
+      when: k7_has_devmapper
 
     - name: Install `file` utility required for lookup('pipe', 'file ...')
       ansible.builtin.apt:
         name: file
         state: present
-      tags: ['utils','firecracker']
+      when: k7_has_devmapper
+      tags: ['utils', 'firecracker']
 
     - name: Copy firecracker binary to final path (only if ELF)
-      copy:
+      ansible.builtin.copy:
         src: "{{ item.path }}"
         dest: "/usr/local/bin/firecracker"
-        remote_src: yes
+        remote_src: true
         mode: '0755'
-      loop: "{{ firecracker_binaries.files }}"
-      when: >
-        'firecracker' in item.path and
-        not item.path.endswith('.debug') and
-        lookup('pipe', 'file ' ~ item.path) is search('ELF .* executable')
+      loop: "{{ firecracker_binaries.files | default([]) }}"
+      when:
+        - k7_has_devmapper
+        - "'firecracker' in item.path"
+        - not item.path.endswith('.debug')
+        - lookup('pipe', 'file ' ~ item.path) is search('ELF .* executable')
 
     - name: Find jailer binary
-      find:
+      ansible.builtin.find:
         paths: /opt/firecracker
         patterns: "jailer*"
-        recurse: no
+        recurse: false
       register: jailer_binaries
+      when: k7_has_devmapper
 
     - name: Copy jailer binary to final path (only if ELF)
-      copy:
+      ansible.builtin.copy:
         src: "{{ item.path }}"
         dest: "/usr/local/bin/jailer"
-        remote_src: yes
+        remote_src: true
         mode: '0755'
-      loop: "{{ jailer_binaries.files }}"
-      when: >
-        'jailer' in item.path and
-        not item.path.endswith('.debug') and
-        lookup('pipe', 'file ' ~ item.path) is search('ELF .* executable')
+      loop: "{{ jailer_binaries.files | default([]) }}"
+      when:
+        - k7_has_devmapper
+        - "'jailer' in item.path"
+        - not item.path.endswith('.debug')
+        - lookup('pipe', 'file ' ~ item.path) is search('ELF .* executable')
 
     - name: Remove bundled Firecracker & jailer
-      file:
+      ansible.builtin.file:
         path: "/opt/kata/bin/{{ item }}"
         state: absent
       loop: [firecracker, jailer]
-      tags: ['kata','cleanup','firecracker','jailer']
+      when: k7_has_devmapper
+      tags: ['kata', 'cleanup', 'firecracker', 'jailer']
 
     - name: Ensure jailer is set‑uid root
-      file:
+      ansible.builtin.file:
         path: /usr/local/bin/jailer
         mode: '4755'
         owner: root
         group: root
-      tags: ['kata','firecracker','jailer']
+      when: k7_has_devmapper
+      tags: ['kata', 'firecracker', 'jailer']
 
     - name: Check Firecracker version
-      command: /usr/local/bin/firecracker --version
+      ansible.builtin.command: /usr/local/bin/firecracker --version
       changed_when: false
+      when: k7_has_devmapper
       tags: ['firecracker']
 
     - name: Check Jailer version
-      command: /usr/local/bin/jailer --version
+      ansible.builtin.command: /usr/local/bin/jailer --version
       changed_when: false
-      tags: ['firecracker','jailer']
+      when: k7_has_devmapper
+      tags: ['firecracker', 'jailer']
 
-    # Section: Install Kata Container
+    # Section: Install Kata Container (always — both runtimes ship in kata-static)
+    - name: Check whether Kata is already installed (skip re-extract if so)
+      ansible.builtin.stat:
+        path: /opt/kata/bin/containerd-shim-kata-v2
+      register: kata_shim_present
+      tags: ['kata']
+
     - name: Download and install Kata Containers
-      shell: |
-        KATA_VERSION=$(curl -sSL https://api.github.com/repos/kata-containers/kata-containers/releases/latest | jq -r .tag_name)
+      register: kata_install
+      retries: 3
+      delay: 15
+      until: kata_install is success
+      ansible.builtin.shell: |
+        set -eu
+        KATA_VERSION="{{ kata_version }}"
         mkdir -p /opt/kata
 
-        # Try .tar.zst first (newer format)
         TARBALL_ZST="kata-static-${KATA_VERSION}-{{ deb_arch }}.tar.zst"
         URL_ZST="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/${TARBALL_ZST}"
+        TAR_OUT="/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar"
 
+        # Download (curl -f errors on >=400; idempotent re-download is fine)
         if curl -fsSL "$URL_ZST" -o "/tmp/$TARBALL_ZST" 2>/dev/null; then
           echo "Downloaded $TARBALL_ZST, extracting with zstd..."
-          if command -v zstd >/dev/null 2>&1; then
-            zstd -d "/tmp/$TARBALL_ZST" -o "/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar"
-            tar -xvf "/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar" -C /
-          else
-            echo "Installing zstd..."
+          if ! command -v zstd >/dev/null 2>&1; then
             apt-get update && apt-get install -y zstd
-            zstd -d "/tmp/$TARBALL_ZST" -o "/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar"
-            tar -xvf "/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar" -C /
           fi
+          # -f: never prompt on existing file; needed for idempotency on re-runs.
+          zstd -d -f "/tmp/$TARBALL_ZST" -o "$TAR_OUT"
+          tar -xf "$TAR_OUT" -C /
         else
-          # Fallback to .tar.xz (older format)
           echo "Trying fallback to .tar.xz format..."
           TARBALL_XZ="kata-static-${KATA_VERSION}-{{ deb_arch }}.tar.xz"
           URL_XZ="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/${TARBALL_XZ}"
           curl -fsSL "$URL_XZ" -o "/tmp/$TARBALL_XZ"
-          tar -xvf "/tmp/$TARBALL_XZ" -C /
+          tar -xf "/tmp/$TARBALL_XZ" -C /
         fi
+        # Free space — these are 5GB+ artifacts. Use :- because TARBALL_XZ is
+        # only set in the .tar.xz fallback branch and `set -u` would error otherwise.
+        rm -f "/tmp/$TARBALL_ZST" "$TAR_OUT" "/tmp/${TARBALL_XZ:-}" 2>/dev/null || true
       args:
         executable: /bin/bash
+      when: not kata_shim_present.stat.exists
+      changed_when: true
       tags: ['kata']
 
-    - name: Point Kata to latest Firecracker / jailer
-      replace:
+    - name: Point Kata to Firecracker / jailer
+      ansible.builtin.replace:
         path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
         regexp: '^({{ item.key }}\s*=\s*).*'
         replace: '\1"/usr/local/bin/{{ item.name }}"'
       loop:
-        - { key: 'path',        name: 'firecracker' }
-        - { key: 'jailer_path', name: 'jailer' }
-      tags: ['kata','config','firecracker','jailer']
-
-
+        - {key: 'path', name: 'firecracker'}
+        - {key: 'jailer_path', name: 'jailer'}
+      when: k7_has_devmapper
+      tags: ['kata', 'config', 'firecracker', 'jailer']
 
     - name: Set valid_hypervisor_paths
-      lineinfile:
+      ansible.builtin.lineinfile:
         path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
         regexp: '^valid_hypervisor_paths'
         line: 'valid_hypervisor_paths = ["/usr/local/bin/firecracker"]'
-      tags: ['kata','config','firecracker']
+      when: k7_has_devmapper
+      tags: ['kata', 'config', 'firecracker']
 
     - name: Set valid_jailer_paths
-      lineinfile:
+      ansible.builtin.lineinfile:
         path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
         regexp: '^valid_jailer_paths'
         line: 'valid_jailer_paths = ["/usr/local/bin/jailer"]'
-      tags: ['kata','config','jailer']
+      when: k7_has_devmapper
+      tags: ['kata', 'config', 'jailer']
 
+    # Spec 18g (kql-r3 dind IO wedge, CHALLENGES.md): kata's default
+    # virtiofsd runs with --thread-pool-size=1, so ALL virtio-fs IO of a
+    # kata-qemu sandbox (container rootfs + every Longhorn PVC mount,
+    # e.g. a dind /var/lib/docker) serializes through ONE thread. Under a
+    # sustained fsync burst against an r>=2 Longhorn volume that thread
+    # saturates for minutes; any kata-agent RPC that touches virtio-fs
+    # blocks behind it, the shim's agent health ping (CheckRequest) times
+    # out, and the shim kills the (perfectly healthy) VM. A 16-thread pool
+    # keeps agent-touched IO out of the write burst's convoy.
+    - name: Widen virtiofsd thread pool for kata-qemu (spec 18g wedge fix)
+      ansible.builtin.lineinfile:
+        path: /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+        regexp: '^virtio_fs_extra_args\s*='
+        line: 'virtio_fs_extra_args = ["--thread-pool-size=16", "--announce-submounts"]'
+      when: k7_has_longhorn
+      tags: ['kata', 'config']
+
+    # Core stamps io.katacontainers.config.hypervisor.default_memory on
+    # kata sandboxes with a memory limit; kata rejects the whole pod
+    # ("annotation ... is not enabled") unless the annotation is
+    # allowlisted here. Found during spec 18g: `k7 create --backend kql
+    # --memory 2Gi` could not create a pod at all.
+    - name: Allow hypervisor memory annotation for kata-qemu
+      ansible.builtin.lineinfile:
+        path: /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+        regexp: '^enable_annotations\s*='
+        line: 'enable_annotations = ["enable_iommu", "virtio_fs_extra_args", "kernel_params", "default_memory"]'
+      when: k7_has_longhorn
+      tags: ['kata', 'config']
+
+    # Same stamp/allowlist as kata-qemu above. Without this (and without
+    # pod_annotations on runtimes.kata), `k7 create --backend kfd --memory`
+    # silently boots the default 2048 MiB VM — found in spec 18g, fixed 18h.
+    - name: Allow hypervisor memory annotation for kata-fc
+      ansible.builtin.lineinfile:
+        path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+        regexp: '^enable_annotations\s*='
+        line: 'enable_annotations = ["enable_iommu", "virtio_fs_extra_args", "kernel_params", "default_memory"]'
+      when: k7_has_devmapper
+      tags: ['kata', 'config']
 
     - name: Create containerd shim symlink
-      file:
+      ansible.builtin.file:
         src: "/opt/kata/bin/containerd-shim-kata-v2"
         dest: "/usr/local/bin/containerd-shim-kata-v2"
         state: link
       tags: ['kata', 'containerd']
 
+    # ------------------------------------------------------------------
+    # Orphaned VMM reaper (spec 18f issue 1b, CHALLENGES.md #6).
+    #
+    # Kata 3.24.0 + jailer: `jailer --daemonize` double-forks, so the shim
+    # records the (immediately-exiting) jailer PID and its SIGTERM fallback
+    # in fcEnd() signals a dead PID. Whenever the graceful in-guest
+    # shutdown fails (dead agent under churn), the firecracker process is
+    # orphaned and spins at 100% CPU. This watchdog kills VMM processes
+    # whose kata shim is gone:
+    #  - firecracker: no containerd-shim-kata-v2 with a matching -id
+    #    (the fc --id is the first 32 hex chars of the CRI sandbox id;
+    #    live firecrackers always have PPID 1, so parentage is useless)
+    #  - qemu: reparented to PID 1 (qemu stays a shim child while healthy)
+    # ------------------------------------------------------------------
+    - name: Install orphaned VMM reaper script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/k7-vmm-reaper.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Reap orphaned kata VMM processes (spec 18f issue 1b).
+          set -u
+          for pid in $(pgrep -x firecracker); do
+            id=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | awk 'prev=="--id"{print; exit} {prev=$0}')
+            [ -n "$id" ] || continue
+            if ! pgrep -f -- "containerd-shim-kata-v2.*-id ${id}" >/dev/null; then
+              echo "reaping orphaned firecracker pid=$pid id=$id (no kata shim)"
+              kill -9 "$pid" || true
+            fi
+          done
+          for pid in $(pgrep -f 'qemu-system'); do
+            ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo "")
+            if [ "$ppid" = "1" ]; then
+              echo "reaping orphaned qemu pid=$pid (reparented to init — kata shim gone)"
+              kill -9 "$pid" || true
+            fi
+          done
+      when: k7_has_devmapper or k7_has_longhorn
+      tags: ['kata', 'reaper']
+
+    - name: Install VMM reaper systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k7-vmm-reaper.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Reap orphaned kata VMM processes (k7 spec 18f issue 1b)
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/k7-vmm-reaper.sh
+      when: k7_has_devmapper or k7_has_longhorn
+      tags: ['kata', 'reaper']
+
+    - name: Install VMM reaper systemd timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k7-vmm-reaper.timer
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Run the k7 VMM reaper every minute
+
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=1min
+
+          [Install]
+          WantedBy=timers.target
+      when: k7_has_devmapper or k7_has_longhorn
+      tags: ['kata', 'reaper']
+
+    - name: Enable and start VMM reaper timer
+      ansible.builtin.systemd:
+        name: k7-vmm-reaper.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: k7_has_devmapper or k7_has_longhorn
+      tags: ['kata', 'reaper']
+
     - name: Ensure /opt/kata/share/kata-containers exists
-      file:
+      ansible.builtin.file:
         path: /opt/kata/share/kata-containers
         state: directory
         mode: '0755'
       tags: ['kata']
 
     # ------------------------------------------------------------------
-    # Kata kernel (vmlinux.container)
+    # Kata kernel (vmlinux.container) — only needed for FC backend
     # ------------------------------------------------------------------
-
     - name: Check if vmlinux.container already exists (provided by kata-static)
-      stat:
+      ansible.builtin.stat:
         path: /opt/kata/share/kata-containers/vmlinux.container
       register: kata_kernel
+      when: k7_has_devmapper
       tags: ['kata']
 
-    - name: Get latest Kata Containers release metadata (only if kernel missing)
-      uri:
-        url: https://api.github.com/repos/kata-containers/kata-containers/releases/latest
-        return_content: yes
+    - name: Get Kata Containers release metadata (only if kernel missing)
+      ansible.builtin.uri:
+        url: https://api.github.com/repos/kata-containers/kata-containers/releases/tags/{{ kata_version }}
+        return_content: true
       register: kata_release_info
-      when: not kata_kernel.stat.exists
+      when:
+        - k7_has_devmapper
+        - not kata_kernel.stat.exists
       tags: ['kata']
 
     - name: Set URL for vmlinux.container asset (only if kernel missing)
-      set_fact:
+      ansible.builtin.set_fact:
         kata_kernel_url: >-
           {{
             kata_release_info.json.assets
@@ -449,157 +806,167 @@
             | map(attribute='browser_download_url')
             | first | default('')
           }}
-      when: not kata_kernel.stat.exists
+      when:
+        - k7_has_devmapper
+        - not kata_kernel.stat.exists
       tags: ['kata']
 
     - name: Fail when release has no vmlinux.container asset (only if kernel missing)
-      fail:
+      ansible.builtin.fail:
         msg: >-
-          The latest Kata release ({{ kata_release_info.json.tag_name }}) does not contain
-          a `vmlinux.container` asset. Either switch to a release that ships the kernel,
-          or build / copy your own kernel into /opt/kata/share/kata-containers/.
+          The Kata release ({{ kata_release_info.json.tag_name }}) does not contain
+          a `vmlinux.container` asset.
       when:
+        - k7_has_devmapper
         - not kata_kernel.stat.exists
         - kata_kernel_url == ''
       tags: ['kata']
 
     - name: Download vmlinux.container (only if kernel missing and asset present)
-      get_url:
+      ansible.builtin.get_url:
         url: "{{ kata_kernel_url }}"
         dest: /opt/kata/share/kata-containers/vmlinux.container
         mode: '0644'
+        timeout: 60
+      register: kata_kernel_dl
+      retries: 5
+      delay: 10
+      until: kata_kernel_dl is success
       when:
+        - k7_has_devmapper
         - not kata_kernel.stat.exists
         - kata_kernel_url != ''
       tags: ['kata']
 
-    # - name: Fail if GH_TOKEN is not set
-    #   fail:
-    #     msg: "GH_TOKEN environment variable must be set to access the private GitHub repo."
-    #   when: lookup('env', 'GH_TOKEN') == ""
-    #   tags: ['kata']
-
-    # - name: Ensure GitHub CLI is installed
-    #   apt:
-    #     name: gh
-    #     state: present
-    #     update_cache: yes
-    #   tags: ['kata']
-
-    # - name: Download kata-containers.img from GitHub Release
-    #   shell: |
-    #     gh release download v0.0.1 \
-    #       --repo Katakate/k7 \
-    #       --pattern "kata-containers.img" \
-    #       --dir /opt/kata/share/kata-containers \
-    #       --clobber
-    #   environment:
-    #     GH_TOKEN: "{{ lookup('env', 'GH_TOKEN') }}"
-    #   args:
-    #     creates: /opt/kata/share/kata-containers/kata-containers.img
-    #   tags: ['kata']
-
     - name: Ensure kernel path is configured in configuration-fc.toml
-      lineinfile:
+      ansible.builtin.lineinfile:
         path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
         regexp: '^#?\s*kernel\s*='
         line: 'kernel = "/opt/kata/share/kata-containers/vmlinux.container"'
-        backrefs: yes
+        backrefs: true
+      when: k7_has_devmapper
       tags: ['kata']
 
     - name: Ensure image path is configured in configuration-fc.toml
-      lineinfile:
+      ansible.builtin.lineinfile:
         path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
         regexp: '^#?\s*image\s*='
         line: 'image = "/opt/kata/share/kata-containers/kata-containers.img"'
-        backrefs: yes
+        backrefs: true
+      when: k7_has_devmapper
       tags: ['kata']
 
-
     - name: Ensure containerd template directory exists
-      file:
+      ansible.builtin.file:
         path: /var/lib/rancher/k3s/agent/etc/containerd
         state: directory
         mode: '0755'
-      tags: ['kata', 'devmapper']
+      tags: ['kata', 'devmapper', 'containerd']
 
-    # ──── BEGIN: spare-disk check ────
+    # ──── BEGIN: spare-disk check (FD backend only) ────
     - name: Detect root disk device
-      set_fact:
+      ansible.builtin.set_fact:
         root_disk: "{{ (ansible_mounts | selectattr('mount', 'equalto', '/') | first).device
-                      | regex_replace('p?[0-9]+$','') }}"
+                      | regex_replace('p?[0-9]+$', '') }}"
+      when: k7_has_devmapper
       tags: ['lvm']
 
     - name: Use provided disk override (if any)
-      set_fact:
-        requested_disk: "{{ k7_disk | default('') }}"
+      ansible.builtin.set_fact:
+        requested_disk: "{{ k7_devmapper_disk | default(k7_disk | default('')) }}"
+      when: k7_has_devmapper
       tags: ['lvm']
 
     - name: Normalize requested disk path
-      set_fact:
+      ansible.builtin.set_fact:
         requested_disk_basename: "{{ requested_disk | regex_replace('^/dev/', '') }}"
         requested_disk_path: "/dev/{{ requested_disk | regex_replace('^/dev/', '') }}"
-      when: requested_disk != ''
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
       tags: ['lvm']
 
     - name: Validate requested disk exists and is a block device
-      stat:
+      ansible.builtin.stat:
         path: "{{ requested_disk_path }}"
       register: requested_disk_stat
-      when: requested_disk != ''
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
       tags: ['lvm']
 
     - name: Fail if requested disk not present or not a block device
-      fail:
+      ansible.builtin.fail:
         msg: "Specified k7_disk '{{ requested_disk_path }}' does not exist or is not a block device"
-      when: requested_disk != '' and (not requested_disk_stat.stat.exists or not requested_disk_stat.stat.isblk)
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
+        - (not requested_disk_stat.stat.exists or not requested_disk_stat.stat.isblk)
       tags: ['lvm']
 
     - name: Ensure requested disk is a whole disk (not a partition)
-      command: lsblk -dn -o TYPE "{{ requested_disk_path }}"
+      ansible.builtin.command: lsblk -dn -o TYPE "{{ requested_disk_path }}"
       register: lsblk_type
       changed_when: false
-      when: requested_disk != ''
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
       tags: ['lvm']
 
     - name: Fail if requested disk is not a whole disk
-      fail:
+      ansible.builtin.fail:
         msg: "Specified k7_disk '{{ requested_disk_path }}' is not a whole disk (TYPE={{ lsblk_type.stdout | trim }})"
-      when: requested_disk != '' and (lsblk_type.stdout is not defined or (lsblk_type.stdout | trim) != 'disk')
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
+        - (lsblk_type.stdout is not defined or (lsblk_type.stdout | trim) != 'disk')
       tags: ['lvm']
 
     - name: Pull ansible facts for requested disk
-      set_fact:
+      ansible.builtin.set_fact:
         requested_disk_facts: "{{ ansible_devices.get(requested_disk_basename) | default(None) }}"
-      when: requested_disk != ''
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
       tags: ['lvm']
 
     - name: Fail if requested disk not found in ansible_devices
-      fail:
+      ansible.builtin.fail:
         msg: "Device '{{ requested_disk_path }}' not visible in ansible_devices facts"
-      when: requested_disk != '' and (requested_disk_facts is not defined or requested_disk_facts is none)
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
+        - (requested_disk_facts is not defined or requested_disk_facts is none)
       tags: ['lvm']
 
     - name: Fail if requested disk has partitions
-      fail:
+      ansible.builtin.fail:
         msg: "Device '{{ requested_disk_path }}' has partitions; wipe it with utils/wipe-disk.sh or choose another disk"
-      when: requested_disk != '' and (requested_disk_facts.partitions is defined and (requested_disk_facts.partitions | length) > 0)
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
+        - (requested_disk_facts.partitions is defined and (requested_disk_facts.partitions | length) > 0)
       tags: ['lvm']
 
     - name: Fail if requested disk appears to be the root disk
-      fail:
+      ansible.builtin.fail:
         msg: "Device '{{ requested_disk_path }}' appears to be the root disk; choose a different disk"
-      when: requested_disk != '' and (requested_disk_basename == (root_disk | basename))
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
+        - (requested_disk_basename == (root_disk | basename))
       tags: ['lvm']
 
     - name: Use requested disk as kata_block
-      set_fact:
+      ansible.builtin.set_fact:
         kata_block: "{{ requested_disk_path }}"
-      when: requested_disk != ''
+      when:
+        - k7_has_devmapper
+        - requested_disk != ''
       tags: ['lvm']
 
     - name: Find an empty secondary disk (skip loop, mapper, CD-ROM, zram, etc.)
-      set_fact:
+      ansible.builtin.set_fact:
         kata_block: >-
           {{
             ansible_devices
@@ -616,49 +983,63 @@
             | map('regex_replace', '^', '/dev/')
             | first | default('')
           }}
-      when: requested_disk == ''
+      when:
+        - k7_has_devmapper
+        - requested_disk == ''
       tags: ['lvm']
 
     - name: Show selected disk for LVM thin-pool
-      debug:
+      ansible.builtin.debug:
         msg: "Using disk for K7 LVM thin-pool: {{ kata_block }} {{ '(user-specified)' if requested_disk != '' else '(auto-detected)' }}"
+      when: k7_has_devmapper
       tags: ['lvm']
 
     - name: Fail if no spare block device is available
-      fail:
+      ansible.builtin.fail:
         msg: |
-          No empty secondary disk found.  
+          No empty secondary disk found.
           K7 expects a dedicated data drive for the LVM thin-pool.
           Attach an extra NVMe/SSD (e.g. /dev/nvme2n1) and re-run the playbook.
-      when: requested_disk == '' and kata_block == ''
+      when:
+        - k7_has_devmapper
+        - requested_disk == ''
+        - kata_block == ''
       tags: ['lvm']
     # ──── END spare-disk check ────
 
-
     - name: Ensure kata-vg exists
-      command: vgdisplay kata-vg
+      ansible.builtin.command: vgdisplay kata-vg
       register: vgcheck
       failed_when: false
       changed_when: false
+      when: k7_has_devmapper
       tags: ['lvm']
 
-    - name: pvcreate (with label)
-      command: pvcreate -y --setphysicalvolumesize 100G --metadatasize 4M --dataalignment 1M {{ kata_block }}
-      when: vgcheck.rc != 0
+    - name: Create physical volume (pvcreate with label)
+      ansible.builtin.command: >
+        pvcreate -y --setphysicalvolumesize {{ kata_thinpool_pv_size }}
+        --metadatasize 4M --dataalignment 1M {{ kata_block }}
+      when:
+        - k7_has_devmapper
+        - vgcheck.rc != 0
       tags: ['lvm']
 
     - name: Create VG if missing
-      command: vgcreate kata-vg {{ kata_block }}
-      when: vgcheck.rc != 0
+      ansible.builtin.command: vgcreate kata-vg {{ kata_block }}
+      when:
+        - k7_has_devmapper
+        - vgcheck.rc != 0
       tags: ['lvm']
 
     - name: Add k7 tag to PV
-      command: pvchange --addtag k7 {{ kata_block }}
-      when: vgcheck.rc != 0
+      ansible.builtin.command: pvchange --addtag k7 {{ kata_block }}
+      when:
+        - k7_has_devmapper
+        - vgcheck.rc != 0
       tags: ['lvm']
 
     - name: Ensure thin pool LV exists
-      command: >
+      ansible.builtin.command: >
         lvcreate -T kata-vg/thin-pool
                  -l 95%FREE
                  --poolmetadatasize 1G
@@ -666,118 +1047,506 @@
                  --yes
       args:
         creates: /dev/kata-vg/thin-pool
+      when: k7_has_devmapper
       tags: ['lvm']
 
-    # – create the VG sub-folder so containerd can write its BoltDB
     - name: Create devmapper VG subdir
-      file:
+      ansible.builtin.file:
         path: /var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.devmapper/kata-vg
-       #path: /var/lib/containerd/io.containerd.snapshotter.v1.devmapper/kata-vg
         state: directory
         mode: '0755'
+      when: k7_has_devmapper
       tags: ['devmapper', 'lvm']
 
     - name: Enable LVM thin-pool autoextend service
-      copy:
+      ansible.builtin.copy:
         dest: /etc/lvm/profile/kata-thin.profile
+        mode: '0644'
         content: |
           activation {
               thin_pool_autoextend_threshold=80
               thin_pool_autoextend_percent=20
           }
+      when: k7_has_devmapper
       tags: ['lvm']
 
     - name: Attach profile to thin pool
-      command: lvchange --metadataprofile kata-thin kata-vg/thin-pool
+      ansible.builtin.command: lvchange --metadataprofile kata-thin kata-vg/thin-pool
+      when: k7_has_devmapper
+      changed_when: true
       tags: ['lvm']
 
+    # ------------------------------------------------------------------
+    # k7d backend (spec 9a M11): install the k7d daemon, containerd shim,
+    # and guest artifacts from the release tarball; provision the host
+    # prerequisites (vhost-vsock, erofs tools, reflink-capable XFS for
+    # writable volume images) and run k7d as a systemd service.
+    # ------------------------------------------------------------------
+    - name: K7d — check /dev/kvm exists
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: k7d_kvm_dev
+      when: k7_has_k7d
+      tags: ['k7d']
 
-    - name: Ensure skeleton containerd template exists (only once)
-      copy: 
-        dest: /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
-        content: |
-          version = 3
-        force: no         # do NOT overwrite if it is already there
+    - name: K7d — fail loudly when /dev/kvm is missing
+      ansible.builtin.fail:
+        msg: >-
+          /dev/kvm not found on {{ inventory_hostname }} — the k7d backend runs hardware-
+          accelerated microVMs and cannot work without KVM. Enable virtualization (VT-x/AMD-V)
+          or drop 'k7d' from k7_backends.
+      when:
+        - k7_has_k7d
+        - not k7d_kvm_dev.stat.exists
+      tags: ['k7d']
+
+    - name: K7d — install host prerequisites (erofs, xfs, virtiofsd)
+      ansible.builtin.apt:
+        name:
+          - erofs-utils
+          - xfsprogs
+          - virtiofsd
+        state: present
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — verify /usr/libexec/virtiofsd is executable
+      ansible.builtin.stat:
+        path: /usr/libexec/virtiofsd
+      register: k7d_virtiofsd
+      failed_when: not (k7d_virtiofsd.stat.exists and k7d_virtiofsd.stat.executable)
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — configure vhost-vsock + tun modules to load at boot
+      ansible.builtin.lineinfile:
+        path: /etc/modules-load.d/k7d.conf
+        line: "{{ item }}"
+        create: true
         mode: '0644'
-      tags: ['containerd']
-    
-    - name: Write basic config-v3.toml.tmpl with devmapper only
-      copy:
+      loop:
+        - vhost_vsock
+        - tun
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — load vhost-vsock + tun modules now
+      ansible.builtin.command: modprobe {{ item }}
+      loop:
+        - vhost_vsock
+        - tun
+      when: k7_has_k7d
+      changed_when: false
+      tags: ['k7d']
+
+    - name: K7d — fail loudly when /dev/vhost-vsock is missing
+      ansible.builtin.stat:
+        path: /dev/vhost-vsock
+      register: k7d_vhost_vsock
+      failed_when: not k7d_vhost_vsock.stat.exists
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    # Writable k7d volume images are raw ext4 files that warm forks clone
+    # with FICLONE reflinks; the root FS is usually ext4 (no reflink), so
+    # provision a sparse XFS (reflink=1) image loop-mounted at
+    # /var/lib/k7d/disks, persisted via /etc/fstab.
+    - name: K7d — create /var/lib/k7d directory
+      ansible.builtin.file:
+        path: /var/lib/k7d
+        state: directory
+        mode: '0755'
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — check whether /var/lib/k7d/disks is already mounted
+      ansible.builtin.command: mountpoint -q /var/lib/k7d/disks
+      register: k7d_disks_mounted
+      changed_when: false
+      failed_when: false
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — create sparse XFS image for /var/lib/k7d/disks
+      ansible.builtin.command: truncate -s {{ k7d_disks_image_size }} /var/lib/k7d/disks.img
+      args:
+        creates: /var/lib/k7d/disks.img
+      when:
+        - k7_has_k7d
+        - k7d_disks_mounted.rc != 0
+      tags: ['k7d']
+
+    - name: K7d — format the disks image as XFS with reflink=1
+      ansible.builtin.command: mkfs.xfs -q -m reflink=1 /var/lib/k7d/disks.img
+      when:
+        - k7_has_k7d
+        - k7d_disks_mounted.rc != 0
+      register: k7d_mkfs
+      changed_when: k7d_mkfs.rc == 0
+      failed_when: k7d_mkfs.rc != 0 and 'appears to contain an existing filesystem' not in k7d_mkfs.stderr
+      tags: ['k7d']
+
+    - name: K7d — persist /var/lib/k7d/disks in /etc/fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "/var/lib/k7d/disks.img /var/lib/k7d/disks xfs loop,nofail 0 0"
+        create: true
+        mode: '0644'
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — mount /var/lib/k7d/disks
+      ansible.builtin.shell: |
+        set -eu
+        mkdir -p /var/lib/k7d/disks
+        mountpoint -q /var/lib/k7d/disks || mount /var/lib/k7d/disks
+      when: k7_has_k7d
+      changed_when: false
+      tags: ['k7d']
+
+    - name: K7d — verify /var/lib/k7d/disks is reflink-capable
+      ansible.builtin.shell: |
+        set -eu
+        echo probe > /var/lib/k7d/disks/.reflink-probe-src
+        cp --reflink=always /var/lib/k7d/disks/.reflink-probe-src /var/lib/k7d/disks/.reflink-probe-dst
+        rm -f /var/lib/k7d/disks/.reflink-probe-src /var/lib/k7d/disks/.reflink-probe-dst
+      when: k7_has_k7d
+      changed_when: false
+      tags: ['k7d']
+
+    # ---- Release artifacts: tarball → /opt/k7d, installed via the
+    # bundled install.sh (binaries → /usr/local/bin, guest assets →
+    # /usr/local/share/k7d, k7d.service unit + socket wait). k3s
+    # registration is NOT delegated to install.sh — the playbook's
+    # merged containerd template + RuntimeClass tasks own that.
+    - name: K7d — create /opt/k7d directory
+      ansible.builtin.file:
+        path: /opt/k7d
+        state: directory
+        mode: '0755'
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — copy release tarball from controller (k7d_artifact_local_path)
+      ansible.builtin.copy:
+        src: "{{ k7d_artifact_local_path }}"
+        dest: /tmp/k7d-release.tar.gz
+        mode: '0644'
+      when:
+        - k7_has_k7d
+        - k7d_artifact_local_path | length > 0
+      tags: ['k7d']
+
+    - name: K7d — download release tarball ({{ k7d_artifact_url }})
+      ansible.builtin.get_url:
+        url: "{{ k7d_artifact_url }}"
+        dest: /tmp/k7d-release.tar.gz
+        mode: '0644'
+        timeout: 120
+      register: k7d_dl
+      retries: 5
+      delay: 10
+      until: k7d_dl is success
+      when:
+        - k7_has_k7d
+        - k7d_artifact_local_path | length == 0
+      tags: ['k7d']
+
+    - name: K7d — extract release tarball to /opt/k7d
+      ansible.builtin.unarchive:
+        src: /tmp/k7d-release.tar.gz
+        dest: /opt/k7d
+        remote_src: true
+      register: k7d_extracted
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — verify release artifacts are complete
+      ansible.builtin.stat:
+        path: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/{{ item }}"
+      register: k7d_artifact_stat
+      failed_when: not k7d_artifact_stat.stat.exists
+      loop:
+        - install.sh
+        - k7d
+        - containerd-shim-k7-v1
+        - vmlinux
+        - initramfs.cpio.gz
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — check whether the k7d control socket already exists
+      ansible.builtin.stat:
+        path: /run/k7d/k7d.sock
+      register: k7d_socket_stat
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — run the release install.sh (binaries, guest assets, k7d.service)
+      ansible.builtin.command: ./install.sh
+      args:
+        chdir: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux"
+      when:
+        - k7_has_k7d
+        - k7d_extracted.changed or not k7d_socket_stat.stat.exists
+      changed_when: true
+      tags: ['k7d']
+
+    # The static runc rides into every k7d guest on the shim's "tools"
+    # erofs image; the shim looks for it at /opt/k7d/runc.amd64 (release
+    # install) before falling back to a host runc. A node with neither
+    # cannot start containers — fail here, not at first pod.
+    - name: K7d — check for bundled static runc in the release
+      ansible.builtin.stat:
+        path: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/runc.amd64"
+      register: k7d_runc_bundled
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — install bundled static runc to /opt/k7d/runc.amd64
+      ansible.builtin.copy:
+        src: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/runc.amd64"
+        dest: /opt/k7d/runc.amd64
+        mode: '0755'
+        remote_src: true
+      when:
+        - k7_has_k7d
+        - k7d_runc_bundled.stat.exists
+      tags: ['k7d']
+
+    - name: K7d — verify a static runc is available for the guest tools image
+      ansible.builtin.shell: |
+        set -eu
+        test -x /opt/k7d/runc.amd64 || test -x /usr/bin/runc || test -x /usr/sbin/runc
+      when: k7_has_k7d
+      changed_when: false
+      tags: ['k7d']
+
+    - name: K7d — wait for the control socket /run/k7d/k7d.sock
+      ansible.builtin.wait_for:
+        path: /run/k7d/k7d.sock
+        state: present
+        timeout: 30
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    # ------------------------------------------------------------------
+    # Containerd template — merged based on per-host backend set
+    # ------------------------------------------------------------------
+    - name: Render containerd config template (per-host backend mix)
+      ansible.builtin.copy:
         dest: /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
-        mode: "0644"
+        mode: '0644'
         owner: root
         content: |
           # version = 3
           {{ '{{' }} template "base" . {{ '}}' }}
-      
+
+          {% if k7_has_devmapper %}
           [plugins."io.containerd.snapshotter.v1.devmapper"]
             pool_name       = "kata--vg-thin--pool"
             root_path       = "/var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.devmapper"
             base_image_size = "10GB"
-        
-    - name: Add Kata runtime configuration to containerd template
-      blockinfile:
-        path: /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
-        marker: "# {mark} ANSIBLE MANAGED KATA RUNTIME"
-        block: |
+
           [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata]
             runtime_type  = "io.containerd.kata.v2"
             privileged_without_host_devices = true
             snapshotter   = "devmapper"
+            pod_annotations = ["io.katacontainers.*"]
             [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata.options]
               BinaryName  = "/usr/local/bin/containerd-shim-kata-v2"
               ConfigPath  = "/opt/kata/share/defaults/kata-containers/configuration-fc.toml"
-        create: no
-        insertafter: EOF
-      tags: ['kata', 'containerd']
+          {% endif %}
 
+          {% if k7_has_longhorn %}
+          [plugins."io.containerd.snapshotter.v1.overlayfs"]
+            mount_options = ["nodev", "nosuid"]
 
-    # ── restart k3s non-blocking and wait for the API ─────────────────────────────
-    - name: Restart K3s to apply devmapper changes (async)
+          [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
+            runtime_type  = "io.containerd.kata.v2"
+            privileged_without_host_devices = true
+            snapshotter   = "overlayfs"
+            pod_annotations = ["io.katacontainers.*"]
+            [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu.options]
+              BinaryName  = "/usr/local/bin/containerd-shim-kata-v2"
+              ConfigPath  = "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+          {% endif %}
+
+          {% if k7_has_k7d %}
+          # k7d runtime: containerd resolves the shim binary from runtime_type
+          # (io.containerd.k7.v1 -> containerd-shim-k7-v1). Do NOT add an
+          # [options] BinaryName — it leaks into the cgroup path and breaks
+          # shim startup. pod_annotations forwards the k7d.katakate.org/*
+          # pod annotations (fork-source, cluster-id, image-slots, ...) into
+          # the sandbox OCI spec where the shim reads them.
+          [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7]
+            runtime_type  = "io.containerd.k7.v1"
+            pod_annotations = ["k7d.katakate.org/*"]
+            privileged_without_host_devices = true
+            snapshotter   = "overlayfs"
+          {% endif %}
+      tags: ['kata', 'containerd', 'k7d']
+
+    # ── restart k3s and wait for the API ─────────────────────────────
+    - name: Restart K3s/k3s-agent to apply config changes (async)
       ansible.builtin.systemd:
-        name: k3s
+        name: "{{ 'k3s' if k7_node_role == 'server' else 'k3s-agent' }}"
         state: restarted
-      async: 300           # allow up to 5 min
-      poll: 0              # fire-and-forget
-      register: k3s_async
-      tags: ['devmapper']
+        enabled: true
+      async: 300
+      poll: 0
+      tags: ['devmapper', 'k3s']
 
     - name: Wait for K3s containerd socket to appear
-      wait_for:
+      ansible.builtin.wait_for:
         path: /run/k3s/containerd/containerd.sock
         state: present
-        timeout: 60
+        timeout: 120
       tags: ['kata']
 
-    - name: Wait for kube-api /readyz
-      command: k3s kubectl get --raw /readyz
+    # HA note: joining servers may spend minutes as etcd learners before
+    # the local apiserver goes Ready (only one learner can join at a time
+    # when several masters restart together) — hence the generous retries.
+    - name: Wait for kube-api /readyz (servers only)
+      ansible.builtin.command: k3s kubectl get --raw /readyz
       register: readyz
-      retries: 30
+      retries: 60
       delay: 5
       until: readyz.rc == 0
+      changed_when: false
+      when: k7_node_role == 'server'
 
-    - name: Wait for node to be Ready and API stable
-      shell: |
-        for i in {1..30}; do
-          if k3s kubectl get nodes --no-headers | grep -q 'Ready'; then
-            echo "Node is Ready"
-            # Test a more complex query to ensure stability
-            if k3s kubectl get pods -n kube-system >/dev/null 2>&1; then
-              exit 0
-            fi
+    # ------------------------------------------------------------------
+    # Cilium CNI install (cluster-wide, delegated to first master)
+    # Runs BEFORE node-Ready gate because nodes stay NotReady until a CNI
+    # is installed when k3s is launched with --flannel-backend=none.
+    # ------------------------------------------------------------------
+    - name: Check if cilium CLI is already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/cilium
+      register: cilium_cli_stat
+      when: k7_cni_is_cilium
+      tags: ['cilium']
+
+    - name: Download Cilium CLI tarball
+      ansible.builtin.get_url:
+        url: "https://github.com/cilium/cilium-cli/releases/download/{{ cilium_cli_version }}/cilium-linux-{{ deb_arch }}.tar.gz"
+        dest: /tmp/cilium-cli.tar.gz
+        mode: '0644'
+        timeout: 60
+      register: cilium_cli_dl
+      retries: 5
+      delay: 10
+      until: cilium_cli_dl is success
+      when:
+        - k7_cni_is_cilium
+        - not cilium_cli_stat.stat.exists
+      tags: ['cilium']
+
+    - name: Extract Cilium CLI
+      ansible.builtin.unarchive:
+        src: /tmp/cilium-cli.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+        extra_opts: ['cilium']
+      when:
+        - k7_cni_is_cilium
+        - not cilium_cli_stat.stat.exists
+      tags: ['cilium']
+
+    - name: Ensure cilium CLI is executable
+      ansible.builtin.file:
+        path: /usr/local/bin/cilium
+        mode: '0755'
+      when: k7_cni_is_cilium
+      tags: ['cilium']
+
+    - name: Check if Cilium is already installed in the cluster
+      ansible.builtin.command: k3s kubectl -n kube-system get daemonset cilium
+      register: cilium_installed_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: k7_cni_is_cilium
+      tags: ['cilium']
+
+    # Cilium tuning notes:
+    # - MTU=1450: VXLAN adds 50B overhead. Cilium's auto-detect can leave
+    #   pods at the underlying NIC MTU (1500), which breaks HTTPS through
+    #   the encap. Pinning pod MTU to 1450 fixes this for both standard
+    #   and Kata pods.
+    # - socketLB.hostNamespaceOnly=true: required for Kata-Containers
+    #   compatibility (Cilium docs:
+    #   https://docs.cilium.io/en/stable/network/kubernetes/kata/). With
+    #   kubeProxyReplacement=true the socket-LB is normally used for
+    #   ClusterIP routing, but Kata VMs run their sockets in a separate
+    #   netns the host-cgroup BPF can't intercept, so service traffic
+    #   (including kube-dns) stalls. Limiting socket-LB to the host
+    #   namespace forces pod traffic onto the per-packet LB path which
+    #   works for Kata.
+    # - dnsProxy.minTtl=3600: CDN-backed hosts (CloudFront et al.) return
+    #   DNS TTLs of 30-60s, but clients like dockerd cache the resolved IP
+    #   and keep dialing it for minutes across retries. With minTtl=0 the
+    #   FQDN→identity mapping expires with the upstream TTL and every
+    #   later SYN is policy-dropped (spec 18f issue 3). Keep learned IPs
+    #   allowed for 1h after the lookup.
+    - name: Install Cilium (kube-proxy replacement, FQDN support)  # noqa: no-changed-when
+      ansible.builtin.shell: |
+        set -eu
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        /usr/local/bin/cilium install \
+          --version {{ cilium_version }} \
+          --set kubeProxyReplacement=true \
+          --set k8sServiceHost={{ hostvars[k7_first_master]['ansible_host'] | default(k7_first_master) }} \
+          --set k8sServicePort=6443 \
+          --set ipam.mode=kubernetes \
+          --set operator.replicas=1 \
+          --set MTU=1450 \
+          --set socketLB.hostNamespaceOnly=true \
+          --set dnsProxy.minTtl=3600
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when:
+        - k7_cni_is_cilium
+        - cilium_installed_check.rc != 0
+      tags: ['cilium']
+
+    - name: Wait for Cilium to report ready  # noqa: no-changed-when
+      ansible.builtin.command: /usr/local/bin/cilium status --wait --wait-duration 5m
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: k7_cni_is_cilium
+      tags: ['cilium']
+
+    - name: Wait for cluster nodes to be Ready (run on first master)
+      ansible.builtin.shell: |
+        set -e
+        expected={{ (groups['k7_cluster'] | default([inventory_hostname])) | length }}
+        for i in $(seq 1 60); do
+          ready=$(k3s kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)
+          if [ "$ready" -ge "$expected" ]; then
+            echo "All $ready/$expected nodes Ready"
+            exit 0
           fi
-          echo "Waiting for node and API stability... ($i/30)"
-          sleep 10
+          echo "Waiting for nodes Ready: $ready/$expected ($i/60)"
+          sleep 5
         done
         exit 1
       register: stability_check
-      until: stability_check.rc == 0
-      retries: 1  # The loop inside handles retries
-      delay: 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
       tags: ['k3s']
 
-
-    - name: Create RuntimeClass 'kata'
+    # ------------------------------------------------------------------
+    # Cluster-wide resources (RuntimeClass, Longhorn, k7-api)
+    # ------------------------------------------------------------------
+    - name: Create RuntimeClass 'kata' (cluster-wide)
       ansible.builtin.shell: |
         cat <<'EOF' | k3s kubectl apply -f -
         apiVersion: node.k8s.io/v1
@@ -792,45 +1561,653 @@
       retries: 12
       delay: 5
       until: "'created' in apply_kata.stdout or 'unchanged' in apply_kata.stdout"
-      tags: ['kata','k3s']
+      changed_when: "'created' in apply_kata.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['kata-firecracker-devmapper']) | length > 0
+      tags: ['kata', 'k3s']
 
+    - name: Create RuntimeClass 'kata-qemu' (cluster-wide)
+      ansible.builtin.shell: |
+        cat <<'EOF' | k3s kubectl apply -f -
+        apiVersion: node.k8s.io/v1
+        kind: RuntimeClass
+        metadata:
+          name: kata-qemu
+        handler: kata-qemu
+        EOF
+      args:
+        executable: /bin/bash
+      register: apply_kata_qemu
+      retries: 12
+      delay: 5
+      until: "'created' in apply_kata_qemu.stdout or 'unchanged' in apply_kata_qemu.stdout"
+      changed_when: "'created' in apply_kata_qemu.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['kata-qemu-longhorn']) | length > 0
+      tags: ['kata', 'k3s']
+
+    - name: Create RuntimeClass 'k7' (cluster-wide)
+      ansible.builtin.shell: |
+        cat <<'EOF' | k3s kubectl apply -f -
+        apiVersion: node.k8s.io/v1
+        kind: RuntimeClass
+        metadata:
+          name: k7
+        handler: k7
+        EOF
+      args:
+        executable: /bin/bash
+      register: apply_k7
+      retries: 12
+      delay: 5
+      until: "'created' in apply_k7.stdout or 'unchanged' in apply_k7.stdout"
+      changed_when: "'created' in apply_k7.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['k7d']) | length > 0
+      tags: ['k7d', 'k3s']
+
+    # ------------------------------------------------------------------
+    # Per-node backend labels — each node labels itself via first master
+    # ------------------------------------------------------------------
+    - name: Wait for node object to register
+      ansible.builtin.command: k3s kubectl get node {{ k7_k8s_node_name }}
+      register: node_check
+      retries: 30
+      delay: 5
+      until: node_check.rc == 0
+      changed_when: false
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['labels']
+
+    - name: Remove deprecated backend labels
+      ansible.builtin.command: >
+        k3s kubectl label node {{ k7_k8s_node_name }}
+        k7.katakate.org/backend-firecracker-devmapper-
+        k7.katakate.org/backend-qemu-longhorn-
+        --overwrite
+      delegate_to: "{{ k7_first_master }}"
+      changed_when: true
+      failed_when: false
+      tags: ['labels']
+
+    - name: Label node with supported backends
+      ansible.builtin.command: >
+        k3s kubectl label node {{ k7_k8s_node_name }}
+        k7.katakate.org/backend-{{ item }}=true --overwrite
+      loop: "{{ k7_backends_list }}"
+      delegate_to: "{{ k7_first_master }}"
+      changed_when: true
+      tags: ['labels']
+
+    - name: Label first master so the k7-api pod has a stable home
+      ansible.builtin.command: >
+        k3s kubectl label node
+        {{ hostvars[k7_first_master].k7_k8s_node_name | default(k7_k8s_node_name) }}
+        k7.katakate.org/first-master=true --overwrite
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      changed_when: true
+      tags: ['labels']
+
+    - name: Ensure K7 config directory exists
+      ansible.builtin.file:
+        path: /etc/k7
+        state: directory
+        mode: '0755'
+      tags: ['k7', 'config']
+
+    - name: Store K7 backend configuration (primary backend = first in list)
+      ansible.builtin.copy:
+        dest: /etc/k7/backend
+        content: "{{ k7_backends_list[0] }}"
+        mode: '0644'
+      tags: ['k7', 'config']
 
     - name: Show K3s node status
-      command: k3s kubectl get nodes -o wide
+      ansible.builtin.command: k3s kubectl get nodes -o wide
       register: k3s_nodes
       changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
       tags: ['k3s']
 
     - name: Debug K3s node status
-      debug:
+      ansible.builtin.debug:
         msg: "{{ k3s_nodes.stdout_lines }}"
+      run_once: true
       tags: ['k3s']
-    
-    # - name: Download Helm installation script
-    #   get_url:
-    #     url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-    #     dest: /tmp/get_helm_3
-    #     mode: '0755'
-    #   tags: ['helm']
 
-    # - name: Install Helm using script
-    #   command: /tmp/get_helm_3 --version {{ helm_version }}
-    #   args:
-    #     creates: /usr/local/bin/helm
-    #   environment:
-    #     USE_SUDO: "false"
-    #     HELM_INSTALL_DIR: /usr/local/bin
-    #   changed_when: "'Helm is already installed' not in helm_install_result.stdout"
-    #   register: helm_install_result
-    #   tags: ['helm']
+    # ── Longhorn installation (cluster-wide; needs >=1 kata-qemu-longhorn node) ────
+    - name: Set fact for any longhorn-capable node in cluster
+      ansible.builtin.set_fact:
+        cluster_has_longhorn: >-
+          {{
+            groups['k7_cluster']
+            | map('extract', hostvars, 'k7_backends_list')
+            | flatten | unique
+            | intersect(['kata-qemu-longhorn'])
+            | length > 0
+          }}
+
+    - name: Download Longhorn manifest
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/longhorn/longhorn/{{ longhorn_version }}/deploy/longhorn.yaml
+        dest: /tmp/longhorn.yaml
+        mode: '0644'
+        timeout: 60
+      register: longhorn_dl
+      retries: 5
+      delay: 10
+      until: longhorn_dl is success
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn']
+
+    - name: Patch Longhorn manifest with custom replica count
+      ansible.builtin.replace:
+        path: /tmp/longhorn.yaml
+        regexp: 'numberOfReplicas: "3"'
+        replace: 'numberOfReplicas: "{{ longhorn_replicas_effective }}"'
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn']
+
+    - name: Install Longhorn
+      ansible.builtin.command: k3s kubectl apply -f /tmp/longhorn.yaml
+      register: longhorn_apply
+      changed_when: "'created' in longhorn_apply.stdout or 'configured' in longhorn_apply.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn']
+
+    - name: Install CSI VolumeSnapshot CRDs (external-snapshotter)
+      ansible.builtin.shell: |
+        set -eu
+        k3s kubectl apply -k https://github.com/kubernetes-csi/external-snapshotter//client/config/crd?ref={{ snapshotter_version }}
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'snapshot']
+
+    - name: Install snapshot-controller (external-snapshotter)
+      ansible.builtin.shell: |
+        set -eu
+        k3s kubectl apply -k https://github.com/kubernetes-csi/external-snapshotter//deploy/kubernetes/snapshot-controller?ref={{ snapshotter_version }}
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'snapshot']
+
+    - name: Verify VolumeSnapshot CRDs exist
+      ansible.builtin.shell: |
+        set -eu
+        k3s kubectl get crd volumesnapshots.snapshot.storage.k8s.io
+        k3s kubectl get crd volumesnapshotcontents.snapshot.storage.k8s.io
+        k3s kubectl get crd volumesnapshotclasses.snapshot.storage.k8s.io
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'snapshot']
+
+    - name: Wait for snapshot-controller to be ready
+      ansible.builtin.shell: |
+        set -eu
+        k3s kubectl -n kube-system rollout status deployment/snapshot-controller --timeout=120s
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'snapshot']
+
+    - name: Ensure Longhorn data path exists on each longhorn-capable host
+      ansible.builtin.file:
+        path: "{{ longhorn_data_path | default('/var/lib/longhorn') }}"
+        state: directory
+        mode: '0755'
+      when: k7_has_longhorn
+      tags: ['longhorn']
+
+    - name: Ensure Longhorn VolumeSnapshotClass exists
+      ansible.builtin.shell: |
+        set -eu
+        cat <<'EOF' | k3s kubectl apply -f -
+        apiVersion: snapshot.storage.k8s.io/v1
+        kind: VolumeSnapshotClass
+        metadata:
+          name: longhorn
+        driver: driver.longhorn.io
+        deletionPolicy: Delete
+        parameters:
+          type: snap
+        EOF
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'snapshot']
+
+    - name: Wait for Longhorn manager to be ready
+      ansible.builtin.command: k3s kubectl -n longhorn-system rollout status daemonset/longhorn-manager --timeout=300s
+      retries: 5
+      delay: 15
+      register: longhorn_manager_status
+      until: longhorn_manager_status.rc == 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn']
+
+    - name: Wait for Longhorn UI deployment to be ready
+      ansible.builtin.command: k3s kubectl -n longhorn-system rollout status deployment/longhorn-ui --timeout=300s
+      retries: 5
+      delay: 15
+      register: longhorn_ui_status
+      until: longhorn_ui_status.rc == 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn']
+
+    - name: Wait for Longhorn StorageClass to be created
+      ansible.builtin.command: k3s kubectl get storageclass longhorn
+      retries: 20
+      delay: 10
+      register: longhorn_sc_check
+      until: longhorn_sc_check.rc == 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn']
+
+    # Replace the upstream StorageClass with a topology-aware version:
+    #   - WaitForFirstConsumer so PVC binding follows the pod's node
+    #   - dataLocality=best-effort to keep one replica co-located with the pod
+    # The Longhorn `longhorn-storageclass` ConfigMap is the source of truth —
+    # longhorn-driver-deployer creates the StorageClass from it at startup. We
+    # patch the ConfigMap, delete the existing SC, then force the deployer to
+    # recreate it (volumeBindingMode and parameters are immutable on a SC).
+    - name: Patch longhorn-storageclass ConfigMap with topology-aware StorageClass  # noqa: no-changed-when
+      ansible.builtin.shell: |
+        set -eu
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: longhorn-storageclass
+          namespace: longhorn-system
+          labels:
+            app.kubernetes.io/instance: longhorn
+            app.kubernetes.io/name: longhorn
+        data:
+          storageclass.yaml: |
+            kind: StorageClass
+            apiVersion: storage.k8s.io/v1
+            metadata:
+              name: longhorn
+              annotations:
+                storageclass.kubernetes.io/is-default-class: "true"
+            provisioner: driver.longhorn.io
+            allowVolumeExpansion: true
+            reclaimPolicy: "Delete"
+            volumeBindingMode: WaitForFirstConsumer
+            parameters:
+              numberOfReplicas: "{{ longhorn_replicas_effective }}"
+              staleReplicaTimeout: "2880"
+              fromBackup: ""
+              fsType: "ext4"
+              dataLocality: "best-effort"
+              unmapMarkSnapChainRemoved: "ignored"
+              disableRevisionCounter: "true"
+              dataEngine: "v1"
+              backupTargetName: "default"
+        EOF
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'topology']
+
+    - name: Delete existing Longhorn StorageClass (immutable fields, will be recreated from ConfigMap)  # noqa: no-changed-when
+      ansible.builtin.command: k3s kubectl delete storageclass longhorn --ignore-not-found
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'topology']
+
+    - name: Restart longhorn-driver-deployer to recreate StorageClass from updated ConfigMap  # noqa: no-changed-when
+      ansible.builtin.command: k3s kubectl -n longhorn-system rollout restart deployment/longhorn-driver-deployer
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'topology']
+
+    - name: Wait for longhorn-driver-deployer rollout to complete  # noqa: no-changed-when
+      ansible.builtin.command: k3s kubectl -n longhorn-system rollout status deployment/longhorn-driver-deployer --timeout=120s
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'topology']
+
+    - name: Wait for Longhorn StorageClass to be recreated with topology affinity
+      ansible.builtin.shell: |
+        set -eu
+        mode=$(k3s kubectl get storageclass longhorn -o jsonpath='{.volumeBindingMode}' 2>/dev/null || echo "")
+        [ "$mode" = "WaitForFirstConsumer" ]
+      register: sc_topology_check
+      retries: 30
+      delay: 5
+      until: sc_topology_check.rc == 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'topology']
+
+    - name: Set Longhorn replica auto-balance to best-effort  # noqa: no-changed-when
+      ansible.builtin.shell: |
+        set -eu
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: longhorn.io/v1beta2
+        kind: Setting
+        metadata:
+          name: replica-auto-balance
+          namespace: longhorn-system
+        value: "best-effort"
+        EOF
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'topology']
+
+    - name: Set Longhorn default data locality to best-effort  # noqa: no-changed-when
+      ansible.builtin.shell: |
+        set -eu
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: longhorn.io/v1beta2
+        kind: Setting
+        metadata:
+          name: default-data-locality
+          namespace: longhorn-system
+        value: "best-effort"
+        EOF
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn', 'topology']
+
+    - name: Set Longhorn default data path
+      ansible.builtin.shell: |
+        set -eu
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: longhorn.io/v1beta2
+        kind: Setting
+        metadata:
+          name: default-data-path
+          namespace: longhorn-system
+        value: "{{ longhorn_data_path | default('/var/lib/longhorn') }}"
+        EOF
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_longhorn
+      tags: ['longhorn']
+
+    - name: Ensure Longhorn extra disk path exists (per-host)
+      ansible.builtin.file:
+        path: "{{ longhorn_extra_disk }}"
+        state: directory
+        mode: '0755'
+      when:
+        - k7_has_longhorn
+        - longhorn_extra_disk is defined
+        - longhorn_extra_disk | length > 0
+      tags: ['longhorn']
+
+    - name: Register extra disk with Longhorn (per-host)
+      ansible.builtin.shell: |
+        set -eu
+        cat <<EOF | k3s kubectl apply -f -
+        apiVersion: longhorn.io/v1beta2
+        kind: Node
+        metadata:
+          name: {{ k7_k8s_node_name }}
+          namespace: longhorn-system
+        spec:
+          disks:
+            extra-disk:
+              path: "{{ longhorn_extra_disk }}"
+              allowScheduling: true
+              storageReserved: 0
+        EOF
+      changed_when: true
+      delegate_to: "{{ k7_first_master }}"
+      when:
+        - k7_has_longhorn
+        - longhorn_extra_disk is defined
+        - longhorn_extra_disk | length > 0
+      tags: ['longhorn']
+
+    # ── K7 API deployment into K3s ─────────────────────────────────────
+    # The CLI passes `k7_repo_root` as an extra-var pointing to the on-controller
+    # source tree (so the CLI can be invoked from anywhere). Fallback to the
+    # playbook-relative path for legacy callers that still bundle the playbook
+    # alongside the source tree.
+    - name: Resolve k7 repo root for API build
+      ansible.builtin.set_fact:
+        k7_repo_root_resolved: "{{ k7_repo_root | default(playbook_dir + '/../../..') }}"
+      when: k7_api_enabled | default(true) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Verify k7 repo root contains the API Dockerfile
+      ansible.builtin.stat:
+        path: "{{ k7_repo_root_resolved }}/src/k7/api/Dockerfile.api"
+      register: api_dockerfile_stat
+      when: k7_api_enabled | default(true) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Fail when API Dockerfile is missing from the resolved repo root
+      ansible.builtin.fail:
+        msg: >-
+          Resolved k7_repo_root='{{ k7_repo_root_resolved }}' on
+          {{ k7_first_master }} does not contain src/k7/api/Dockerfile.api.
+          Pass `k7_repo_root=/abs/path/to/repo` as an extra-var pointing to a
+          rsynced copy of the k7 source tree on that host.
+      when:
+        - k7_api_enabled | default(true) | bool
+        - not api_dockerfile_stat.stat.exists
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Build k7-api Docker image locally
+      # ``--network=host`` works around a recurring DNS flake on Hetzner nodes
+      # where the default Docker bridge can't resolve pypi.org / registry-1
+      # mid-build. Host networking shares the node's already-working resolver
+      # (no functional downside for a build that just fetches Python packages).
+      ansible.builtin.command: docker build --network=host -f src/k7/api/Dockerfile.api -t k7-api:local .
+      args:
+        chdir: "{{ k7_repo_root_resolved }}"
+      when: k7_api_enabled | default(true) | bool
+      register: api_build
+      changed_when: "'Successfully built' in api_build.stdout or 'exporting to image' in api_build.stdout or api_build.rc == 0"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Export k7-api image to tarball  # noqa: no-changed-when command-instead-of-shell
+      ansible.builtin.command: docker save k7-api:local -o /tmp/k7-api-local.tar
+      when: k7_api_enabled | default(true) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Fetch k7-api tarball from first master to controller
+      ansible.builtin.fetch:
+        src: /tmp/k7-api-local.tar
+        dest: /tmp/k7-api-local.tar
+        flat: true
+      when: k7_api_enabled | default(true) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Distribute k7-api tarball to every node (imagePullPolicy=Never)
+      ansible.builtin.copy:
+        src: /tmp/k7-api-local.tar
+        dest: /tmp/k7-api-local.tar
+        mode: '0644'
+      when: k7_api_enabled | default(true) | bool
+      tags: ['k7', 'api']
+
+    - name: Import k7-api image into k3s containerd on every node  # noqa: no-changed-when
+      ansible.builtin.command: k3s ctr images import /tmp/k7-api-local.tar
+      when: k7_api_enabled | default(true) | bool
+      tags: ['k7', 'api']
+
+    - name: Clean up image tarball on nodes
+      ansible.builtin.file:
+        path: /tmp/k7-api-local.tar
+        state: absent
+      when: k7_api_enabled | default(true) | bool
+      tags: ['k7', 'api']
+
+    # Spec 18g: shared token authenticating k7-api → k7-agent (and root CLI →
+    # agent) traffic. Generated once on the first master, distributed to
+    # /etc/k7/agent_token (0600) on every node; both the API deployment and
+    # the agent DaemonSet read it through the /etc/k7 hostPath mount.
+    - name: Generate shared k7 agent token on first master  # noqa: command-instead-of-shell
+      ansible.builtin.shell: umask 077 && openssl rand -hex 32 > /etc/k7/agent_token
+      args:
+        creates: /etc/k7/agent_token
+      when: k7_api_enabled | default(true) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Read agent token from first master
+      ansible.builtin.slurp:
+        src: /etc/k7/agent_token
+      register: k7_agent_token_slurp
+      no_log: true
+      when: k7_api_enabled | default(true) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Distribute agent token to every node
+      ansible.builtin.copy:
+        content: "{{ k7_agent_token_slurp.content | b64decode }}"
+        dest: /etc/k7/agent_token
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+      when: k7_api_enabled | default(true) | bool
+      tags: ['k7', 'api']
+
+    # The manifests live at src/k7/deploy/manifests/k7-api/. We use remote_src
+    # because the source tree is already rsynced to the first master at
+    # k7_repo_root_resolved (the playbook itself runs from a tempfile, so the
+    # default `playbook_dir`-relative lookup is wrong).
+    - name: Copy K7 API manifests on first master
+      ansible.builtin.copy:
+        src: "{{ k7_repo_root_resolved }}/src/k7/deploy/manifests/k7-api/"
+        dest: /etc/k7/manifests/k7-api/
+        mode: '0644'
+        remote_src: true
+      when: k7_api_enabled | default(true) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Apply K7 API manifests
+      ansible.builtin.command: k3s kubectl apply -f /etc/k7/manifests/k7-api/
+      when: k7_api_enabled | default(true) | bool
+      register: api_apply
+      changed_when: "'created' in api_apply.stdout or 'configured' in api_apply.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Wait for K7 API deployment to be ready
+      ansible.builtin.command: k3s kubectl rollout status deployment/k7-api -n kube-system --timeout=120s
+      when: k7_api_enabled | default(true) | bool
+      register: api_rollout
+      retries: 3
+      delay: 10
+      until: api_rollout.rc == 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Wait for k7-agent DaemonSet rollout (spec 18g)
+      ansible.builtin.command: k3s kubectl rollout status daemonset/k7-agent -n kube-system --timeout=180s
+      when: k7_api_enabled | default(true) | bool
+      register: agent_rollout
+      retries: 3
+      delay: 10
+      until: agent_rollout.rc == 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Get K7 API NodePort
+      ansible.builtin.command: >
+        k3s kubectl get svc k7-api -n kube-system
+        -o jsonpath='{.spec.ports[0].nodePort}'
+      when: k7_api_enabled | default(true) | bool
+      register: api_nodeport
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Get node IPv4 address for API endpoint
+      ansible.builtin.shell: >
+        k3s kubectl get nodes -o json |
+        python3 -c "import sys,json;
+        addrs=json.load(sys.stdin)['items'][0]['status']['addresses'];
+        print(next(a['address'] for a in addrs if a['type']=='InternalIP' and ':' not in a['address']))"
+      when: k7_api_enabled | default(true) | bool
+      register: node_ip
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Store API endpoint in /etc/k7/api_endpoint on every host
+      ansible.builtin.copy:
+        dest: /etc/k7/api_endpoint
+        content: "http://{{ hostvars[k7_first_master]['node_ip']['stdout'] }}:{{ hostvars[k7_first_master]['api_nodeport']['stdout'] }}"
+        mode: '0644'
+      when: k7_api_enabled | default(true) | bool
+      tags: ['k7', 'api']
 
     - name: Reminder about logging out and back in for group changes
-      debug:
-        msg: "IMPORTANT: User '{{ target_user }}' was added to 'docker' and/or 'kvm' groups. You (or the user) will need to log out and log back in on the server for these group changes to take full effect in their shell sessions."
+      ansible.builtin.debug:
+        msg: >-
+          IMPORTANT: User '{{ target_user }}' was added to 'docker' and/or 'kvm' groups.
+          Log out and back in on the server for group changes to take effect.
       tags: ['info']
-
 
   handlers:
     - name: Load xt_mark
       ansible.builtin.command: modprobe xt_mark
-
+      changed_when: false

@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k7-api
+  namespace: kube-system
+  labels:
+    app: k7-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k7-api
+  template:
+    metadata:
+      labels:
+        app: k7-api
+    spec:
+      serviceAccountName: k7-api
+      # /etc/k7 is hostPath-mounted (api_keys.json lives there). Pin the API
+      # pod to the first master so single-node and multi-node clusters both
+      # have a predictable, stable location for the host-side key store.
+      # The first master is labelled `k7.katakate.org/first-master=true` by
+      # the install playbook.
+      nodeSelector:
+        k7.katakate.org/first-master: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: k7-api
+          image: k7-api:local
+          imagePullPolicy: Never
+          # Root is required for the co-located k7d VM-op fallback (spec 18f
+          # issue 2): `crictl` must reach the k3s containerd socket (0660
+          # root:root) to resolve a pod's CRI sandbox id before talking to
+          # the k7d daemon socket. No added capabilities / not privileged.
+          # k7d VM ops only work for sandboxes on THIS node (the first
+          # master) — core fails loudly on a node mismatch; see
+          # docs/BACKENDS.md.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          env:
+            - name: K7_API_KEYS_FILE
+              value: /etc/k7/api_keys.json
+            # k7d VM operations (pause/fork) are node-local; core compares
+            # the sandbox pod's node against this (os.uname() inside a
+            # container returns the pod name, which never matches).
+            - name: K7_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: k7-config
+              mountPath: /etc/k7
+            # k7d daemon control socket (VM pause/resume/fork). Present only
+            # on nodes provisioned with the k7d backend; DirectoryOrCreate
+            # keeps the pod schedulable on clusters without it (core then
+            # fails loudly with "socket not found").
+            - name: k7d-run
+              mountPath: /run/k7d
+            # k3s containerd socket for crictl pod → CRI sandbox id lookup.
+            - name: k3s-containerd
+              mountPath: /run/k3s/containerd
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: k7-config
+          hostPath:
+            path: /etc/k7
+            type: DirectoryOrCreate
+        - name: k7d-run
+          hostPath:
+            path: /run/k7d
+            type: DirectoryOrCreate
+        - name: k3s-containerd
+          hostPath:
+            path: /run/k3s/containerd
+            type: Directory

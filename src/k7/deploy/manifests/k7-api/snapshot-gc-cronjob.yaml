@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k7-snapshot-gc
+  namespace: kube-system
+  labels:
+    app: k7-snapshot-gc
+spec:
+  # Sweep every 10 minutes — matches K7Core.gc_snapshots' default keep window.
+  schedule: "*/10 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app: k7-snapshot-gc
+        spec:
+          serviceAccountName: k7-api
+          restartPolicy: OnFailure
+          nodeSelector:
+            k7.katakate.org/first-master: "true"
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          containers:
+            - name: gc
+              image: k7-api:local
+              imagePullPolicy: Never
+              command: ["python", "-m", "k7.api.snapshot_gc"]
+              env:
+                - name: K7_GC_KEEP_FORK_FOR_MINUTES
+                  value: "10"
+                - name: K7_GC_DRY_RUN
+                  value: "false"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: "500m"
+                  memory: 256Mi

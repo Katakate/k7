@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "k7"
+version = "0.2.0"
+description = "Self-hosted VM sandboxes for untrusted and AI code (CLI, API, SDK)"
+readme = "README.md"
+requires-python = ">=3.10.11"
+dependencies = [
+    "fastapi>=0.135.3",
+    "httpx>=0.28.1",
+    "kubernetes-asyncio>=31.1.0",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.26",
+    "pyyaml>=6.0.3",
+    "requests>=2.32.3",
+    "rich>=14.3.3",
+    "typer>=0.24.1",
+    "uvicorn[standard]>=0.44.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/k7", "src/k7_sdk", "src/katakate"]
+
+[dependency-groups]
+dev = [
+    "ansible-lint>=26.4.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=0.25.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.10",
+    "ty>=0.0.29",
+]
+
+# ---------- ruff ----------
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line length handled by formatter
+    "B008",   # function call in defaults — standard typer/fastapi pattern
+    "B904",   # raise-without-from in except (many existing patterns)
+    "SIM105", # contextlib.suppress — existing try/except/pass patterns are intentional
+    "SIM108", # ternary — readability preference
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["k7", "k7_sdk", "katakate"]
+
+# ---------- pytest ----------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: tests requiring a live k7 node",
+    "firecracker: tests specific to kata-firecracker-devmapper backend",
+    "qemu: tests specific to kata-qemu-longhorn backend",
+    "k7d: tests specific to the k7d backend",
+    "multinode: tests requiring a multi-node k7 cluster (>=2 Ready nodes)",
+    "bench: spec-10b benchmark module; opt-in only (-m bench), not run by default",
+]
+addopts = [
+    "--strict-markers",
+    "-m", "not integration and not bench",
+    "--cov=src/k7",
+    "--cov-report=term-missing",
+]
+asyncio_mode = "auto"
+
+# ---------- coverage ----------
+[tool.coverage.run]
+source = ["src/k7"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "pass",
+]

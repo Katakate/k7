@@ -1,0 +1,22 @@
+# Spec 18g: restrict pod-originated ingress to the k7-agent DaemonSet to
+# the k7-api pod only. `host` / `remote-node` entities stay allowed so
+# kubelet health probes and root CLI usage on cluster nodes keep working —
+# those callers still need the shared token (/etc/k7/agent_token, root
+# 0600), which is the actual authentication. Sandbox pods and any other
+# workload pods are denied at the network layer.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: k7-agent-ingress
+  namespace: kube-system
+spec:
+  endpointSelector:
+    matchLabels:
+      app: k7-agent
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: k7-api
+    - fromEntities:
+        - host
+        - remote-node

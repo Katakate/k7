@@ -14,11 +14,9 @@ ARCH=$(uname -m)
 case "$ARCH" in
   x86_64)
     DEB_ARCH="amd64"
-    DOCKER_PLATFORM="linux/amd64"
     ;;
   aarch64|arm64)
     DEB_ARCH="arm64"
-    DOCKER_PLATFORM="linux/arm64"
     ;;
   *)
     echo "Unsupported architecture: $ARCH"

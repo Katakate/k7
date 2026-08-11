@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k7-agent
+  namespace: kube-system
+  labels:
+    app: k7-agent
+spec:
+  selector:
+    matchLabels:
+      app: k7-agent
+  template:
+    metadata:
+      labels:
+        app: k7-agent
+    spec:
+      # Reuses the k7-api ServiceAccount/RBAC: the agent runs the same
+      # K7Core code (pod lookup, deployment annotate/create for
+      # pause/resume/fork).
+      serviceAccountName: k7-api
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: k7-agent
+          image: k7-api:local
+          imagePullPolicy: Never
+          # Same image as k7-api, different app: only the node-local VM ops
+          # and the storage endpoint (spec 18g).
+          command: ["uvicorn", "k7.api.agent:app", "--host", "0.0.0.0", "--port", "8000"]
+          # Privileged: `lvs` (kfd thin-pool utilization) issues device-mapper
+          # ioctls and reads raw block devices under the hostPath-mounted
+          # /dev — the default device cgroup denies that to unprivileged
+          # containers. Root (the image defaults to uid 1000) is required for
+          # crictl, the k7d socket, and the 0600 root-owned agent token.
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 0
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          env:
+            - name: K7_AGENT
+              value: "1"
+            - name: K7_AGENT_TOKEN_FILE
+              value: /etc/k7/agent_token
+            - name: K7_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            # Shared agent token (playbook writes it on every node).
+            - name: k7-config
+              mountPath: /etc/k7
+              readOnly: true
+            # k7d daemon control socket (VM pause/resume/fork/lookup).
+            - name: k7d-run
+              mountPath: /run/k7d
+            # k3s containerd socket for crictl pod → CRI sandbox id lookup.
+            - name: k3s-containerd
+              mountPath: /run/k3s/containerd
+            # k7d disks pool (XFS loopback mount) for `df` utilization.
+            - name: k7d-lib
+              mountPath: /var/lib/k7d
+              readOnly: true
+            # Raw devices for `lvs` (kfd thin-pool utilization).
+            - name: dev
+              mountPath: /dev
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: k7-config
+          hostPath:
+            path: /etc/k7
+            type: DirectoryOrCreate
+        - name: k7d-run
+          hostPath:
+            path: /run/k7d
+            type: DirectoryOrCreate
+        - name: k3s-containerd
+          hostPath:
+            path: /run/k3s/containerd
+            type: Directory
+        - name: k7d-lib
+          hostPath:
+            path: /var/lib/k7d
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory

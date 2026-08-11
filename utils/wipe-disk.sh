@@ -33,7 +33,11 @@ echo "=============================="
 echo " YOU ARE ABOUT TO WIPE: $DEVICE"
 echo "=============================="
 echo "This will destroy ALL partitions, RAID/LVM/crypto metadata, and filesystems."
-read -r -p "Type YES to proceed: " confirm
+confirm="${WIPE_CONFIRM:-}"
+if [[ "$confirm" != "YES" ]]; then
+  read -r -p "Type YES to proceed: " confirm
+fi
+
 [[ "$confirm" == "YES" ]] || { echo "Aborted."; exit 0; }
 
 # Helper: enumerate child partitions of the device
@@ -50,7 +54,7 @@ while read -r src; do
   while read -r mnt; do
     [[ -n "$mnt" ]] && run umount -R "$mnt" || true
   done < <(findmnt -rno TARGET -S "$src" 2>/dev/null || true)
-done < <(printf "%s\n" "$DEVICE" $(partitions))
+done < <(printf "%s\n" "$DEVICE" "$(partitions)")
 
 # Disable any swap that points to the device/partitions
 if [[ -r /proc/swaps ]]; then
@@ -64,7 +68,7 @@ fi
 echo "[2/7] Closing dm-crypt (LUKS) mappings on top of this device (best effort)..."
 if command -v lsblk >/dev/null 2>&1; then
   # Find any device-mapper names that depend on our base device or its parts
-  while read -r dmname dtype pk; do
+  while read -r dmname dtype _pk; do
     [[ "$dtype" != "crypt" ]] && continue
     # If this crypt mapper ultimately uses our device or its partitions, close it
     if lsblk -rno PKNAME "/dev/$dmname" 2>/dev/null | grep -Eq "$(basename "$DEVICE")(p[0-9]+)?"; then
