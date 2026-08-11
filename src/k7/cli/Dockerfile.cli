@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y python3 python3-pip python3-venv gcc pa
 WORKDIR /app
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
-RUN pip install --no-cache-dir nuitka typer kubernetes kubernetes_asyncio httpx python-dotenv pyyaml rich requests
+RUN pip install --no-cache-dir nuitka typer click kubernetes kubernetes_asyncio httpx python-dotenv pyyaml rich requests
 
 # Copy source packages into build context (src layout). The CLI imports
 # k7_sdk (its API client since the SDK rename) — without it the onefile
