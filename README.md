@@ -6,7 +6,6 @@
 
 
 <p align="center">
-  <a href="https://katakate.org"><img src="https://img.shields.io/badge/website-katakate.org-orange"></a>
   <a href="https://github.com/Katakate/k7/stargazers"><img src="https://img.shields.io/github/stars/Katakate/k7?style=social"></a>
   <a href="https://docs.katakate.org">
     <img src="https://img.shields.io/badge/docs-docs.katakate.org-orange" />
