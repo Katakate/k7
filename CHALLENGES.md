@@ -297,3 +297,33 @@ the shim↔agent ttrpc channel).
 
 **Time lost:** ~3 h (bench-faithful repro, guest-side dmesg/meminfo
 streaming, two disproven hypotheses, virtiofsd A/B).
+
+## 11. Control-plane SSRF via sandbox `image` + missing API-key namespace authz (spec 10h)
+
+**Symptom:** Authenticated callers of `k7-api` 0.2.0 could point the
+control plane at internal/loopback/metadata addresses by supplying a
+crafted container `image` (e.g. `169.254.169.254/...` or
+`127.0.0.1:PORT/...`). Separately, any valid API key could operate on any
+Kubernetes namespace — keys were authenticated but not authorized.
+
+**Root cause:** `_get_registry_image_config` parsed the registry host
+straight from the user-controlled image reference and issued `httpx`
+GETs with no allowlist and no private/loopback/link-local rejection; the
+`localhost` case even downgraded to plaintext `http`. On the authz side,
+`verify_api_key` returned key metadata that no handler consulted, and
+`namespace` was a free query/body parameter on every route.
+
+**Fix:**
+- `_assert_registry_host_allowed` — allowlist (default public registries +
+  `K7_REGISTRY_ALLOWLIST`) plus resolve-and-deny for non-public addresses;
+  called before any registry HTTP; `follow_redirects=False`; localhost→http
+  downgrade removed. Also enforced early in `create_sandbox`.
+- Optional `"namespaces": [...]` on API key records; CLI
+  `generate-api-key -n`; `authorize_namespace` applied on every
+  namespace-bearing endpoint. Absent/empty scope remains unrestricted.
+
+**Reference:** Responsible disclosure against `k7-api` 0.2.0
+(SSRF ≈ CVSS 7.1; missing namespace authz ≈ CVSS 9.1 in multi-tenant).
+spec 10h-security-ssrf-and-namespace-authz.
+
+**Time lost:** n/a (implemented from disclosure + spec).

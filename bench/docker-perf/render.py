@@ -35,7 +35,7 @@ from pathlib import Path
 from statistics import median
 
 # Stable column ordering for the rendered tables.
-ENVS: list[str] = ["host", "k7-fd", "k7-ql-r1", "k7-ql-r2", "k7-ql-r3"]
+ENVS: list[str] = ["host", "k7-fd", "k7-ql-r1", "k7-ql-r2", "k7-ql-r3", "k7d"]
 
 # Stable row ordering, plus the human-readable column label for each op.
 OP_DISPLAY: list[tuple[str, str]] = [

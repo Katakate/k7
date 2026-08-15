@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from k7.core.core import K7Core
 
 # --- _parse_image_reference ---
@@ -194,6 +196,14 @@ def _patch_httpx(get_fn):
 
 
 class TestGetRegistryImageConfig:
+    @pytest.fixture(autouse=True)
+    def _public_dns(self, monkeypatch):
+        """Keep SSRF allowlist checks offline-friendly in unit tests."""
+        monkeypatch.setattr(
+            "k7.core.core.socket.getaddrinfo",
+            lambda *a, **k: [(None, None, None, None, ("1.1.1.1", 0))],
+        )
+
     async def test_simple_manifest(self, core: K7Core):
         """Non-Docker-Hub registry with a direct manifest (not a list)."""
         manifest = {

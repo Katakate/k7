@@ -2,10 +2,13 @@
 
 ## Supported Versions
 
-This project is pre-1.0 (targeting **0.1.0** for the public cut; working
-tree may still show `0.0.4-dev`) and under active development. Breaking
-changes may occur until 1.0.0. Security fixes land on the latest release
-line only.
+This project is pre-1.0 and under active development; breaking changes may
+occur until 1.0.0. Security fixes land on the latest release line only.
+
+| Version | Supported |
+|---------|-----------|
+| 0.2.1 and later | Yes |
+| 0.2.0 and earlier | No — upgrade to 0.2.1 |
 
 ## Reporting a Vulnerability
 
@@ -43,7 +46,18 @@ Do **not** open a public issue for security-sensitive reports.
   of the VM boundary.
 - The control plane API uses API keys with hashed storage and expiry
   (file-backed by default at `/etc/k7/api_keys.json` — rotate and protect
-  that file).
+  that file). Keys may optionally be scoped to one or more namespaces
+  (`k7 generate-api-key -n <ns>`); absent/empty scope keeps the historical
+  unrestricted behaviour (backward compatible). Scoped keys are enforced
+  on every namespace-bearing endpoint — they cannot list across all
+  namespaces or touch namespaces outside their list.
+- Control-plane OCI registry inspection (used to resolve image
+  entrypoint/cmd) rejects registry hosts that are not on an allowlist
+  (default: `registry-1.docker.io`, `ghcr.io`, `quay.io`, `public.ecr.aws`;
+  extend via `K7_REGISTRY_ALLOWLIST`) and rejects any host that resolves
+  to loopback/private/link-local/metadata/reserved addresses. Redirect
+  following is disabled. The previous `localhost`→`http` downgrade path
+  has been removed.
 - **Ingress** to sandboxes is denied by default (NetworkPolicy).
   **Egress** is per-sandbox: open, blocked, CIDR allowlist, or **FQDN**
   allowlist when Cilium is the CNI (default). DNS is blocked by default
@@ -57,6 +71,8 @@ See also the docs: security model, networking, and backends comparison.
 
 - No rate limiting or abuse protection at the API layer yet.
 - API key storage is local file-backed; treat the API host as trusted.
+  Namespace scoping is an opt-in tenancy boundary on top of that model —
+  unscoped keys still have full cross-namespace control-plane access.
 - Young project; no independent security audit yet.
 - The `k7d` backend has a different isolation trade-off for CoW sibling
   forks — see k7d's `SECURITY.md`.

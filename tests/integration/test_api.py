@@ -51,7 +51,7 @@ def _api_pod_ready() -> bool:
     return result.returncode == 0 and result.stdout.strip() not in ("", "0")
 
 
-def _generate_test_api_key() -> str:
+def _generate_test_api_key(*, name: str = "integration-test", namespaces: list[str] | None = None) -> str:
     """Write a test API key directly into the keys file, return the raw token."""
     import os
     import secrets as _secrets
@@ -63,12 +63,15 @@ def _generate_test_api_key() -> str:
     if K7_API_KEYS_FILE.exists():
         keys = json.loads(K7_API_KEYS_FILE.read_text())
 
-    keys[key_hash] = {
-        "name": "integration-test",
+    entry: dict = {
+        "name": name,
         "created": int(time.time()),
         "expires": int(time.time()) + 3600,
         "last_used": None,
     }
+    if namespaces:
+        entry["namespaces"] = list(namespaces)
+    keys[key_hash] = entry
     K7_API_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
     K7_API_KEYS_FILE.write_text(json.dumps(keys, indent=2))
     # Mirror production permissions (`k7 generate-api-key`): 0600 owned by
@@ -600,3 +603,174 @@ class TestSdkSandboxProxy:
 
         out = forked.exec("cat /mnt/state/marker")
         assert "sdk-fork-marker" in out["stdout"]
+
+
+# ---------------------------------------------------------------------------
+# Spec 10h: SSRF guard + API-key namespace authorization
+# ---------------------------------------------------------------------------
+
+
+class TestApiSsrfGuard:
+    """Control-plane must not fetch OCI manifests from internal/loopback hosts."""
+
+    def test_loopback_image_rejected_and_listener_untouched(
+        self, api_base_url: str, api_headers: dict, test_namespace: str
+    ):
+        port = 8199
+        # Tiny python listener with a hit counter. Bound on all interfaces so a
+        # buggy control-plane fetch via the node IP would also be visible; the
+        # image uses 127.0.0.1 which the guard must reject before any dial.
+        counter = Path("/tmp/k7-ssrf-listener-hits")
+        if counter.exists():
+            counter.unlink()
+        listener = subprocess.Popen(
+            [
+                "python3",
+                "-c",
+                (
+                    "import socket, pathlib\n"
+                    f"p=pathlib.Path({str(counter)!r})\n"
+                    "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                    f"s.bind(('0.0.0.0', {port})); s.listen(5); s.settimeout(8)\n"
+                    "try:\n"
+                    "  c,_=s.accept(); p.write_text('hit'); c.close()\n"
+                    "except Exception:\n"
+                    "  pass\n"
+                    "finally:\n"
+                    "  s.close()\n"
+                ),
+            ],
+        )
+        try:
+            time.sleep(0.4)
+            r = httpx.post(
+                f"{api_base_url}/api/v1/sandboxes",
+                json={
+                    "name": "ssrf-loopback",
+                    "image": f"127.0.0.1:{port}/x:latest",
+                    "namespace": test_namespace,
+                },
+                headers=api_headers,
+                timeout=15,
+            )
+            assert r.status_code >= 400, f"expected error, got {r.status_code}: {r.text}"
+            assert "not allowed" in r.text.lower() or "registry" in r.text.lower()
+            time.sleep(0.5)
+            assert not counter.exists(), "listener received a connection — SSRF guard failed"
+        finally:
+            listener.kill()
+            try:
+                listener.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def test_metadata_image_rejected(self, api_base_url: str, api_headers: dict, test_namespace: str):
+        r = httpx.post(
+            f"{api_base_url}/api/v1/sandboxes",
+            json={
+                "name": "ssrf-metadata",
+                "image": "169.254.169.254/latest/meta-data:latest",
+                "namespace": test_namespace,
+            },
+            headers=api_headers,
+            timeout=15,
+        )
+        assert r.status_code >= 400
+        assert "not allowed" in r.text.lower() or "registry" in r.text.lower()
+
+    def test_public_image_create_still_works(
+        self, api_base_url: str, api_headers: dict, test_namespace: str, cleanup_sandbox
+    ):
+        name = "ssrf-public-ok"
+        cleanup_sandbox(name, test_namespace)
+        r = httpx.post(
+            f"{api_base_url}/api/v1/sandboxes",
+            json={"name": name, "image": "alpine:3.21", "namespace": test_namespace},
+            headers=api_headers,
+            timeout=30,
+        )
+        assert r.status_code == 201, f"create failed: {r.text}"
+        _wait_for_sandbox_ready(api_base_url, api_headers, name, test_namespace)
+
+
+class TestApiNamespaceAuthz:
+    """Scoped API keys may only operate in their listed namespaces."""
+
+    def test_scoped_key_alpha_ok_beta_forbidden(self, api_base_url: str, test_namespace: str, cleanup_sandbox):
+        # Ensure namespaces exist (create via unscoped key / kubectl).
+        for ns in ("alpha", "beta"):
+            subprocess.run(
+                ["k3s", "kubectl", "create", "namespace", ns],
+                capture_output=True,
+                text=True,
+            )
+
+        scoped = _generate_test_api_key(name="integ-scoped-alpha", namespaces=["alpha"])
+        scoped_headers = {"X-API-Key": scoped}
+        unscoped = _generate_test_api_key(name="integ-unscoped")
+        unscoped_headers = {"X-API-Key": unscoped}
+
+        name = "ns-authz-sb"
+        cleanup_sandbox(name, "alpha")
+        cleanup_sandbox(name, "beta")
+
+        # Scoped key: create in alpha OK
+        r = httpx.post(
+            f"{api_base_url}/api/v1/sandboxes",
+            json={"name": name, "image": "alpine:3.21", "namespace": "alpha"},
+            headers=scoped_headers,
+            timeout=30,
+        )
+        assert r.status_code == 201, f"scoped create alpha failed: {r.text}"
+
+        # List/delete in alpha OK
+        lr = httpx.get(
+            f"{api_base_url}/api/v1/sandboxes",
+            params={"namespace": "alpha"},
+            headers=scoped_headers,
+            timeout=10,
+        )
+        assert lr.status_code == 200
+
+        # beta denied
+        br = httpx.get(
+            f"{api_base_url}/api/v1/sandboxes",
+            params={"namespace": "beta"},
+            headers=scoped_headers,
+            timeout=10,
+        )
+        assert br.status_code == 403
+
+        br2 = httpx.post(
+            f"{api_base_url}/api/v1/sandboxes",
+            json={"name": name, "image": "alpine:3.21", "namespace": "beta"},
+            headers=scoped_headers,
+            timeout=15,
+        )
+        assert br2.status_code == 403
+
+        # all-namespaces list denied
+        ar = httpx.get(
+            f"{api_base_url}/api/v1/sandboxes",
+            headers=scoped_headers,
+            timeout=10,
+        )
+        assert ar.status_code == 403
+
+        # Unscoped key still works on beta
+        ur = httpx.get(
+            f"{api_base_url}/api/v1/sandboxes",
+            params={"namespace": "beta"},
+            headers=unscoped_headers,
+            timeout=10,
+        )
+        assert ur.status_code == 200
+
+        # Cleanup via scoped key in alpha
+        dr = httpx.delete(
+            f"{api_base_url}/api/v1/sandboxes/{name}",
+            params={"namespace": "alpha"},
+            headers=scoped_headers,
+            timeout=30,
+        )
+        assert dr.status_code == 200, dr.text

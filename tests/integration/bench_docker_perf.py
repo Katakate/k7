@@ -1,4 +1,4 @@
-"""Spec 10b/18e: Docker workload benchmark — host vs k7-fd vs k7-ql (r=1..3).
+"""Spec 10b/18e/18h: Docker workload benchmark — host vs k7-fd vs k7-ql vs k7d.
 
 Why a pytest module rather than a separate bash harness:
 ``tests/integration/test_sidecar_docker.py`` already pioneered the pattern
@@ -7,27 +7,28 @@ docker commands via ``k7_core.exec_command``." This benchmark just times
 that same pattern — no new infrastructure, no shelling-out to a separate
 script, no fiddly Alpine-vs-bash portability problems.
 
-Why all four environments are valid:
+Why these environments are valid:
 ``test_sidecar_docker.py`` has a note claiming Docker-DinD doesn't work on
 the Firecracker backend. That note is wrong — confirmed by a manual probe
 on the multi-node cluster: ``k7 create --backend kfd --sidecar docker`` +
 ``docker run hello-world`` exits 0 in ~3s. The sidecar wiring in
-``core.py`` (around line 1537) is symmetric across backends; the only
-per-backend branch is where the docker daemon's ``/var/lib/docker`` lives
-(emptyDir on fd, Longhorn PVC sub_path on ql), which is exactly the
-isolation we want from a benchmark:
+``core.py`` is symmetric across backends; the only per-backend branch is
+where the docker daemon's ``/var/lib/docker`` lives (emptyDir on fd/k7d,
+Longhorn PVC sub_path on ql), which is exactly the isolation we want:
 
   - ``k7-fd``  — docker-in-VM without Longhorn in the storage path.
   - ``k7-ql-r1`` — adds Longhorn r=1 (one local replica).
   - ``k7-ql-r2`` — adds Longhorn r=2 (one local + one cross-node sync).
   - ``k7-ql-r3`` — Longhorn r=3 (replicas on all three nodes of an HA
     cluster; spec 18e — the full redundancy write-amplification cost).
+  - ``k7d`` — docker-in-VM on k7d (dind data on guest tmpfs / emptyDir;
+    no Longhorn). Needs a large ``--memory`` because layers live in RAM.
 
 Marker / invocation:
 This file uses ``@pytest.mark.bench`` so it doesn't run with the rest of
 ``-m integration``. Drive it explicitly:
 
-    K7_BENCH_ENVS=host,k7-fd,k7-ql-r1,k7-ql-r2,k7-ql-r3 \\
+    K7_BENCH_ENVS=host,k7-fd,k7-ql-r1,k7-ql-r2,k7-ql-r3,k7d \\
     K7_BENCH_OUT=/tmp/bench-out \\
     uv run pytest -m bench tests/integration/bench_docker_perf.py -v
 
@@ -333,6 +334,7 @@ async def _bench_sandbox(
     backend_extra: dict[str, str],
     out_dir: Path,
     longhorn_replicas: int | None = None,
+    limits: dict[str, str] | None = None,
 ) -> Path:
     name = f"bench-{label.replace('_', '-')}"
     cfg = SandboxConfig(
@@ -345,9 +347,10 @@ async def _bench_sandbox(
         # + the 2k-files / 512 MB workloads. Default 10Gi is the minimum;
         # keep it explicit for reproducibility — and only meaningful when
         # the root disk is a Longhorn PVC (kata-qemu-longhorn). The firecracker
-        # backend ignores this and the docker daemon's data lives on the
-        # sidecar's emptyDir.
+        # / k7d backends ignore this and the docker daemon's data lives on
+        # the sidecar's emptyDir (guest tmpfs on k7d — size via ``limits``).
         root_disk_size="20Gi",
+        limits=limits,
     )
     create = await k7_core.create_sandbox(cfg)
     assert create.success, f"create {name}: {create.error}"
@@ -678,3 +681,32 @@ async def test_bench_k7_ql_r3(
     """Longhorn r=3 — the full redundancy cost on a 3-node HA cluster."""
     _maybe_skip("k7-ql-r3")
     await _bench_ql(k7_core, test_namespace, bench_out_dir, bench_logs, replicas=3)
+
+
+@pytest.mark.k7d
+async def test_bench_k7d(
+    k7_core: K7Core,
+    test_namespace: str,
+    bench_out_dir: Path,
+    bench_logs: list[Path],
+):
+    """k7d docker-in-VM — dind data on guest tmpfs (no Longhorn).
+
+    3Gi guest + 4 vCPU: largest size that reliably reaches Ready today.
+    ≥4Gi currently breaks k7d agent connect on create
+    (``Connection timed out`` / ``No such device``) — use 3Gi until
+    that is root-caused. Guest overlay scales with memory (~1.5 Gi at
+    3Gi), so layers + the 512 MB fsync share that budget.
+    """
+    _maybe_skip("k7d")
+    log = await _bench_sandbox(
+        k7_core,
+        label="k7d",
+        namespace=test_namespace,
+        backend="k7d",
+        backend_extra={"docker_data_path": "emptyDir/tmpfs"},
+        out_dir=bench_out_dir,
+        limits={"memory": "3Gi", "cpu": "4"},
+    )
+    bench_logs.append(log)
+    print(f"\n[bench] k7d log → {log}")

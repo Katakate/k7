@@ -1519,7 +1519,16 @@ def top(
 
 
 @app.command()
-def generate_api_key(name: str, expires_days: int = typer.Option(365, help="API key expiration in days")):
+def generate_api_key(
+    name: str,
+    expires_days: int = typer.Option(365, help="API key expiration in days"),
+    namespace: builtins.list[str] | None = typer.Option(
+        None,
+        "--namespace",
+        "-n",
+        help="Restrict key to this namespace (repeatable). Omit for unrestricted access.",
+    ),
+):
     """Generate a new API key."""
     api_key = secrets.token_urlsafe(32)
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
@@ -1530,18 +1539,33 @@ def generate_api_key(name: str, expires_days: int = typer.Option(365, help="API 
             api_keys = json.load(f)
 
     expiry_timestamp = int((datetime.now() + timedelta(days=expires_days)).timestamp())
-    api_keys[key_hash] = {
+    entry: dict = {
         "name": name,
         "created": int(time.time()),
         "expires": expiry_timestamp,
         "last_used": None,
     }
+    if namespace:
+        # Preserve order, drop empties/duplicates.
+        seen: set[str] = set()
+        scoped: builtins.list[str] = []
+        for ns in namespace:
+            if ns and ns not in seen:
+                seen.add(ns)
+                scoped.append(ns)
+        if scoped:
+            entry["namespaces"] = scoped
+    api_keys[key_hash] = entry
 
     _write_api_keys(api_keys)
 
     typer.echo(f"Generated API key for '{name}':")
     typer.echo(f"API Key: {api_key}")
     typer.echo(f"Expires: {datetime.fromtimestamp(expiry_timestamp)}")
+    if entry.get("namespaces"):
+        typer.echo(f"Namespaces: {', '.join(entry['namespaces'])}")
+    else:
+        typer.echo("Namespaces: * (unrestricted)")
     typer.echo("Keep this key secure - it won't be shown again!")
 
 
@@ -1561,6 +1585,7 @@ def list_api_keys():
     table.add_column("Created", style="blue")
     table.add_column("Expires", style="yellow")
     table.add_column("Last Used", style="green")
+    table.add_column("Namespaces", style="magenta")
 
     for _key_hash, key_data in api_keys.items():
         created = datetime.fromtimestamp(key_data["created"]).strftime("%Y-%m-%d %H:%M")
@@ -1568,8 +1593,10 @@ def list_api_keys():
         last_used = "Never"
         if key_data["last_used"]:
             last_used = datetime.fromtimestamp(key_data["last_used"]).strftime("%Y-%m-%d %H:%M")
+        namespaces = key_data.get("namespaces") or []
+        ns_col = "*" if not namespaces else ", ".join(namespaces)
 
-        table.add_row(key_data["name"], created, expires, last_used)
+        table.add_row(key_data["name"], created, expires, last_used, ns_col)
 
     console.print(table)
 

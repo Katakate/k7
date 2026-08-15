@@ -44,6 +44,10 @@ override_dh_auto_install:
 	# Use dh_install via debian/k7.install; do not run project Makefile install
 	true
 
+override_dh_auto_test:
+	# Packaging ships a prebuilt Nuitka onefile; do not run the pytest suite in chroots
+	true
+
 override_dh_strip:
 	# Do not strip the Nuitka onefile; payload is appended to the ELF
 	true

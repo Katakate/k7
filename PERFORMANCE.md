@@ -248,3 +248,25 @@ Two takeaways (spec 18f issue 8 / 18h):
   takes >1 s while dockerd copies vfs layers), which cuts the
   `ttrpc: received message on inactive stream` noise but was NOT
   sufficient on its own.
+
+## k7d docker-perf leg (2026-08-11, partial)
+
+`test_bench_k7d` is wired (`K7_BENCH_ENVS=k7d`). Guest sized at **3Gi /
+4 vCPU** — largest size that reliably reaches Ready on this k7d build;
+≥~4Gi fails agent connect (`Connection timed out`, MMIO base moves past
+4 GiB). At 3Gi the guest tmpfs upper is ~1.5 GiB, which is enough for
+`docker pull debian:12-slim` but not for a sustained no-cache build of
+`bench.Dockerfile` (apt+pip layers already ~1.4 GiB before the cpython
+clone / 256 MB `dd`).
+
+Measured on the 3-node HA cluster (pod on k7-node-02), 3 reps, no warmup:
+
+| op | k7d (3Gi) | notes |
+|---|---|---|
+| pull debian:12-slim | **9.99 s** (9.88–10.19) | overlay2; slow vs kql's ~2.4 s lifecycle-bench pull — same NAT/tmpfs path |
+| build / run_* | n/a | hits ENOSPC / guest wedge mid-build under the 1.5 GiB tmpfs ceiling |
+
+One-shot smoke (same limits, single `docker build --no-cache`) completed in
+~302 s earlier the same day — reproducible multi-rep builds did not.
+Unblocking the full column needs a k7d fix for ≥4 GiB guests (or a larger
+non-tmpfs docker data disk).

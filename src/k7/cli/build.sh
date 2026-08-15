@@ -57,7 +57,7 @@ Version: __VERSION__
 Section: utils
 Priority: optional
 Architecture: ${DEB_ARCH}
-Maintainer: K7 Team <support@example.com>
+Maintainer: K7 Team <hi@katakate.org>
 Description: K7 CLI for sandbox management
  Provides the \`k7\` command with embedded installer playbook.
 EOF

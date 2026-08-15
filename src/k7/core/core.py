@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -214,6 +215,71 @@ class K7Core:
             repo = ref
         return registry, repo, tag
 
+    @staticmethod
+    def _registry_hostname(registry: str) -> str:
+        """Extract hostname from a registry authority (host or host:port or [ipv6]:port)."""
+        if not registry or not isinstance(registry, str):
+            raise ValueError("Registry host must be a non-empty string")
+        if registry.startswith("["):
+            end = registry.find("]")
+            if end == -1:
+                raise ValueError(f"Invalid registry host: {registry}")
+            return registry[1:end]
+        if ":" in registry:
+            host, maybe_port = registry.rsplit(":", 1)
+            if maybe_port.isdigit():
+                return host
+        return registry
+
+    def _registry_allowlist(self) -> set[str]:
+        """Default public registries, extended by ``K7_REGISTRY_ALLOWLIST`` (comma-separated)."""
+        allow = {"registry-1.docker.io", "ghcr.io", "quay.io", "public.ecr.aws"}
+        extra = os.environ.get("K7_REGISTRY_ALLOWLIST", "").strip()
+        if extra:
+            allow |= {h.strip().lower() for h in extra.split(",") if h.strip()}
+        return allow
+
+    def _assert_registry_host_allowed(self, registry: str) -> None:
+        """Reject registry hosts that resolve to non-public addresses (SSRF guard).
+
+        Always-on backstop: every resolved A/AAAA must be a public unicast address
+        (not loopback/private/link-local/reserved/multicast/unspecified). Tightening
+        layer: hostname must be in the allowlist (defaults + ``K7_REGISTRY_ALLOWLIST``).
+        """
+        hostname = self._registry_hostname(registry).lower()
+        if hostname in {"localhost", "metadata.google.internal"}:
+            raise ValueError(f"Registry host not allowed: {registry}")
+
+        allowlist = self._registry_allowlist()
+        if hostname not in allowlist:
+            raise ValueError(
+                f"Registry host not allowed: {registry} (not in allowlist; set K7_REGISTRY_ALLOWLIST to extend)"
+            )
+
+        try:
+            infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            raise ValueError(f"Cannot resolve registry host {hostname}: {e}") from e
+        if not infos:
+            raise ValueError(f"Cannot resolve registry host {hostname}: no addresses")
+
+        for info in infos:
+            ip_str = info[4][0]
+            ip = ipaddress.ip_address(ip_str)
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            ):
+                raise ValueError(f"Registry host not allowed: {registry} resolves to non-public address {ip_str}")
+
+    async def _assert_registry_host_allowed_async(self, registry: str) -> None:
+        """Async wrapper so DNS resolution does not block the API event loop."""
+        await asyncio.to_thread(self._assert_registry_host_allowed, registry)
+
     async def _get_registry_image_config(self, image: str) -> dict:
         """Fetch the OCI image config from a container registry.
 
@@ -221,17 +287,20 @@ class K7Core:
         OCI-compliant registry that supports anonymous pulls.
         """
         registry, repo, tag = self._parse_image_reference(image)
-        scheme = "http" if registry == "localhost" or registry.startswith("localhost:") else "https"
-        base = f"{scheme}://{registry}"
+        await self._assert_registry_host_allowed_async(registry)
+        # Always HTTPS — the previous localhost→http downgrade was an SSRF footgun.
+        base = f"https://{registry}"
 
         headers: dict[str, str] = {}
 
-        async with httpx.AsyncClient() as http_client:
-            if "docker.io" in registry:
+        async with httpx.AsyncClient(follow_redirects=False) as http_client:
+            # Token endpoint is a fixed public host; only for the real Docker Hub registry.
+            if registry in {"registry-1.docker.io", "docker.io"}:
                 try:
                     token_resp = await http_client.get(
                         f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull",
                         timeout=10,
+                        follow_redirects=False,
                     )
                     token_resp.raise_for_status()
                     token = token_resp.json()["token"]
@@ -250,7 +319,7 @@ class K7Core:
             headers["Accept"] = accept
 
             manifest_url = f"{base}/v2/{repo}/manifests/{tag}"
-            manifest_resp = await http_client.get(manifest_url, headers=headers, timeout=15)
+            manifest_resp = await http_client.get(manifest_url, headers=headers, timeout=15, follow_redirects=False)
             manifest_resp.raise_for_status()
             manifest = manifest_resp.json()
 
@@ -265,7 +334,10 @@ class K7Core:
                             "application/vnd.docker.distribution.manifest.v2+json"
                         )
                         inner_resp = await http_client.get(
-                            f"{base}/v2/{repo}/manifests/{digest}", headers=headers, timeout=15
+                            f"{base}/v2/{repo}/manifests/{digest}",
+                            headers=headers,
+                            timeout=15,
+                            follow_redirects=False,
                         )
                         inner_resp.raise_for_status()
                         manifest = inner_resp.json()
@@ -277,7 +349,12 @@ class K7Core:
             if not config_digest:
                 raise ValueError(f"No config digest in manifest for {image}")
 
-            config_resp = await http_client.get(f"{base}/v2/{repo}/blobs/{config_digest}", headers=headers, timeout=15)
+            config_resp = await http_client.get(
+                f"{base}/v2/{repo}/blobs/{config_digest}",
+                headers=headers,
+                timeout=15,
+                follow_redirects=False,
+            )
             config_resp.raise_for_status()
             return config_resp.json()
 
@@ -291,6 +368,12 @@ class K7Core:
             ep = self._normalize_image_argv(container_config.get("Entrypoint"))
             cmd = self._normalize_image_argv(container_config.get("Cmd"))
             return ep, cmd
+        except ValueError as e:
+            # SSRF / allowlist rejection must fail loud — do not soft-fail to [].
+            msg = str(e).lower()
+            if "not allowed" in msg or "cannot resolve registry" in msg:
+                raise
+            return [], []
         except Exception:
             return [], []
 
@@ -1583,6 +1666,12 @@ class K7Core:
 
             if config.limits and not self._validate_limits(config.limits):
                 return OperationResult(success=False, error="Invalid resource limits")
+
+            # SSRF guard: refuse image registries that resolve to non-public
+            # addresses before any control-plane HTTP or cluster create work.
+            if config.image:
+                registry, _, _ = self._parse_image_reference(config.image)
+                await self._assert_registry_host_allowed_async(registry)
 
             apps_v1 = await self._get_apps_v1_client()
             v1 = await self._get_core_v1_client()
