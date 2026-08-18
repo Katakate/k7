@@ -19,12 +19,12 @@
 ;   longhorn_data_path     : Longhorn default data path (defaults to /var/lib/longhorn)
 
 [k7_servers]
-node1 ansible_host=192.0.2.10 k7_backends=kata-qemu-longhorn,kata-firecracker-devmapper k7_devmapper_disk=/dev/nvme1n1
-node2 ansible_host=5.9.18.222 k7_backends=kata-qemu-longhorn
-node3 ansible_host=5.9.18.223 k7_backends=kata-qemu-longhorn
+node1 ansible_host=203.0.113.10 k7_backends=kata-qemu-longhorn,kata-firecracker-devmapper k7_devmapper_disk=/dev/nvme1n1
+node2 ansible_host=203.0.113.11 k7_backends=kata-qemu-longhorn
+node3 ansible_host=203.0.113.12 k7_backends=kata-qemu-longhorn
 
 [k7_agents]
-node4 ansible_host=5.9.18.224 k7_backends=kata-firecracker-devmapper k7_devmapper_disk=/dev/nvme1n1
+node4 ansible_host=203.0.113.13 k7_backends=kata-firecracker-devmapper k7_devmapper_disk=/dev/nvme1n1
 
 [k7_cluster:children]
 k7_servers
@@ -41,25 +41,48 @@ longhorn_replicas=2
 ; tolerance — for a 2-node cluster, put the second node in [k7_agents].
 ; The first host listed in [k7_servers] is the cluster-init server.
 ;
-; 3-node HA with ALL backends (kfd + kql + k7d) on every node — spec 18e.
-; Run ONE command from a checkout on the first master:
-;
-;   k7 install -i inventory.ini --ha --k7d-artifact /root/k7d-v0.1.0-x86_64-linux.tar.gz
-;
 ; Do NOT pass --backend alongside -i: per-host `k7_backends` in the
 ; inventory is authoritative (an explicit --backend overrides it).
 ;
-; On dual-NVMe boxes where the OS lives on one disk and the other is a raw
-; spare, OMIT k7_devmapper_disk: NVMe enumeration (nvme0n1 vs nvme1n1) is
-; NOT stable across reboots, so a hardcoded device can point at the OS disk
+; On dual-NVMe boxes (TWO_DISK=1 reset, or installimage with SWRAID 0 so
+; the OS is on one NVMe and the other stays raw for the kfd thin-pool),
+; OMIT k7_devmapper_disk: NVMe enumeration (nvme0n1 vs nvme1n1) is NOT
+; stable across reboots, so a hardcoded device can point at the OS disk
 ; after a reboot. The playbook auto-detects the empty non-root whole disk,
 ; which is enumeration-proof. Set k7_devmapper_disk only when a node has
 ; several spare disks and you must pick a specific one.
+; See tutorials/k7_hetzner_node_setup.md (same file is in public Katakate/k7).
+;
+; 2-node, ALL backends, from the PPA CLI (no --ha — that needs 3+ servers).
+; After TWO_DISK=1 so each box has a spare raw NVMe:
+;
+;   sudo add-apt-repository ppa:katakate.org/k7 && sudo apt update && sudo apt install k7
+;   # run from a checkout so the playbook can build k7-api:local
+;   k7 install -i inventory.ini --k7d-version 0.2.1
 ;
 ; [k7_servers]
-; k7-node-01 ansible_host=192.0.2.11 k7_backends=kfd,kql,k7d
-; k7-node-02 ansible_host=192.0.2.12 k7_backends=kfd,kql,k7d
-; k7-node-03 ansible_host=192.0.2.13   k7_backends=kfd,kql,k7d
+; k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
+;
+; [k7_agents]
+; k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
+;
+; [k7_cluster:children]
+; k7_servers
+; k7_agents
+;
+; [k7_cluster:vars]
+; ansible_user=root
+; ansible_ssh_private_key_file=/root/.ssh/id_ed25519
+; longhorn_replicas=2
+;
+; 3-node HA with ALL backends on every node — spec 18e. ONE command:
+;
+;   k7 install -i inventory.ini --ha --k7d-version 0.2.1
+;
+; [k7_servers]
+; k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
+; k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
+; k7-node-03 ansible_host=203.0.113.12 k7_backends=kfd,kql,k7d
 ;
 ; [k7_cluster:children]
 ; k7_servers

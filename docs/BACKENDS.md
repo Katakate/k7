@@ -52,15 +52,15 @@ The Ansible playbook:
    reflink-capable XFS image loop-mounted at `/var/lib/k7d/disks` (warm forks
    clone writable volume images with `FICLONE` reflinks);
 3. downloads the k7d release tarball
-   (`k7d_artifact_url`, default the `katakate/k7d` GitHub release for
-   `k7d_version`; override with `k7d_artifact_local_path` or
-   `k7 install --k7d-artifact <path>`) and runs the bundled `install.sh`,
-   which installs `k7d` + `containerd-shim-k7-v1` into `/usr/local/bin`,
-   guest kernel/initramfs into `/usr/local/share/k7d`, and starts
-   `k7d.service` (control socket `/run/k7d/k7d.sock`).
-   The default URL resolves to the `katakate/k7d` GitHub release for
-   `k7d_version`; use `--k7d-artifact` (or `k7d_artifact_local_path`)
-   to install from a locally built tarball instead.
+   (`k7d_artifact_url`, default the public `Katakate/k7d` GitHub release
+   for `k7d_version`, currently **0.2.1**) and runs the bundled
+   `install.sh`, which installs `k7d` + `containerd-shim-k7-v1` into
+   `/usr/local/bin`, guest kernel/initramfs into `/usr/local/share/k7d`,
+   and starts `k7d.service` (control socket `/run/k7d/k7d.sock`).
+   Override with `k7 install --k7d-version <ver>` (same GitHub URL, other
+   tag) or `--k7d-artifact <path>` / `k7d_artifact_local_path` (local
+   tarball). The PPA `k7` 0.2.1 playbook still defaults to k7d 0.1.0 —
+   pass `--k7d-version 0.2.1` on that package until the next k7 cut.
 4. registers the `k7` runtime in the k3s containerd template **with**
    `pod_annotations = ["k7d.katakate.org/*"]` and **without** a `BinaryName`
    option (containerd resolves the shim from

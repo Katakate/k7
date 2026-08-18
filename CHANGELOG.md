@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-08-18
+
+Docs and install-path release for a two-node `apt` install that ships
+k7d 0.2.1, plus TWO_DISK documentation.
+
+### Changed
+
+- Two-node inventory / install docs and playbook extras so a Show HN
+  reader can `apt install` k7 and bring up k7d 0.2.1 without guessing
+  disk layout (`TWO_DISK`).
+
 ## [0.2.1] — 2026-08-15
 
 Security release. Everyone running the `k7-api` control plane on 0.2.0 or

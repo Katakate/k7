@@ -190,7 +190,7 @@ sudo apt install k7
 
 Then let `k7` get your node ready with everything:
 ```console
-$  k7 install
+$  k7 install --backend kfd,kql,k7d --k7d-version 0.2.1
 Current task: Reminder about logging out and back in for group changes
   Installing K7 on 1 host(s)... ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:01:41
 ✅ Installation completed successfully!
@@ -199,10 +199,18 @@ Current task: Reminder about logging out and back in for group changes
 
 Optionally pass `-v` for a verbose output.
 
-> It will also tell you which raw disk was auto-selected for the LVM thin-pool. If you prefer, specify the disk explicitly (on a dual-NVMe Hetzner box this is usually the spare, e.g. `/dev/nvme1n1`):
-> ```bash
-> k7 install --disk /dev/nvme1n1
-> ```
+> Dual-NVMe Hetzner boxes have no third empty disk for the `kfd` thin-pool.
+> Put Ubuntu on **one** NVMe (`SWRAID 0` / `TWO_DISK=1`) and leave the other
+> raw — the playbook auto-detects that spare. Do **not** pin
+> `--disk /dev/nvme1n1`: NVMe names swap across reboots. Walkthrough:
+> [tutorials/k7_hetzner_node_setup.md](tutorials/k7_hetzner_node_setup.md)
+> (this file is also in public [Katakate/k7](https://github.com/Katakate/k7)).
+>
+> `k7` 0.2.1 from the PPA still defaults the k7d artifact to 0.1.0. Pass
+> `--k7d-version 0.2.1` so install pulls the current
+> [Katakate/k7d](https://github.com/Katakate/k7d/releases/tag/v0.2.1) release.
+> Multi-node inventory shapes (2-node server+agent, 3-node `--ha`) are in
+> `src/k7/deploy/inventory.ini.example`.
 
 This will install and most importantly connect together the following components (depending on `--backend`):
 - Kubernetes (K3s prod-ready distribution)

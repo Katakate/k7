@@ -4,7 +4,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="k7-sdk",
-    version="0.2.1",
+    version="0.2.2",
     description="K7 sandbox management Python SDK (HTTP client for the k7 API)",
     long_description=Path(__file__).with_name("README.md").read_text(),
     long_description_content_type="text/markdown",

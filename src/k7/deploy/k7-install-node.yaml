@@ -13,7 +13,7 @@
     # k7d backend (spec 9a M11): release artifact source. Override
     # `k7d_artifact_local_path` (path on the Ansible controller) to install
     # from a locally built tarball instead of the GitHub release.
-    k7d_version: "0.1.0"
+    k7d_version: "0.2.1"
     k7d_artifact_url: "https://github.com/katakate/k7d/releases/download/v{{ k7d_version }}/k7d-v{{ k7d_version }}-x86_64-linux.tar.gz"
     k7d_artifact_local_path: ""
     # Sparse XFS (reflink=1) loopback image backing /var/lib/k7d/disks —

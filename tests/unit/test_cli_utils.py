@@ -102,7 +102,7 @@ _SINGLE_STACK = json.dumps(
 _DUAL_STACK = json.dumps(
     [
         {"address": "192.0.2.10", "type": "InternalIP"},
-        {"address": "2a01:4f8:160:92c8::2", "type": "InternalIP"},
+        {"address": "2001:db8::2", "type": "InternalIP"},
         {"address": "k7-node-01", "type": "Hostname"},
     ]
 )

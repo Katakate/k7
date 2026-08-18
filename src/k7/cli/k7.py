@@ -313,7 +313,7 @@ def install(
     k7d_version: str | None = typer.Option(
         None,
         "--k7d-version",
-        help="k7d release version to install (k7d backend only; default from playbook: 0.1.0)",
+        help="k7d release version to install (k7d backend only; default from playbook: 0.2.1)",
     ),
     k7d_artifact: str | None = typer.Option(
         None,
@@ -375,11 +375,15 @@ def install(
     """Install K7 on target hosts using Ansible.
 
     Single-node (default): `k7 install` provisions localhost with **both**
-    backends (kata-firecracker-devmapper + kata-qemu-longhorn). Pass `--backend kfd` or
-    `--backend kql` to install only one.
+    Kata backends (kata-firecracker-devmapper + kata-qemu-longhorn). Pass
+    `--backend kfd,kql,k7d` to also install the k7d warm-fork runtime
+    (downloads `Katakate/k7d` v0.2.1 unless `--k7d-version` / `--k7d-artifact`
+    override it).
 
     Multi-node: `k7 install -i inventory.ini` reads roles, backends, and disks
     from the Ansible inventory. See `inventory.ini.example` for the layout.
+    Dual-NVMe boxes need the OS on one disk and a raw spare for kfd — see
+    `tutorials/k7_hetzner_node_setup.md` (`TWO_DISK=1`).
     """
     if role not in ("server", "agent"):
         raise typer.BadParameter(f"--role must be 'server' or 'agent', got '{role}'")

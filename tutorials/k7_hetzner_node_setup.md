@@ -79,13 +79,20 @@ sudo add-apt-repository ppa:katakate.org/k7
 sudo apt update
 sudo apt install k7
 
-# dual-NVMe box: let the playbook auto-detect the raw spare disk
-sudo k7 install
+# dual-NVMe box: let the playbook auto-detect the raw spare disk.
+# PPA k7 0.2.1 still defaults k7d to 0.1.0 — pin the public v0.2.1 release.
+# Run from a checkout of this repo (or Katakate/k7) so k7-api:local can build.
+sudo k7 install --backend kfd,kql,k7d --k7d-version 0.2.1
 ```
 
 `k7 install` provisions the LVM thin-pool on that disk for the `kfd` backend.
 Other backends (`kql`, `k7d`) do not need this spare disk, but keeping one raw
 NVMe lets you compare all backends on the same node.
+
+Two-node (one server + one agent, no `--ha`) is the same idea: write an
+inventory with `k7_backends=kfd,kql,k7d` on both hosts, omit
+`k7_devmapper_disk`, and run **one** `k7 install -i inventory.ini --k7d-version 0.2.1`
+from the first master. See `src/k7/deploy/inventory.ini.example`.
 
 > **Do NOT pin the disk on dual-NVMe boxes.** NVMe enumeration
 > (`nvme0n1` vs `nvme1n1`) is **not stable across reboots**, so a hardcoded
@@ -106,5 +113,5 @@ NVMe lets you compare all backends on the same node.
 - [ ] `ls /dev/kvm` exists
 - [ ] OS root is on a single disk (`findmnt /` → `/dev/nvme0n1p…`, not `/dev/md…`)
 - [ ] Spare disk has no filesystem (`lsblk -f` empty FSTYPE)
-- [ ] `k7 install --disk /dev/nvme1n1` (or the spare you chose) succeeds
+- [ ] `k7 install --backend kfd,kql,k7d --k7d-version 0.2.1` succeeds (auto-detects the spare disk — do not pin `--disk` on dual-NVMe)
 - [ ] `k7 create --backend kfd …` can start a sandbox

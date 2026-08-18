@@ -67,7 +67,7 @@ test-integration-remote: ## Run integration tests on remote k7 node via SSH (set
 	@echo "Run integration tests on the node itself: rsync this repo there, then 'make test-integration'." >&2; exit 1
 
 rsync-all: ## Rsync repo to all nodes (K7_NODE_IPS=ip1,ip2,ip3)
-	@IFS=',' read -ra IPS <<< "$${K7_NODE_IPS:-$${K7_NODE_IP:?set K7_NODE_IP to your node IP}}"; \
+	@IFS=',' read -ra IPS <<< "$${K7_NODE_IPS:-$${K7_NODE_IP:?set K7_NODE_IP or K7_NODE_IPS}}"; \
 	for ip in "$${IPS[@]}"; do \
 		echo "==> Syncing to $${K7_NODE_USER:-root}@$$ip"; \
 		rsync -az --delete \

@@ -1,5 +1,40 @@
 # Performance
 
+## Show HN cut — 2026-08-18 (apt `k7` 0.2.1, two-node, all backends)
+
+Two Hetzner AX41-1-LTD boxes (k7-node-01 + k7-node-02). The third box
+in the fleet was left untouched. Each node `TWO_DISK=1` (Ubuntu on one
+NVMe, spare raw for the kfd thin-pool — NVMe names were **swapped**
+across the two boxes, so auto-detect is mandatory).
+
+Install path: `apt install k7` (PPA 0.2.1) on the first master, public
+`Katakate/k7` v0.2.1 checkout as `k7_repo_root`, **one** command:
+
+```bash
+k7 install -i /root/k7-2n.ini --k7d-version 0.2.1
+```
+
+`failed=0` in 9m09s. Confirmed: PPA `k7` 0.2.1, PyPI `k7-sdk` 0.2.1,
+`k7d` 0.2.1 on both nodes, RuntimeClasses `kata` / `kata-qemu` / `k7`,
+thin-pool + `/var/lib/k7d/disks` on both. n=1 wall-clock via `k7 --core`
+(create/resume/fork timed until an exec answers).
+
+| Operation | kfd | kql | k7d |
+|---|---:|---:|---:|
+| create → exec answers | 3.74 s | 20.76 s | 3.83 s |
+| pause (API) | 0.81 s | 0.82 s | 1.00 s |
+| resume → exec answers | 4.48 s | 12.95 s | 1.95 s |
+| fork → exec answers | n/a (rejected) | 83.30 s | **3.93 s** |
+| fork inherits `/tmp` marker | n/a | no (disk-only clone) | **yes** (warm memory CoW) |
+| sidecar create → `docker info` | 5.02 s | 21.02 s | 5.33 s |
+| sidecar `docker run --rm hello-world` | 3.39 s | 4.01 s | 12.57 s |
+
+kql fork is slower than the 2026-08-10 single-node r=1 median (~47 s)
+because this cluster is two nodes / Longhorn r=2. k7d is the only backend
+whose fork carries live memory. kfd has no fork by design. Docker-in-VM
+sidecar (`--sidecar docker`) works on all three; k7d's `hello-world` pull
+is the slow path (tmpfs + virtio + NAT), matching the 2026-08-10 note.
+
 ## Backend lifecycle: kql vs k7d — 2026-08-10 (spec 9a M11)
 
 Hetzner AX41 dedicated node (Ryzen 5 3600, 64 GiB, NVMe), Ubuntu 24.04,

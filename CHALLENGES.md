@@ -327,3 +327,24 @@ GETs with no allowlist and no private/loopback/link-local rejection; the
 spec 10h-security-ssrf-and-namespace-authz.
 
 **Time lost:** n/a (implemented from disclosure + spec).
+
+---
+
+## 12. `k7 exec` swallows `--rm` / `-c` (Show HN apt 0.2.1 smoke)
+
+**Symptom:** `k7 --core exec NAME docker run --rm hello-world` returned in
+~0.8 s on every backend with no `Hello from Docker`. Separately,
+`k7 exec NAME sh -c 'echo x > /tmp/m'` aborted with PyInstaller's
+`tried to call itself with '-c'`.
+
+**Root cause:** Typer treats `--rm` as an option of `k7 exec`, so it never
+reaches docker. The packaged CLI is a PyInstaller binary; a guest command
+that includes `-c` trips its self-execution guard.
+
+**Fix:** pass a separator and avoid `-c` in the guest command:
+`k7 --core exec NAME -- docker run --rm hello-world` and
+`k7 --core exec NAME -- 'echo x > /tmp/m'`. No product change this round.
+
+**Reference:** none (Typer + PyInstaller).
+
+**Time lost:** ~20 min (misread as sidecar/egress failure).
