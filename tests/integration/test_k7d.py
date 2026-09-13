@@ -1,4 +1,4 @@
-"""Integration tests specific to the k7d backend (spec 9a M11).
+"""Integration tests specific to the k7d backend.
 
 k7d sandboxes are pods with ``runtimeClassName: k7`` — each pod is one
 k7d microVM. Fork is a **warm CoW disk+memory fork** of the live source
@@ -21,7 +21,7 @@ from k7.core.models import SandboxConfig
 pytestmark = [pytest.mark.integration, pytest.mark.k7d]
 
 # k7d VM operations (pause/resume/fork) go through the node-local
-# /run/k7d/k7d.sock — cross-node ops are out of scope (k7d spec 9a M12)
+# /run/k7d/k7d.sock — cross-node ops are out of scope
 # and core fails loudly on a node mismatch. On a multi-node cluster the
 # scheduler may place the sandbox anywhere, so tests that exercise VM
 # ops pin their sandboxes to the node this pytest process runs on.
@@ -271,5 +271,6 @@ class TestK7dSidecarDocker:
             fork_result = await k7_core.fork_sandbox(name, f"{name}-fork", namespace=test_namespace)
             assert not fork_result.success
             assert "sidecar" in fork_result.error
+            assert "real CRI sidecar" in fork_result.error
         finally:
             await k7_core.delete_sandbox(name, namespace=test_namespace)

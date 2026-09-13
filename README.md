@@ -76,33 +76,36 @@ The Tech Stack
 Sandbox backends
 </h3>
 
-`k7 install --backend <kfd|kql|k7d>` provisions one or more backends per node; `k7 create --backend …` picks one per sandbox. See [docs/BACKENDS.md](docs/BACKENDS.md) for the architecture and [PERFORMANCE.md](PERFORMANCE.md) for the full measurements (Hetzner AX41 node, medians).
+`k7 install --backend <kfd|kql|k7d|k7d-fc>` provisions one or more backends per node; `k7 create --backend …` picks one per sandbox. See [docs/BACKENDS.md](docs/BACKENDS.md) for the architecture and [PERFORMANCE.md](PERFORMANCE.md) for the full measurements (Hetzner AX41 node, medians).
 
-| | `kfd` (kata-firecracker-devmapper) | `kql` (kata-qemu-longhorn) | `k7d` |
-|---|---|---|---|
-| VMM | Firecracker (Kata) | QEMU (Kata) | k7d (custom KVM VMM) |
-| RuntimeClass | `kata` | `kata-qemu` | `k7` |
-| Sandbox storage | devmapper thin-pool (needs a spare raw disk) | Longhorn PVC (replicated, persistent) | erofs images + reflink XFS + guest tmpfs |
-| Create → Ready* | not re-measured† | 17.1s | **2.1s** |
-| Named snapshot* | — | 6.5s (Longhorn, disk-only) | — (VM snapshot trees via the k7d API) |
-| Fork → usable* | — | 46.7s (disk clone + cold boot) | **~5 ms VM CoW fork**; **~2.4 s** end-to-end via k7/k8s (pod Ready + exec) |
-| Pause / resume* | scale to 0 / 1 | 1.3s / 4.1s (disk survives) | **0.2s / 0.3s (VM frozen in place, memory survives)** |
-| Docker-in-VM sidecar | ✅ (ephemeral docker data) | ✅ (persistent docker data; fastest `docker pull`) | ✅ (VM-lifetime docker data) |
-| Cross-pod persistence | ✗ | ✅ snapshots/restore | ✗ (fork carries state instead) |
+| | `kfd` (kata-firecracker-devmapper) | `kql` (kata-qemu-longhorn) | `k7d` | `k7d-fc` |
+|---|---|---|---|---|
+| VMM | Firecracker (Kata) | QEMU (Kata) | k7d (custom KVM VMM) | k7d + Firecracker jailer |
+| RuntimeClass | `kata` | `kata-qemu` | `k7` | `k7-fc` |
+| Sandbox storage | devmapper thin-pool (needs a spare raw disk) | Longhorn PVC (replicated, persistent) | erofs images + reflink XFS + guest tmpfs | same as k7d (no virtiofs / hostPath) |
+| Create → Ready* | not re-measured† | 17.1s | **2.1s** | **2.1s** |
+| Named snapshot* | — | 6.5s (Longhorn, disk-only) | — (VM snapshot trees via the k7d API) | — (same as k7d) |
+| Fork → usable* | n/a (rejected) | 46.7s (disk clone + cold boot) | **~5 ms VM CoW fork**; **~2.4 s** end-to-end via k7/k8s (pod Ready + exec) | **~2.5 s** end-to-end (same CoW; child `--docker` stays overlay2) |
+| Pause / resume* | scale to 0 / 1 | 1.3s / 4.1s (disk survives) | **0.2s / 0.3s (VM frozen in place, memory survives)** | **0.2s / —‡** |
+| Docker in the VM | **`--docker`**: vehicle + overlay2 on ephemeral LVM block | **`--docker`**: vehicle + overlay2 on Longhorn block (fork/restore) | **`--docker`**: in-guest dockerd, overlay2 on virtio-blk, **forkable** | **same guest dockerd**, overlay2, **forkable** |
+| Cross-pod persistence | ✗ | ✅ snapshots/restore | ✗ (fork carries state instead) | ✗ |
 
-\* medians of 3 on one Hetzner AX41 node — methodology, ranges, and the docker-sidecar
+\* medians of 3 on one Hetzner AX41 node — methodology, ranges, and docker-in-VM
 numbers are in [PERFORMANCE.md](PERFORMANCE.md).
-† kfd needs a spare raw disk the benchmark node didn't have; its docker-workload numbers
-are in the [PERFORMANCE.md](PERFORMANCE.md) spec-10b section.
+† kfd needs a spare raw disk the lifecycle-bench node didn't have; Show HN
+measured kfd create→exec 3.74s and **fork n/a (rejected)**. Docker-workload
+numbers for kfd are in the [PERFORMANCE.md](PERFORMANCE.md) Docker benchmark section.
+‡ k7-fc VMM pause/resume returns immediately; CRI exec after resume hung on this
+run (`guest_cid=0` retained — CHALLENGES #17). k7d resume→exec is **0.3s**.
 
 <h3 align="left">
 Also available today
 </h3>
 
-- 🛠️ Docker <code>build</code> / <code>run</code> inside VM sandboxes (docker sidecar on <b>kfd</b>, <b>kql</b>, and <b>k7d</b>; see [PERFORMANCE.md](PERFORMANCE.md))
+- 🛠️ Docker <code>build</code> / <code>run</code> inside VM sandboxes: <code>k7 create --docker --backend k7d ubuntu:24.04</code> (or <code>--backend k7d-fc</code>). In-guest dockerd, overlay2, forkable. The same <code>--docker</code> flag on Kata (kfd/kql) injects a privileged docker-vehicle with overlay2 on a block disk — kql persists/forks the graph, kfd is ephemeral. <code>--sidecar docker</code> is a deprecated alias. See [PERFORMANCE.md](PERFORMANCE.md)
 - ⚡ <b>Warm VM fork</b> on the k7d backend: <code>k7 fork</code> CoW-clones a running sandbox's disk <i>and memory</i> in ~5&nbsp;ms at the VMM; end-to-end through k7/Kubernetes is ~2&nbsp;s to a Ready pod
 - 🌐 Multi-node clusters (Ansible + Longhorn)
-- 🔍 Cilium CNI with FQDN egress policies
+- 🔍 Cilium CNI with FQDN egress policies (optional Hubble flow observability via <code>k7 install --hubble</code>; off by default, observability only)
 - 📸 Pause / resume / fork / restore and <code>k7 snapshot</code> lifecycle
 - 🐍 Python SDK: <code>pip install k7-sdk</code> (<code>katakate</code> package deprecated)
 
@@ -190,7 +193,7 @@ sudo apt install k7
 
 Then let `k7` get your node ready with everything:
 ```console
-$  k7 install --backend kfd,kql,k7d --k7d-version 0.2.1
+$  k7 install --backend kfd,kql,k7d
 Current task: Reminder about logging out and back in for group changes
   Installing K7 on 1 host(s)... ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:01:41
 ✅ Installation completed successfully!
@@ -206,11 +209,40 @@ Optionally pass `-v` for a verbose output.
 > [tutorials/k7_hetzner_node_setup.md](tutorials/k7_hetzner_node_setup.md)
 > (this file is also in public [Katakate/k7](https://github.com/Katakate/k7)).
 >
-> `k7` 0.2.1 from the PPA still defaults the k7d artifact to 0.1.0. Pass
-> `--k7d-version 0.2.1` so install pulls the current
-> [Katakate/k7d](https://github.com/Katakate/k7d/releases/tag/v0.2.1) release.
-> Multi-node inventory shapes (2-node server+agent, 3-node `--ha`) are in
+> The playbook pins k7d **0.6.0**. `--docker` needs the guest docker
+> service (payload on the node); an older k7d fails loudly with
+> `this k7d has no docker service; upgrade`. Multi-node inventory shapes
+> (2-node server+agent, 3-node `--ha`) are in
 > `src/k7/deploy/inventory.ini.example`.
+
+`k7 install` serves `k7-api` on NodePort `31007` over HTTPS. The default
+is a playbook-minted cluster CA (Let's Encrypt cannot issue for a bare
+IP). Copy `/etc/k7/tls/ca.crt` off the node and point the CLI at it:
+
+```bash
+scp root@<node>:/etc/k7/tls/ca.crt ./k7-ca.crt
+k7 config set api.url https://<node-ip>:31007
+k7 config set api.ca ./k7-ca.crt
+k7 config set api.key <key>
+```
+
+`--api-hostname <name>` uses Let's Encrypt via a Caddy sidecar (the DNS
+A record must point at the first master). `--api-tls-cert` +
+`--api-tls-key` installs an operator-supplied pair. `--api-insecure-http`
+is today's plain HTTP NodePort and must be called what it is: keys travel
+in cleartext. None of this is rate limiting; do not write "the API is
+now secure".
+
+Pass `--api-allow-cidr <cidr>` (repeatable, Cilium only) to restrict who
+can connect. Off by default. Defence in depth for operators who know
+their client CIDRs — it stacks with TLS and does not replace it. See
+[docs/BACKENDS.md](docs/BACKENDS.md) "TLS for `k7-api`" and
+"Restricting who can reach `k7-api`".
+
+Pass `--hubble` to turn on Cilium Hubble (relay + CLI, no UI) so policy
+drops are a `hubble observe` question. Off by default; requires the
+Cilium CNI (`--hubble --cni flannel` fails loudly). See
+[docs/BACKENDS.md](docs/BACKENDS.md) "Debugging policy drops".
 
 This will install and most importantly connect together the following components (depending on `--backend`):
 - Kubernetes (K3s prod-ready distribution)
@@ -218,6 +250,7 @@ This will install and most importantly connect together the following components
 - Firecracker + Jailer + devmapper thin-pool (`kfd`)
 - QEMU via Kata + Longhorn PVC-backed roots (`kql`)
 - k7d daemon + `containerd-shim-k7-v1` + RuntimeClass `k7` (`k7d`)
+- Optional: Hubble relay + `hubble` CLI when `--hubble` is passed
 
 
 Careful design: config updates will not touch your existing Docker or containerd setups. We chose to use K3s' own containerd for minimal disruption. Installation may however overwrite existing installations of K3s, Kata, Firecracker, Jailer, QEMU/Kata config, or Longhorn. 
@@ -465,7 +498,10 @@ K7 sandboxes are hardened by default with multiple layers of security:
 - **Linux capabilities**: All capabilities are dropped by default (`drop: ALL`) for defense-in-depth
   - Only explicitly add back capabilities you need via `cap_add` parameter
   - `allow_privilege_escalation` is always set to `false`
-  - Seccomp profile: `RuntimeDefault`
+  - Seccomp profile: `RuntimeDefault` is applied on the sandbox container
+    and enforced inside the guest: on k7d, and on Kata (`kfd` / `kql`)
+    with `disable_guest_seccomp = false` in the playbook's Kata config
+    (the sandbox container's OCI seccomp reaches guest runc).
 
 - **Non-root execution**: Optionally run containers and pods as non-root user (UID 65532):
   - `container_non_root`: Run the main container as non-root and disable privilege escalation
@@ -477,9 +513,10 @@ K7 sandboxes are hardened by default with multiple layers of security:
   - File-based storage with 600 permissions (`/etc/k7/api_keys.json` by default)
 
 - **Network policies**: Complete network isolation for VM sandboxes
-  - **Ingress isolation**: All inter-VM communication is blocked by default to prevent sandbox-to-sandbox access
+  - **Ingress isolation**: All inter-VM communication is blocked by default to prevent sandbox-to-sandbox access; opt in per sandbox with `--ingress-port` / `--ingress-from` (`sandbox:<name>`, `namespace:<ns>`, `cidr:<cidr>`)
   - **Egress lockdown**: per-sandbox allowlists — CIDRs via Kubernetes NetworkPolicy, or **FQDN / domain** allowlists via Cilium (`CiliumNetworkPolicy`; default CNI)
   - **DNS is blocked** when egress is locked down; only entries in `egress_whitelist` (CIDR or domain) are reachable
+  - **Platform isolation** (Cilium only): a cluster-wide deny policy stops sandboxes in every egress mode — including `--egress-open` — from reaching the node, other nodes, the Kubernetes API, cloud metadata and the `kube-system`/`longhorn-system` pods (CoreDNS excepted). Not applied on `--cni flannel` clusters.
   - Administrative access via `kubectl exec` and `k7 shell` is preserved (uses Kubernetes API, not pod networking)
 
 More security features are on the roadmap (e.g. AppArmor).

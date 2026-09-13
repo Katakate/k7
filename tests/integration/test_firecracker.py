@@ -108,8 +108,37 @@ class TestFirecrackerBackend:
         finally:
             await k7_core.delete_sandbox("integ-fc", namespace=test_namespace)
 
+    async def test_guest_seccomp_enforced(self, k7_core: K7Core, test_namespace: str):
+        """RuntimeDefault must actually be applied inside the Firecracker guest."""
+        toml_path = "/opt/kata/share/defaults/kata-containers/configuration-fc.toml"
+        with open(toml_path) as f:
+            toml = f.read()
+        assert "disable_guest_seccomp = false" in toml, toml
+        assert "disable_guest_seccomp = true" not in toml.replace("disable_guest_seccomp = false", "")
+        cfg = SandboxConfig(
+            name="integ-fc-seccomp",
+            image="alpine:3.20",
+            namespace=test_namespace,
+            backend="kata-firecracker-devmapper",
+        )
+        result = await k7_core.create_sandbox(cfg)
+        assert result.success, f"create failed after disable_guest_seccomp=false: {result.error}"
+        try:
+            _wait_for_pod_running("integ-fc-seccomp", test_namespace)
+            r = await k7_core.exec_command(
+                "integ-fc-seccomp",
+                "grep '^Seccomp:' /proc/self/status",
+                namespace=test_namespace,
+            )
+            assert r.exit_code == 0, r.stderr
+            assert r.stdout.split()[-1] == "2", (
+                f"guest Seccomp is {r.stdout!r} (want 2=filter); RuntimeDefault is not enforced"
+            )
+        finally:
+            await k7_core.delete_sandbox("integ-fc-seccomp", namespace=test_namespace)
+
     async def test_memory_limit_sizes_vm(self, k7_core: K7Core, test_namespace: str):
-        """Spec 18h regression: kfd must honour ``default_memory`` (not silently
+        """Regression: kfd must honour ``default_memory`` (not silently
         ignore it). Before the install forwarded ``pod_annotations`` on
         ``runtimes.kata`` and allowlisted the annotation in
         configuration-fc.toml, ``--memory 3Gi`` still booted a 2048 MiB VM."""

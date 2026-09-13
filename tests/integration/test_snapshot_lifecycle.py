@@ -1,4 +1,4 @@
-"""Integration tests for the Spec 10e snapshot lifecycle, multi-node cluster.
+"""Integration tests for the snapshot lifecycle, multi-node cluster.
 
 Coverage:
 
@@ -13,8 +13,10 @@ Coverage:
 """
 
 import asyncio
+import json
 import subprocess
 import time
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,7 +33,7 @@ _DEV_SH = _REPO_ROOT / "src" / "k7" / "cli" / "dev.sh"
 
 
 def _run_cli(*args: str, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess:
-    """Invoke ``dev.sh --core <args>`` — Spec 10g made the default API; these
+    """Invoke ``dev.sh --core <args>`` — the default route is the API; these
     CLI-flag tests don't want / need that detour."""
     cmd = [str(_DEV_SH), "--core", *args]
     return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout, cwd=str(_REPO_ROOT))
@@ -80,6 +82,50 @@ def _snapshot_exists(name: str, namespace: str) -> bool:
         text=True,
     )
     return out.returncode == 0 and out.stdout.strip() != ""
+
+
+def _wait_snapshot_deleting_or_gone(name: str, namespace: str, timeout: int = 60) -> None:
+    """GC skips a VolumeSnapshotContent while its VolumeSnapshot is still live."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = subprocess.run(
+            [_K3S, "kubectl", "get", "volumesnapshot", name, "-n", namespace, "-o", "json"],
+            capture_output=True,
+            text=True,
+        )
+        if out.returncode != 0:
+            return
+        try:
+            meta = (json.loads(out.stdout) or {}).get("metadata") or {}
+        except json.JSONDecodeError:
+            time.sleep(1)
+            continue
+        if meta.get("deletionTimestamp"):
+            return
+        time.sleep(1)
+    raise TimeoutError(f"VolumeSnapshot {namespace}/{name} still live after delete")
+
+
+def _vsc_names_for_namespace(namespace: str) -> list[str]:
+    raw = subprocess.run(
+        [_K3S, "kubectl", "get", "volumesnapshotcontent", "-o", "json"],
+        capture_output=True,
+        text=True,
+    )
+    if raw.returncode != 0 or not raw.stdout.strip():
+        return []
+    try:
+        items = json.loads(raw.stdout).get("items") or []
+    except json.JSONDecodeError:
+        return []
+    names = []
+    for item in items:
+        ref = (item.get("spec") or {}).get("volumeSnapshotRef") or {}
+        if ref.get("namespace") == namespace:
+            name = (item.get("metadata") or {}).get("name")
+            if name:
+                names.append(name)
+    return names
 
 
 def _force_delete_snapshot(name: str, namespace: str) -> None:
@@ -189,7 +235,7 @@ class TestSnapshotCrud:
 
 
 class TestForkInlineSnapshotDelete:
-    """Spec 10e Option A: ``fork`` cleans up its ``-fork-`` snapshot inline."""
+    """Option A: ``fork`` cleans up its ``-fork-`` snapshot inline."""
 
     async def test_fork_auto_deletes_temp_snapshot(
         self,
@@ -241,8 +287,25 @@ class TestForkInlineSnapshotDelete:
                 pass
 
 
+class TestGcOrphanContents:
+    """GC must reap leftover VolumeSnapshotContents so namespaces can die."""
+
+    def test_gc_reaps_orphan_vsc_after_snapshot_delete(
+        self,
+        ql_sandbox: str,
+        test_namespace: str,
+    ):
+        snap = f"{ql_sandbox}-exp-baseline"
+        _run_cli("snapshot", "create", ql_sandbox, snap, "-n", test_namespace)
+        assert _snapshot_exists(snap, test_namespace)
+        _run_cli("snapshot", "delete", snap, "-n", test_namespace, "--yes")
+        _wait_snapshot_deleting_or_gone(snap, test_namespace)
+        asyncio.run(K7Core().gc_snapshots(namespace=test_namespace, keep_fork_for=timedelta(0)))
+        assert _vsc_names_for_namespace(test_namespace) == []
+
+
 class TestGcSafety:
-    """Spec 10e: pause and named snapshots are never auto-collected."""
+    """Pause and named snapshots are never auto-collected."""
 
     def test_pause_and_named_snapshots_survive_gc(
         self,

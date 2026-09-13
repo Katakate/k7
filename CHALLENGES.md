@@ -348,3 +348,183 @@ that includes `-c` trips its self-execution guard.
 **Reference:** none (Typer + PyInstaller).
 
 **Time lost:** ~20 min (misread as sidecar/egress failure).
+
+---
+
+## 13. k7d `--docker`: BuildKit TLS vs dockerd pull; `-p` is guest-host netns (spec 37a-inc2)
+
+**Symptom:** `docker run --rm hello-world` and `docker run alpine:3.21`
+succeeded in a `--docker` k7d sandbox, but `docker build -t myapp .`
+from alpine:3.21 failed with `x509: certificate signed by unknown
+authority` on `auth.docker.io`, and `wget http://127.0.0.1:8080` from
+`k7 exec` never saw an nginx published with `-p 8080:80`.
+`K7Core.exec_command` also always reports `exit_code=0`, so a failed
+`docker build` looked like a successful tag that `docker run myapp`
+then could not find.
+
+**Root cause:** dockerd's pull path uses the payload CA bundle
+(`guest/docker/payload/etc/ssl/certs/ca-certificates.crt`). Default
+BuildKit metadata fetch (docker driver, buildx 0.20 / buildkit v0.18)
+does not, so `docker build` / compose `build:` fail TLS while `docker
+pull` works. `docker run -p 8080:80` publishes in the **guest host**
+netns (k7d inc1 probes it via agent vsock wget). `k7 exec` is the CRI
+container netns, so localhost:8080 is the wrong place. `exec_command`
+never reads the kubectl-exec exit code.
+
+**Fix:** tests use `DOCKER_BUILDKIT=0 docker build` (classic builder →
+dockerd pull + CA) and probe the inner nginx with `docker exec web wget
+http://127.0.0.1:80`. Guest exit codes are asserted via an `__K7_EC:$?`
+marker. Do not "fix" this by setting `DOCKER_BUILDKIT=0` as a product
+default.
+
+**Reference:** k7d `crates/k7d/tests/test_docker_service.rs`
+`test_docker_warm_fork_nginx_survives` (`agent_sh` wget 8080);
+k7d `guest/docker/payload/etc/ssl/certs/ca-certificates.crt`.
+
+**Time lost:** ~40 min (first integration pass).
+
+---
+
+## 14. k3s containerd does not stamp the runtime-handler; `k7d_version` 0.5.0 would clobber the new shim (spec 38a-inc5)
+
+**Symptom:** RuntimeClass `k7-fc` is not enough for the shim to see
+handler `k7-fc` — this node's k3s 1.36 / containerd 2.3.3 never sets
+`io.kubernetes.cri.runtime-handler` on the sandbox OCI spec (k7d
+CHALLENGES #228). Also, `k7 install --backend k7d-fc` with the playbook
+default `k7d_version: 0.5.0` would download the public GitHub tarball
+and overwrite `/usr/local/bin/containerd-shim-k7-v1` / `k7d` with a
+build that does not know ConfigPath.
+
+**Root cause:** ConfigPath on `runtimes.k7-fc` is the working signal.
+Kata Firecracker lives at `/opt/kata/bin` (playbook pin ~v1.14);
+k7d-fc installs upstream v1.16.1 at `/usr/local/bin` — different
+paths, do not share binaries. `grep runtimes.k7` matches `k7-fc`.
+
+**Fix:** playbook writes `/etc/k7d/shim-k7-fc.toml` and a ConfigPath
+`[options]` table **without** `BinaryName`. Install Firecracker via
+vendored `src/k7/deploy/k7d-fc/install-firecracker.sh` (sha fatal).
+Smoke-test the playbook with `--tags k7d-fc` (facts tagged `always`)
+and `--k7d-artifact` pointing at a tarball built from the k7d tree
+that just passed `make remote-check`, never the 0.5.0 GitHub URL.
+`k7_has_k7d` is true for `k7d` **or** `k7d-fc`. The allowed-backend
+`difference()` list must include `k7d-fc` or a k7d-fc-only install
+fails validation before any task runs.
+A fifth trap: the playbook **replaces** the whole containerd template
+from the selected backends. A full `k7 install --backend k7d,k7d-fc`
+on a mixed k7d-dev node would drop kata/nvidia/wasm runtime blocks.
+`--tags k7d-fc` installs Firecracker + toml + RuntimeClass + labels
+and does not rewrite the template (`runtimes.k7-fc` is also
+self-patched by k7d's `ensure_k7_fc_runtime_registered`).
+
+**Reference:** k7d CHALLENGES #228, `docs/backends.md`.
+
+**Time lost:** named in the spec before implementation (~15 min
+confirming live sandbox inspect on the node).
+
+---
+
+## 15. CRI exec into a k7-fc guest hung; kube Ready never flipped (spec 38a-inc5 / fixed 38a-inc6)
+
+**Symptom:** `tests/integration/test_k7d_fc.py` created a Running
+`runtimeClassName: k7-fc` pod (shim log `backend=Firecracker`) then
+hung forever on `K7Core.exec_command`. `timeout 15 k3s kubectl exec
+… -- echo hello` exited 124. The sandbox's exec readiness probe
+(`/bin/sh -c true`, 5s) also timed out, so the container never
+became Ready.
+
+**Root cause:** Firecracker guests are reached over the jail vsock
+UDS (`FcUds`), not host `AF_VSOCK`. The daemon publishes
+`guest_cid = 0` (`NO_HOST_CID`). A host that dialled CID 0 blocked
+in `connect()` with no timeout, so CRI Wait never saw an exit code.
+This was not ConfigPath / RuntimeClass selection (k7d #228 / #230)
+and not virtiofs (k7d-fc has none).
+
+**Fix (inc6):** k7d refuses `AF_VSOCK` CIDs 0–2 and proves
+`timeout 15 kubectl exec … -- echo hello` plus kube Ready on
+`k7-fc` (`test_k7_fc_exec_probe_ready_and_native_exec`). Install that
+artifact with `--k7d-artifact` (not GitHub `latest`). k7-fc tests
+wait on Ready again; `test_k7d_fc_exec_echo_hello` and
+`TestDockerK7dFc` exec into the guest. Ready is a valid signal.
+
+**Reference:** k7d CHALLENGES #228 / #230 (selection) and #232 (CID 0).
+
+**Time lost:** ~45 min in inc5 (pytest sat on exec until the SSH
+session dropped; leftover ns `k7-test-fe13c2d7` had to be deleted
+by hand).
+
+---
+
+## 16. Kata `--docker` vehicle: persist-bind hides CLI; two-PVC fork; shareProcessNamespace (spec 22a)
+
+**Symptom / traps while bringing `--docker` to kfd/kql:**
+
+1. **kql persist-bind overlays `/usr`.** The spec mounts the docker CLI via
+   emptyDir `subPath` onto `/usr/local/bin/docker` and
+   `/usr/local/lib/docker/cli-plugins/*`. kql's persist-bind then
+   `mount --bind`s the PVC's `/usr` over that path, so compose/buildx
+   vanish. Fix: also mount the CLI emptyDir at `/run/k7/docker-cli`
+   (persist-bind does not overlay `/run`) and restage the canonical
+   paths immediately after the `/usr` bind. Vehicle path-sharing
+   fingerprints that staging file, not `/usr`.
+2. **`hostPID` is the node, not the Kata guest.** Path sharing needs the
+   vehicle to see the sandbox container's rootfs. `shareProcessNamespace:
+   true` shares the *guest* PID namespace between the two CRI containers.
+   `hostPID: true` would be the Kubernetes node (and is the wrong trust
+   domain).
+3. **Two Longhorn VolumeSnapshots are not atomic.** kql fork/restore
+   snapshots the root PVC and the docker-graph Block PVC separately.
+   Each is crash-consistent (`sync` in sandbox + vehicle first);
+   containerd's boltdb recovers. Do not claim cross-volume atomicity.
+4. **Never fall back to virtio-fs for the graph.** CHALLENGES #10's vfs
+   tax and virtiofsd wedge are why the graph is `volumeDevices` + ext4 +
+   overlay2 or fail loud. Keep the relaxed exec-probe timings (3/15/12/4).
+5. **Alpine dind `VOLUME /var/lib/docker` is virtio-fs on Kata.** Unmount
+   it, mkfs only when blkid is not already ext4 (busybox blkid ignores
+   `-o value`), then `mount -t ext4`.
+6. **`mount --bind` from `/proc/PID/root` is EINVAL on Kata.** Reading
+   through that path works. Path sharing **symlinks** `/tmp` `/home`
+   `/root` `/opt` `/workspace` in the vehicle onto the sandbox rootfs so
+   `docker run -v /tmp/x:/x` resolves.
+7. **OpenEBS LVM `GetCapacity` reports VG VFree, not thin-pool free.**
+   `kata-vg` is almost entirely the thin-pool plus a few GiB leftover.
+   With `storageCapacity: true` (chart default) the scheduler sees ~5Gi
+   and never binds a 20Gi `k7-docker-lvm` PVC. Disable capacity tracking;
+   thin LVs come from the pool (`thinProvision: yes`).
+8. **Kata FC virtio-fs file `subPath` mounts are invisible to Docker
+   plugin discovery.** `docker compose` is not a docker command on kfd
+   unless compose/buildx are copied into `~/.docker/cli-plugins` from
+   the directory-mounted emptyDir. kql persist-bind already restages
+   them as regular files.
+
+**Reference:** spec 22a-kata-docker-vehicle; CHALLENGES #10, #13.
+
+**Time lost:** kql integration (vehicle CrashLoopBackOff on graph mount
+and path-share).
+
+---
+
+## 17. k7-fc `--docker` Ready wait saw OutOfcpu corpses; CRI exec after pause hung
+
+**Symptom (bench wait):** `test_bench_k7d_fc` at 4 CPU Guaranteed left a
+Ready pod plus a pile of Failed/`OutOfcpu` siblings (`requested: 4050,
+used: 9890, capacity: 12000` — the just-deleted k7d sandbox's 4 CPU
+still counted). `_wait_all_containers_ready` only looked at `items[0]`,
+which was a Failed pod, so the wait would have timed out at 300s while
+one replica was already Ready.
+
+**Fix:** wait until **any Running** pod has all containers Ready (same
+shape as `bench_backend_lifecycle._pod_ready`). Forked-child `docker info`
+asserts overlay2 on both k7d and k7d-fc.
+
+**Symptom (lifecycle resume):** alpine k7d-fc pause returned in 0.18s
+and k7d logged `resumed vm-… (guest_cid=0)`. `_wait_exec` after resume
+never returned: kubelet `Readiness probe failed: "/bin/sh -c true"
+timed out after 5s`. Create→Ready and exec *before* pause had worked
+(2.14s / 0.18s). This is #15 again on the post-pause path, not a
+docker-perf failure. Lifecycle was aborted; do not quote k7d-fc
+resume→exec from that run.
+
+**Reference:** CHALLENGES #15; k7d #232.
+
+**Time lost:** ~15 min on the OutOfcpu wait; lifecycle resume hung until
+the pytest process was killed (~8 min).

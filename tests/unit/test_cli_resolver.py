@@ -1,4 +1,4 @@
-"""Unit tests for the Spec 10g CLI ↔ API client plumbing.
+"""Unit tests for the CLI ↔ API client plumbing.
 
 Coverage:
 
@@ -168,6 +168,62 @@ def test_resolve_client_exits_when_key_missing(isolated_config_dir, monkeypatch)
     monkeypatch.setattr(cli_client, "_ETC_API_KEYS", isolated_config_dir / "no_keys")
     with pytest.raises(typer.Exit):
         cli_client.resolve_client("https://flag.local:31000", None)
+
+
+def test_resolve_api_ca_chain(isolated_config_dir, monkeypatch, tmp_path):
+    flag = tmp_path / "flag.pem"
+    envp = tmp_path / "env.pem"
+    cfgp = tmp_path / "cfg.pem"
+    etcp = tmp_path / "etc.pem"
+    for p in (flag, envp, cfgp, etcp):
+        p.write_text("ca")
+    monkeypatch.setattr(cli_client, "_ETC_API_CA", etcp)
+    assert cli_client._resolve_api_ca(str(flag)) == str(flag)
+    monkeypatch.setenv("K7_API_CA", str(envp))
+    assert cli_client._resolve_api_ca(None) == str(envp)
+    monkeypatch.delenv("K7_API_CA")
+    cli_config.set_config_value("api.ca", str(cfgp))
+    assert cli_client._resolve_api_ca(None) == str(cfgp)
+    # Config wins over /etc; wipe config by pointing at a fresh dir.
+    monkeypatch.setenv(cli_config.CONFIG_DIR_ENV, str(tmp_path / "empty-cfg"))
+    assert cli_client._resolve_api_ca(None) == str(etcp)
+
+
+def test_verify_ssl_for_url_never_disables_https():
+    assert cli_client.verify_ssl_for_url("https://10.0.0.1:31007", None) is True
+    assert cli_client.verify_ssl_for_url("https://10.0.0.1:31007", "/etc/k7/tls/ca.crt") == "/etc/k7/tls/ca.crt"
+    assert cli_client.verify_ssl_for_url("http://10.0.0.1:31007", "/etc/k7/tls/ca.crt") is False
+
+
+def test_resolve_client_https_uses_ca_path(isolated_config_dir, monkeypatch, tmp_path):
+    ca = tmp_path / "ca.crt"
+    ca.write_text("dummy")
+    monkeypatch.delenv("K7_API_CA", raising=False)
+    monkeypatch.setattr(cli_client, "_ETC_API_CA", tmp_path / "missing")
+    with patch("k7.cli._client.Client") as client_cls:
+        cli_client.resolve_client("https://10.0.0.1:31007", "k", str(ca))
+    assert client_cls.call_args.kwargs["verify_ssl"] == str(ca)
+
+
+def test_resolve_client_https_without_ca_uses_system_store(isolated_config_dir, monkeypatch, tmp_path):
+    monkeypatch.delenv("K7_API_CA", raising=False)
+    monkeypatch.setattr(cli_client, "_ETC_API_CA", tmp_path / "missing")
+    with patch("k7.cli._client.Client") as client_cls:
+        cli_client.resolve_client("https://api.example.com:31007", "k")
+    assert client_cls.call_args.kwargs["verify_ssl"] is True
+
+
+def test_resolve_client_http_disables_verify(isolated_config_dir, monkeypatch, tmp_path):
+    monkeypatch.delenv("K7_API_CA", raising=False)
+    monkeypatch.setattr(cli_client, "_ETC_API_CA", tmp_path / "missing")
+    with patch("k7.cli._client.Client") as client_cls:
+        cli_client.resolve_client("http://10.0.0.1:31007", "k")
+    assert client_cls.call_args.kwargs["verify_ssl"] is False
+
+
+def test_config_accepts_api_ca(isolated_config_dir):
+    cli_config.set_config_value("api.ca", "/tmp/ca.crt")
+    assert cli_config.get_config_value("api.ca") == "/tmp/ca.crt"
 
 
 # ---------------------------------------------------------------------------

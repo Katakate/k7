@@ -1,4 +1,4 @@
-"""Unit tests for the control-plane registry SSRF guard (spec 10h)."""
+"""Unit tests for the control-plane registry SSRF guard."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 

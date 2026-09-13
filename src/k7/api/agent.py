@@ -1,4 +1,4 @@
-"""Per-node k7 agent (spec 18g).
+"""Per-node k7 agent.
 
 Runs as a DaemonSet (``k7-agent``, kube-system) on every node, reusing the
 ``k7-api:local`` image with an overridden command
@@ -120,7 +120,7 @@ async def vm_lookup(body: dict | None = None):
 
 
 # ---------------------------------------------------------------------------
-# Node storage-pool utilization (spec 18g part 2 / 18f issue 5 leftover).
+# Node storage-pool utilization.
 # ---------------------------------------------------------------------------
 
 

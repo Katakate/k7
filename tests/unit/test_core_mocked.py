@@ -94,10 +94,10 @@ class TestDeleteSandbox:
         assert result.success is True
         mock_apps.delete_namespaced_deployment.assert_called_once_with(name="my-sb", namespace="default")
         mock_v1.delete_namespaced_secret.assert_called_once_with(name="my-sb-env", namespace="default")
-        mock_v1.delete_namespaced_config_map.assert_called_once_with(name="my-sb-persist-wrapper", namespace="default")
-        mock_v1.delete_namespaced_persistent_volume_claim.assert_called_once_with(
-            name="my-sb-root-lh", namespace="default"
-        )
+        mock_v1.delete_namespaced_config_map.assert_any_call(name="my-sb-persist-wrapper", namespace="default")
+        mock_v1.delete_namespaced_config_map.assert_any_call(name="my-sb-docker-vehicle", namespace="default")
+        mock_v1.delete_namespaced_persistent_volume_claim.assert_any_call(name="my-sb-root-lh", namespace="default")
+        mock_v1.delete_namespaced_persistent_volume_claim.assert_any_call(name="my-sb-docker-lh", namespace="default")
 
     async def test_delete_ignores_404s(self, core: K7Core):
         mock_apps = AsyncMock()
@@ -383,11 +383,11 @@ class TestPauseSandbox:
         assert snap_mock.call_args.kwargs["snapshot_name"] == "snap1"
 
     async def test_snapshot_only_defaults_pvc_to_root(self, core: K7Core):
-        """Spec 10c regression: snapshot_name alone triggers snapshot.
+        """Regression: snapshot_name alone triggers snapshot.
 
-        Pre-10c the snapshot only fired when ``pvc_name AND snapshot_name`` were
+        The snapshot used to fire only when ``pvc_name AND snapshot_name`` were
         both set, so ``k7 pause foo --snapshot bar`` silently did nothing.
-        After 10c, ``snapshot_name`` alone is sufficient and ``pvc_name``
+        Now ``snapshot_name`` alone is sufficient and ``pvc_name``
         defaults to ``_root_pvc_name(name)``.
         """
         mock_apps = AsyncMock()
@@ -536,7 +536,12 @@ class TestForkSandbox:
         """Set up mock clients for fork tests and return them."""
         mock_apps = AsyncMock()
         mock_v1 = AsyncMock()
-        _setup_clients(core, apps=mock_apps, v1=mock_v1)
+        # Source has no egress policy at all → the fork inherits open egress.
+        mock_net = AsyncMock()
+        mock_net.read_namespaced_network_policy.side_effect = ApiException(status=404)
+        mock_custom = AsyncMock()
+        mock_custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        _setup_clients(core, apps=mock_apps, v1=mock_v1, net=mock_net, custom=mock_custom)
 
         src_dep = MagicMock()
         src_dep.metadata.name = "src"
@@ -671,8 +676,305 @@ class TestForkSandbox:
         assert "Forked" in result.message
         mock_apps.create_namespaced_deployment.assert_called_once()
 
+    def _patch_fork_storage(self, core: K7Core):
+        return (
+            patch.object(core, "_create_volume_snapshot", new_callable=AsyncMock, return_value=OperationResult(True)),
+            patch.object(core, "_wait_for_snapshot_ready", new_callable=AsyncMock, return_value=OperationResult(True)),
+            patch.object(core, "_wait_for_pvc_bound", new_callable=AsyncMock, return_value=OperationResult(True)),
+        )
 
-# --- spec 18g: per-node agent forwarding ---
+    async def test_fork_applies_network_policies(self, core: K7Core):
+        """a fork used to come up with no policy at all."""
+        self._setup_fork(core)
+        core._custom_objects_client.get_namespaced_custom_object.side_effect = None
+        core._custom_objects_client.get_namespaced_custom_object.return_value = {
+            "spec": {"egress": [{"toFQDNs": [{"matchName": "example.com"}]}, {"toCIDR": ["10.0.0.0/8"]}]}
+        }
+        snap, ready, bound = self._patch_fork_storage(core)
+
+        with (
+            snap,
+            ready,
+            bound,
+            patch.object(
+                core,
+                "_apply_sandbox_network_policies",
+                new_callable=AsyncMock,
+                return_value=OperationResult(True),
+            ) as apply_policies,
+        ):
+            result = await core.fork_sandbox("src", "dst")
+
+        assert result.success is True
+        assert apply_policies.call_args.kwargs["name"] == "dst"
+        assert apply_policies.call_args.kwargs["egress_whitelist"] == ["example.com", "10.0.0.0/8"]
+
+    async def test_fork_of_open_egress_source_inherits_open_egress(self, core: K7Core):
+        self._setup_fork(core)
+        snap, ready, bound = self._patch_fork_storage(core)
+
+        with (
+            snap,
+            ready,
+            bound,
+            patch.object(
+                core,
+                "_apply_sandbox_network_policies",
+                new_callable=AsyncMock,
+                return_value=OperationResult(True),
+            ) as apply_policies,
+        ):
+            result = await core.fork_sandbox("src", "dst")
+
+        assert result.success is True
+        assert apply_policies.call_args.kwargs["egress_whitelist"] is None
+
+    async def test_fork_policy_failure_rolls_back_deployment(self, core: K7Core):
+        self._setup_fork(core)
+        snap, ready, bound = self._patch_fork_storage(core)
+
+        with (
+            snap,
+            ready,
+            bound,
+            patch.object(
+                core,
+                "_apply_sandbox_network_policies",
+                new_callable=AsyncMock,
+                return_value=OperationResult(False, error="boom"),
+            ),
+            patch.object(
+                core,
+                "_delete_sandbox_resources",
+                new_callable=AsyncMock,
+                return_value=OperationResult(True),
+            ) as rollback,
+        ):
+            result = await core.fork_sandbox("src", "dst")
+
+        assert result.success is False
+        assert "rolled back" in result.error and "boom" in result.error
+        rollback.assert_awaited_once_with("dst", "default")
+
+
+class TestApplySandboxNetworkPolicies:
+    """opt-in ingress, deny-all by default."""
+
+    def _net(self, core: K7Core):
+        mock_net = AsyncMock()
+        _setup_clients(core, net=mock_net)
+        return mock_net
+
+    def _ingress_body(self, mock_net):
+        for call in mock_net.create_namespaced_network_policy.call_args_list:
+            body = call.kwargs["body"]
+            if body.metadata.name.endswith("-deny-ingress"):
+                return body
+        raise AssertionError("no deny-ingress policy created")
+
+    async def test_default_is_deny_all(self, core: K7Core):
+        mock_net = self._net(core)
+        result = await core._apply_sandbox_network_policies(name="sb", namespace="default", egress_whitelist=None)
+
+        assert result.success is True
+        body = self._ingress_body(mock_net)
+        assert body.spec.policy_types == ["Ingress"]
+        assert body.spec.ingress == []
+        assert body.spec.pod_selector.match_labels == {"katakate.org/sandbox": "sb"}
+
+    async def test_ports_without_sources_allow_same_namespace_sandboxes(self, core: K7Core):
+        mock_net = self._net(core)
+        await core._apply_sandbox_network_policies(
+            name="sb", namespace="default", egress_whitelist=None, ingress_ports=[8000, 8001]
+        )
+
+        rule = self._ingress_body(mock_net).spec.ingress[0]
+        assert [(p.protocol, p.port) for p in rule.ports] == [("TCP", 8000), ("TCP", 8001)]
+        expr = rule._from[0].pod_selector.match_expressions[0]
+        assert (expr.key, expr.operator) == ("katakate.org/sandbox", "Exists")
+
+    async def test_explicit_sources_are_scoped(self, core: K7Core):
+        mock_net = self._net(core)
+        await core._apply_sandbox_network_policies(
+            name="sb",
+            namespace="default",
+            egress_whitelist=None,
+            ingress_ports=[8000],
+            ingress_from=["sandbox:alice", "cidr:203.0.113.0/24"],
+        )
+
+        peers = self._ingress_body(mock_net).spec.ingress[0]._from
+        assert peers[0].pod_selector.match_labels == {"katakate.org/sandbox": "alice"}
+        assert peers[1].ip_block.cidr == "203.0.113.0/24"
+
+    async def test_bad_source_fails_without_creating_the_policy(self, core: K7Core):
+        mock_net = self._net(core)
+        result = await core._apply_sandbox_network_policies(
+            name="sb", namespace="default", egress_whitelist=None, ingress_ports=[8000], ingress_from=["nonsense"]
+        )
+
+        assert result.success is False
+        assert "nonsense" in result.error
+        mock_net.create_namespaced_network_policy.assert_not_called()
+
+    async def test_policy_name_is_unchanged_when_it_carries_allow_rules(self, core: K7Core):
+        """Renaming it would strand policies created by older k7 versions,
+        which `_delete_sandbox_resources` deletes by name."""
+        mock_net = self._net(core)
+        await core._apply_sandbox_network_policies(
+            name="sb", namespace="default", egress_whitelist=None, ingress_ports=[8000]
+        )
+
+        assert self._ingress_body(mock_net).metadata.name == "sb-deny-ingress"
+
+
+class TestExposeSandboxPorts:
+    """NodePort Service in front of matching ingress rules."""
+
+    async def test_service_uses_local_external_traffic_policy(self, core: K7Core):
+        mock_v1 = AsyncMock()
+        created = MagicMock()
+        port = MagicMock()
+        port.port = 8000
+        port.node_port = 31234
+        created.spec.ports = [port]
+        mock_v1.create_namespaced_service.return_value = created
+        _setup_clients(core, v1=mock_v1)
+
+        result = await core._apply_sandbox_expose_service("sb", "default", [8000])
+
+        assert result.success is True
+        assert result.data == {"node_ports": {8000: 31234}}
+        body = mock_v1.create_namespaced_service.call_args.kwargs["body"]
+        assert body.metadata.name == "sb-expose"
+        assert body.spec.type == "NodePort"
+        # Without Local the client's source IP is SNAT'd and cidr: rules are theatre.
+        assert body.spec.external_traffic_policy == "Local"
+        assert body.spec.selector == {"app": "sb"}
+
+    async def test_unallocated_node_port_is_a_loud_failure(self, core: K7Core):
+        mock_v1 = AsyncMock()
+        created = MagicMock()
+        port = MagicMock()
+        port.port = 8000
+        port.node_port = None
+        created.spec.ports = [port]
+        mock_v1.create_namespaced_service.return_value = created
+        _setup_clients(core, v1=mock_v1)
+
+        result = await core._apply_sandbox_expose_service("sb", "default", [8000])
+        assert result.success is False
+        assert "no node port" in result.error
+
+    async def test_expose_without_matching_ingress_port_is_rejected(self, core: K7Core):
+        mock_apps = AsyncMock()
+        _setup_clients(core, apps=mock_apps, v1=AsyncMock(), net=AsyncMock())
+
+        cfg = SandboxConfig(name="sb1", image="alpine:3.20", ingress_ports=[8000], expose_ports=[9000])
+        result = await core.create_sandbox(cfg)
+
+        assert result.success is False
+        assert "[9000]" in result.error
+        mock_apps.create_namespaced_deployment.assert_not_called()
+
+
+class TestReadSandboxIngressRules:
+    async def test_deny_all_reads_back_as_none(self, core: K7Core):
+        np = MagicMock()
+        np.spec.ingress = []
+        mock_net = AsyncMock()
+        mock_net.read_namespaced_network_policy.return_value = np
+        _setup_clients(core, net=mock_net)
+
+        assert await core._read_sandbox_ingress_rules("sb", "default") == (None, None)
+
+    async def test_round_trips_ports_and_sources(self, core: K7Core):
+        """A fork must re-derive the source's policy from what it reads back."""
+        core_net = AsyncMock()
+        _setup_clients(core, net=core_net)
+        await core._apply_sandbox_network_policies(
+            name="sb",
+            namespace="default",
+            egress_whitelist=None,
+            ingress_ports=[8000],
+            ingress_from=["sandbox:alice", "namespace:team-a", "cidr:203.0.113.0/24"],
+        )
+        applied = [
+            c.kwargs["body"]
+            for c in core_net.create_namespaced_network_policy.call_args_list
+            if c.kwargs["body"].metadata.name == "sb-deny-ingress"
+        ][0]
+        core_net.read_namespaced_network_policy.return_value = applied
+
+        ports, sources = await core._read_sandbox_ingress_rules("sb", "default")
+        assert ports == [8000]
+        assert sources == ["sandbox:alice", "namespace:team-a", "cidr:203.0.113.0/24"]
+
+    async def test_default_source_reads_back_as_empty_list(self, core: K7Core):
+        core_net = AsyncMock()
+        _setup_clients(core, net=core_net)
+        await core._apply_sandbox_network_policies(
+            name="sb", namespace="default", egress_whitelist=None, ingress_ports=[8000]
+        )
+        applied = [
+            c.kwargs["body"]
+            for c in core_net.create_namespaced_network_policy.call_args_list
+            if c.kwargs["body"].metadata.name == "sb-deny-ingress"
+        ][0]
+        core_net.read_namespaced_network_policy.return_value = applied
+
+        assert await core._read_sandbox_ingress_rules("sb", "default") == ([8000], [])
+
+
+class TestReadSandboxEgressWhitelist:
+    async def test_cilium_wildcard_round_trips(self, core: K7Core):
+        mock_custom = AsyncMock()
+        mock_custom.get_namespaced_custom_object.return_value = {
+            "spec": {"egress": [{"toFQDNs": [{"matchPattern": "**.docker.com"}, {"matchName": "docker.io"}]}]}
+        }
+        _setup_clients(core, custom=mock_custom)
+
+        assert await core._read_sandbox_egress_whitelist("sb", "default") == ["*.docker.com", "docker.io"]
+
+    async def test_v1_netpol_cidrs(self, core: K7Core):
+        np = MagicMock()
+        peer = MagicMock()
+        peer.ip_block.cidr = "10.0.0.0/8"
+        rule = MagicMock()
+        rule.to = [peer]
+        np.spec.egress = [rule]
+        mock_net = AsyncMock()
+        mock_net.read_namespaced_network_policy.return_value = np
+        mock_custom = AsyncMock()
+        mock_custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        _setup_clients(core, net=mock_net, custom=mock_custom)
+
+        assert await core._read_sandbox_egress_whitelist("sb", "default") == ["10.0.0.0/8"]
+
+    async def test_block_all_egress_round_trips_as_empty_list(self, core: K7Core):
+        """`egress_whitelist=[]` (block everything) must not degrade to None
+        (open) when a fork inherits it."""
+        np = MagicMock()
+        np.spec.egress = []
+        mock_net = AsyncMock()
+        mock_net.read_namespaced_network_policy.return_value = np
+        mock_custom = AsyncMock()
+        mock_custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        _setup_clients(core, net=mock_net, custom=mock_custom)
+
+        assert await core._read_sandbox_egress_whitelist("sb", "default") == []
+
+    async def test_no_policy_means_open_egress(self, core: K7Core):
+        mock_net = AsyncMock()
+        mock_net.read_namespaced_network_policy.side_effect = ApiException(status=404)
+        mock_custom = AsyncMock()
+        mock_custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        _setup_clients(core, net=mock_net, custom=mock_custom)
+
+        assert await core._read_sandbox_egress_whitelist("sb", "default") is None
+
+
+# --- per-node agent forwarding ---
 
 
 class TestK7dAgentForwarding:
@@ -1084,6 +1386,24 @@ class TestCreateSandboxValidation:
         assert result.success is False
         assert "empty or invalid" in result.error
 
+    async def test_ingress_from_without_ports_rejected(self, core: K7Core):
+        _setup_clients(core, apps=AsyncMock(), v1=AsyncMock(), net=AsyncMock())
+
+        cfg = SandboxConfig(name="sb1", image="alpine:3.18", ingress_from=["sandbox:alice"])
+        result = await core.create_sandbox(cfg)
+        assert result.success is False
+        assert "ingress_from requires ingress_ports" in result.error
+
+    async def test_unparseable_ingress_source_rejected_before_provisioning(self, core: K7Core):
+        mock_apps = AsyncMock()
+        _setup_clients(core, apps=mock_apps, v1=AsyncMock(), net=AsyncMock())
+
+        cfg = SandboxConfig(name="sb1", image="alpine:3.18", ingress_ports=[8000], ingress_from=["nonsense"])
+        result = await core.create_sandbox(cfg)
+        assert result.success is False
+        assert "nonsense" in result.error
+        mock_apps.create_namespaced_deployment.assert_not_called()
+
 
 # --- _wait_for_pod_container_started ---
 
@@ -1351,8 +1671,7 @@ class TestApplyCiliumEgressPolicy:
         assert {"matchName": "api.openai.com"} in fqdn_rule["toFQDNs"]
         # Leading `*.` must be translated to Cilium's multi-label wildcard
         # `**.` — a single `*` never crosses label boundaries, silently
-        # breaking nested subdomains like production.cloudfront.docker.com
-        # (spec 18f issue 3).
+        # breaking nested subdomains like production.cloudfront.docker.com.
         assert {"matchPattern": "**.huggingface.co"} in fqdn_rule["toFQDNs"]
         assert any("toCIDR" in r and r["toCIDR"] == ["10.0.0.0/8"] for r in egress)
         # DNS proxy allowance is present

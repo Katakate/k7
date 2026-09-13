@@ -1,4 +1,4 @@
-"""Unit tests for the pause/resume/fork API endpoints (Spec 10a).
+"""Unit tests for the pause/resume/fork API endpoints.
 
 Hits the FastAPI ASGI app directly with a mocked K7Core, so these tests
 need no Kubernetes cluster. They verify request/response shape, body
@@ -64,7 +64,7 @@ class TestPauseEndpoint:
         fake.assert_awaited_once_with(name="demo", namespace="default", snapshot_name=None)
 
     async def test_pause_ignores_legacy_pvc_and_snapshot_class(self, keys_file):
-        """Spec 10c: pvc/snapshot_class in the body must NOT be forwarded to Core.
+        """pvc/snapshot_class in the body must NOT be forwarded to Core.
 
         We accept them silently for one release rather than 400ing — but the
         server-side behaviour is exactly as if they weren't sent.

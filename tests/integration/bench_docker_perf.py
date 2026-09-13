@@ -1,34 +1,38 @@
-"""Spec 10b/18e/18h: Docker workload benchmark — host vs k7-fd vs k7-ql vs k7d.
+"""Docker workload benchmark — host vs k7-fd vs k7-ql vs k7d vs k7d-fc.
 
 Why a pytest module rather than a separate bash harness:
-``tests/integration/test_sidecar_docker.py`` already pioneered the pattern
-of "spin up a ``docker:27.5-cli`` sandbox with ``--sidecar docker`` and run
-docker commands via ``k7_core.exec_command``." This benchmark just times
-that same pattern — no new infrastructure, no shelling-out to a separate
-script, no fiddly Alpine-vs-bash portability problems.
+``tests/integration/test_docker.py`` already pioneered the pattern
+of spinning up a sandbox with Docker and running docker commands via
+``k7_core.exec_command``. This benchmark times that same pattern.
+
+k7d and k7d-fc use first-class ``--docker`` (guest agent dockerd, overlay2 on a
+virtio-blk graph disk, forkable). Kata backends use the same ``--docker``
+flag via a privileged docker-vehicle container and a block graph
+(overlay2): Longhorn Block PVC on kql, ephemeral LVM thin LV on kfd.
 
 Why these environments are valid:
 ``test_sidecar_docker.py`` has a note claiming Docker-DinD doesn't work on
-the Firecracker backend. That note is wrong — confirmed by a manual probe
-on the multi-node cluster: ``k7 create --backend kfd --sidecar docker`` +
-``docker run hello-world`` exits 0 in ~3s. The sidecar wiring in
-``core.py`` is symmetric across backends; the only per-backend branch is
-where the docker daemon's ``/var/lib/docker`` lives (emptyDir on fd/k7d,
-Longhorn PVC sub_path on ql), which is exactly the isolation we want:
+the Firecracker backend. That note is historical — ``k7 create --docker``
+now lands on the vehicle, not ``docker:27.5-dind``. The isolation we want:
 
   - ``k7-fd``  — docker-in-VM without Longhorn in the storage path.
   - ``k7-ql-r1`` — adds Longhorn r=1 (one local replica).
   - ``k7-ql-r2`` — adds Longhorn r=2 (one local + one cross-node sync).
   - ``k7-ql-r3`` — Longhorn r=3 (replicas on all three nodes of an HA
-    cluster; spec 18e — the full redundancy write-amplification cost).
-  - ``k7d`` — docker-in-VM on k7d (dind data on guest tmpfs / emptyDir;
-    no Longhorn). Needs a large ``--memory`` because layers live in RAM.
+    cluster — the full redundancy write-amplification cost).
+  - ``k7d`` — first-class ``--docker``: dockerd is an agent child, graph
+    on a per-sandbox virtio-blk scratch disk (overlay2, not tmpfs).
+    Needs enough ``--memory`` for the engine; layers live on the graph
+    disk. Fork of a warm engine is in-scope.
+  - ``k7d-fc`` — same guest docker service as ``k7d``, RuntimeClass
+    ``k7-fc`` (stock Firecracker + jailer). Overlay2 and warm fork of
+    a running inner engine must match native k7d.
 
 Marker / invocation:
 This file uses ``@pytest.mark.bench`` so it doesn't run with the rest of
 ``-m integration``. Drive it explicitly:
 
-    K7_BENCH_ENVS=host,k7-fd,k7-ql-r1,k7-ql-r2,k7-ql-r3,k7d \\
+    K7_BENCH_ENVS=host,k7-fd,k7-ql-r1,k7-ql-r2,k7-ql-r3,k7d,k7d-fc \\
     K7_BENCH_OUT=/tmp/bench-out \\
     uv run pytest -m bench tests/integration/bench_docker_perf.py -v
 
@@ -49,15 +53,18 @@ import csv
 import json
 import os
 import platform
+import re
+import shlex
 import shutil
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from k7.core.core import K7Core
+from k7.core.core import K7Core, _is_k7d_family
 from k7.core.models import SandboxConfig
 
 pytestmark = pytest.mark.bench
@@ -82,19 +89,31 @@ BENCH_DOCKERFILE = (Path(__file__).resolve().parents[2] / "bench" / "docker-perf
 Operation = tuple[str, str]  # (op_name, shell_command)
 
 
-def _ops() -> list[Operation]:
+def _build_cmd(args: str, classic: bool) -> str:
+    # k7d guest BuildKit lacks the payload CA bundle (CHALLENGES #13).
+    prefix = "DOCKER_BUILDKIT=0 " if classic else ""
+    return f"{prefix}docker build {args}"
+
+
+def _ops(*, classic_build: bool = False) -> list[Operation]:
     return [
         ("pull", f"docker rmi -f {BENCH_IMAGE} 2>/dev/null; docker pull {BENCH_IMAGE}"),
         # The big one: apt + pip + git + 256 MB fsync.
         # ``--network=host`` works around the same Docker default-bridge DNS
-        # flake spec 10g hit when building the API image: with default bridge
+        # flake seen when building the API image: with default bridge
         # networking, ``apt-get update`` inside the build container intermittently
         # fails with "Try again" / "failed to lookup address information". Host
         # networking shares the daemon's already-working resolver — no measurement
         # impact for our purposes (the storage path is the same either way).
-        ("build_nocache", "cd /tmp/bench && docker build --network=host --no-cache -t bench:nocache -f Dockerfile ."),
+        (
+            "build_nocache",
+            f"cd /tmp/bench && {_build_cmd('--network=host --no-cache -t bench:nocache -f Dockerfile .', classic_build)}",
+        ),
         # Should be sub-second; non-zero would indicate a broken /var/lib/docker bind.
-        ("build_cached", "cd /tmp/bench && docker build --network=host -t bench:nocache -f Dockerfile ."),
+        (
+            "build_cached",
+            f"cd /tmp/bench && {_build_cmd('--network=host -t bench:nocache -f Dockerfile .', classic_build)}",
+        ),
         # 10s busy-loop — measures kata-qemu CPU overhead (mostly noise on host).
         (
             "run_cpu",
@@ -294,8 +313,10 @@ def _wait_all_containers_ready(name: str, namespace: str, timeout: int = 300) ->
         if r.returncode == 0:
             try:
                 items = _json.loads(r.stdout).get("items", [])
-                if items:
-                    statuses = items[0].get("status", {}).get("containerStatuses", [])
+                for pod in items:
+                    if pod.get("status", {}).get("phase") != "Running":
+                        continue
+                    statuses = pod.get("status", {}).get("containerStatuses", [])
                     if statuses and all(s.get("ready") for s in statuses):
                         return
             except (_json.JSONDecodeError, KeyError, IndexError):
@@ -304,13 +325,32 @@ def _wait_all_containers_ready(name: str, namespace: str, timeout: int = 300) ->
     raise TimeoutError(f"containers not ready for {name}: {timeout}s")
 
 
-async def _sandbox_run_once(k7_core: K7Core, name: str, namespace: str, command: str) -> float:
+async def _sandbox_run_once(k7_core: K7Core, name: str, namespace: str, command: str, timeout: int = 1800) -> float:
+    """Time a guest command. Kata CRI exec returns after the first stdout chunk
+    (CHALLENGES #13), so we launch with no streaming stdout and poll a done-file.
+    """
+    token = uuid.uuid4().hex[:12]
+    out = f"/tmp/k7-bench-{token}.out"
+    ec = f"/tmp/k7-bench-{token}.ec"
+    launch = f"trap '' HUP; rm -f {ec} {out}; ( sh -c {shlex.quote(command)} >{out} 2>&1; echo $? >{ec} ) &"
     start = _now()
-    r = await k7_core.exec_command(name, command, namespace=namespace)
-    elapsed = _now() - start
-    if r.exit_code != 0:
-        raise AssertionError(f"sandbox op failed (rc={r.exit_code}): {r.stderr[-500:]}")
-    return elapsed
+    await k7_core.exec_command(name, launch, namespace=namespace)
+    deadline = start + timeout
+    last = ""
+    while _now() < deadline:
+        result = await k7_core.exec_command(name, f"[ -f {ec} ] && echo __K7_EC:$(cat {ec})", namespace=namespace)
+        last = (result.stdout or "") + (f"\n{result.stderr}" if result.stderr else "")
+        match = re.search(r"__K7_EC:(\d+)", last)
+        if match:
+            elapsed = _now() - start
+            code = int(match.group(1))
+            body_res = await k7_core.exec_command(name, f"tail -c 800 {out}; rm -f {out} {ec}", namespace=namespace)
+            if code != 0:
+                body = (body_res.stdout or "").strip()
+                raise AssertionError(f"sandbox op failed (rc={code}): {body[-500:]}")
+            return elapsed
+        await asyncio.sleep(2)
+    raise AssertionError(f"sandbox op timed out after {timeout}s: {command!r} last={last!r}")
 
 
 async def _sandbox_reset(k7_core: K7Core, name: str, namespace: str) -> None:
@@ -335,22 +375,25 @@ async def _bench_sandbox(
     out_dir: Path,
     longhorn_replicas: int | None = None,
     limits: dict[str, str] | None = None,
+    *,
+    docker: bool = False,
 ) -> Path:
     name = f"bench-{label.replace('_', '-')}"
     cfg = SandboxConfig(
         name=name,
-        image=SANDBOX_IMAGE,
+        image="ubuntu:24.04" if docker else SANDBOX_IMAGE,
         namespace=namespace,
         backend=backend,
-        sidecar="docker",
+        docker=docker,
+        sidecar=None if docker else "docker",
         # The sandbox needs room for the full bench image + its build cache
         # + the 2k-files / 512 MB workloads. Default 10Gi is the minimum;
         # keep it explicit for reproducibility — and only meaningful when
-        # the root disk is a Longhorn PVC (kata-qemu-longhorn). The firecracker
-        # / k7d backends ignore this and the docker daemon's data lives on
-        # the sidecar's emptyDir (guest tmpfs on k7d — size via ``limits``).
+        # the root disk is a Longhorn PVC (kata-qemu-longhorn). On k7d
+        # ``--docker`` the graph is a virtio-blk scratch disk (default 20Gi).
         root_disk_size="20Gi",
         limits=limits,
+        node_name=platform.node(),
     )
     create = await k7_core.create_sandbox(cfg)
     assert create.success, f"create {name}: {create.error}"
@@ -400,7 +443,7 @@ async def _bench_sandbox(
         assert actual_lines >= expected_lines - 2, (
             f"Dockerfile was truncated on the sandbox side: "
             f"expected ~{expected_lines} lines, got {actual_lines}. "
-            f"This is the spec-10b 'silent build failure' regression — see commit msg."
+            f"This is the 'silent build failure' regression — see commit msg."
         )
 
         # Capture docker version + storage driver from inside the sandbox.
@@ -429,11 +472,11 @@ async def _bench_sandbox(
             await k7_core.exec_command(name, f"docker pull {BENCH_IMAGE}", namespace=namespace)
             await k7_core.exec_command(
                 name,
-                "cd /tmp/bench && docker build --network=host --no-cache -t bench:nocache -f Dockerfile .",
+                f"cd /tmp/bench && {_build_cmd('--network=host --no-cache -t bench:nocache -f Dockerfile .', docker)}",
                 namespace=namespace,
             )
 
-        for op, command in _ops():
+        for op, command in _ops(classic_build=docker):
             for i in range(1, REPS + 1):
                 # Same reset policy as the host leg — see _bench_host for rationale.
                 if op in ("pull", "build_nocache"):
@@ -453,6 +496,31 @@ async def _bench_sandbox(
                     _append_row(log, op, i, float("nan"))
 
         await _sandbox_reset(k7_core, name, namespace)
+
+        if docker and _is_k7d_family(backend):
+            # Fork a warm engine; child must stay overlay2.
+            fork_name = f"{name}-fork"
+            t0 = time.monotonic()
+            fork = await k7_core.fork_sandbox(name, fork_name, namespace=namespace)
+            elapsed = time.monotonic() - t0
+            assert fork.success, f"{backend} --docker fork failed: {fork.error}"
+            _append_row(log, "fork_warm_engine", 1, elapsed)
+            try:
+                _wait_all_containers_ready(fork_name, namespace, timeout=180)
+                await _wait_docker_ready(k7_core, fork_name, namespace)
+                child_sd = await k7_core.exec_command(
+                    fork_name,
+                    "docker info 2>/dev/null | grep 'Storage Driver' | head -1",
+                    namespace=namespace,
+                )
+                driver = child_sd.stdout.strip()
+                assert "overlay2" in driver.lower(), f"{backend} forked child storage driver: {driver!r}"
+                assert "vfs" not in driver.lower(), f"{backend} forked child fell back to vfs: {driver!r}"
+                with log.open("a") as f:
+                    f.write(f"# storage_driver_child={driver}\n")
+                _append_row(log, "fork_to_ready", 1, time.monotonic() - t0)
+            finally:
+                await k7_core.delete_sandbox(fork_name, namespace=namespace)
     finally:
         await k7_core.delete_sandbox(name, namespace=namespace)
     return log
@@ -621,8 +689,9 @@ async def test_bench_k7_fd(
         label="k7-fd",
         namespace=test_namespace,
         backend="kata-firecracker-devmapper",
-        backend_extra={"docker_data_path": "emptyDir"},
+        backend_extra={"docker_data_path": "k7-docker-lvm-overlay2"},
         out_dir=bench_out_dir,
+        docker=True,
     )
     bench_logs.append(log)
     print(f"\n[bench] k7-fd log → {log}")
@@ -641,9 +710,10 @@ async def _bench_ql(
         label=label,
         namespace=namespace,
         backend="kata-qemu-longhorn",
-        backend_extra={"longhorn_replicas": str(replicas)},
+        backend_extra={"longhorn_replicas": str(replicas), "docker_data_path": "longhorn-block-overlay2"},
         out_dir=out_dir,
         longhorn_replicas=replicas,
+        docker=True,
     )
     bench_logs.append(log)
     print(f"\n[bench] {label} log → {log}")
@@ -690,13 +760,10 @@ async def test_bench_k7d(
     bench_out_dir: Path,
     bench_logs: list[Path],
 ):
-    """k7d docker-in-VM — dind data on guest tmpfs (no Longhorn).
+    """k7d first-class --docker — overlay2 on a virtio-blk graph disk.
 
-    3Gi guest + 4 vCPU: largest size that reliably reaches Ready today.
-    ≥4Gi currently breaks k7d agent connect on create
-    (``Connection timed out`` / ``No such device``) — use 3Gi until
-    that is root-caused. Guest overlay scales with memory (~1.5 Gi at
-    3Gi), so layers + the 512 MB fsync share that budget.
+    Graph is no longer guest tmpfs, so the 3Gi memory ceiling that blocked
+    no-cache builds is gone. Fork of a warm engine is timed after run_io.
     """
     _maybe_skip("k7d")
     log = await _bench_sandbox(
@@ -704,9 +771,41 @@ async def test_bench_k7d(
         label="k7d",
         namespace=test_namespace,
         backend="k7d",
-        backend_extra={"docker_data_path": "emptyDir/tmpfs"},
+        backend_extra={"docker_data_path": "virtio-blk-scratch"},
         out_dir=bench_out_dir,
         limits={"memory": "3Gi", "cpu": "4"},
+        docker=True,
     )
     bench_logs.append(log)
     print(f"\n[bench] k7d log → {log}")
+
+
+@pytest.mark.k7d
+async def test_bench_k7d_fc(
+    k7_core: K7Core,
+    test_namespace: str,
+    bench_out_dir: Path,
+    bench_logs: list[Path],
+):
+    """k7d-fc --docker — same guest service, RuntimeClass k7-fc."""
+    _maybe_skip("k7d-fc")
+    present = subprocess.run(
+        ["k3s", "kubectl", "get", "runtimeclass", "k7-fc"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if present.returncode != 0:
+        pytest.skip("RuntimeClass k7-fc not registered")
+    log = await _bench_sandbox(
+        k7_core,
+        label="k7d-fc",
+        namespace=test_namespace,
+        backend="k7d-fc",
+        backend_extra={"docker_data_path": "virtio-blk-scratch", "runtime_class": "k7-fc"},
+        out_dir=bench_out_dir,
+        limits={"memory": "3Gi", "cpu": "4"},
+        docker=True,
+    )
+    bench_logs.append(log)
+    print(f"\n[bench] k7d-fc log → {log}")

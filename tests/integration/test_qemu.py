@@ -28,7 +28,7 @@ def _wait_pod_ready(sandbox_name: str, namespace: str, timeout: int = 300) -> No
     """Block until a non-terminating Running pod for the sandbox is Ready.
 
     After pause→resume, a terminating pod can still report Ready=True while
-    the replacement is Pending; ``.items[0]`` alone races (spec 18h flake).
+    the replacement is Pending; ``.items[0]`` alone races (observed flake).
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -156,8 +156,28 @@ class TestQemuLonghornBackend:
         finally:
             await k7_core.delete_sandbox("integ-ql-rt", namespace=test_namespace)
 
+    async def test_guest_seccomp_config_and_sandbox_starts(self, k7_core: K7Core, test_namespace: str):
+        """Guest seccomp bypass must be off; persist-bind must still boot."""
+        toml_path = "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+        with open(toml_path) as f:
+            toml = f.read()
+        assert "disable_guest_seccomp = false" in toml, toml
+        assert "disable_guest_seccomp = true" not in toml.replace("disable_guest_seccomp = false", "")
+        cfg = SandboxConfig(
+            name="integ-ql-seccomp",
+            image="alpine:3.20",
+            namespace=test_namespace,
+            backend="kata-qemu-longhorn",
+        )
+        result = await k7_core.create_sandbox(cfg)
+        assert result.success, f"create failed after disable_guest_seccomp=false: {result.error}"
+        try:
+            _wait_pod_ready("integ-ql-seccomp", test_namespace)
+        finally:
+            await k7_core.delete_sandbox("integ-ql-seccomp", namespace=test_namespace)
+
     async def test_memory_limit_sizes_vm(self, k7_core: K7Core, test_namespace: str):
-        """Spec 18g regression: a kql sandbox with a memory limit stamps the
+        """Regression: a kql sandbox with a memory limit stamps the
         ``default_memory`` hypervisor annotation. Before the install allowed
         it in configuration-qemu.toml, kata rejected the WHOLE pod with
         "annotation ... is not enabled" — it could never start. Assert the
@@ -344,7 +364,7 @@ class TestSnapshotPauseResumeFork:
             _wait_pod_ready(fork_name, test_namespace, timeout=600)
             fork_elapsed = time.time() - t0
             print(f"[timing] fork total in {fork_elapsed:.2f}s")
-            # 600s bound (spec 18e): on a 3-node Longhorn r=3 cluster the
+            # 600s bound: on a 3-node Longhorn r=3 cluster the
             # fork's cloned volume hydrates replicas on all nodes, and the
             # very FIRST fork after a fresh install additionally pulls the
             # Longhorn engine image on every node plus the sandbox image on
@@ -419,7 +439,7 @@ class TestSnapshotPauseResumeFork:
     async def test_cleanup_no_leak(self, k7_core: K7Core, test_namespace: str):
         """Validates delete removes PVCs once referencing snapshots are gone.
 
-        Spec 10e keeps the root PVC while pause/named snapshots still exist, so
+        The root PVC is kept while pause/named snapshots still exist, so
         the snapshot must be deleted before the sandbox for a full cleanup.
         """
         name = "integ-leak"

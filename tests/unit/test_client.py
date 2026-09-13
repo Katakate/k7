@@ -1,7 +1,7 @@
 """Unit tests for the k7_sdk client (sync + async).
 
 These tests verify URL/body construction and response unwrapping for the
-pause/resume/fork SDK additions from Spec 10a. The HTTP layer is mocked so
+pause/resume/fork SDK additions. The HTTP layer is mocked so
 the tests run without a live API.
 """
 
@@ -10,6 +10,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from k7_sdk.client import AsyncClient, Client, SandboxProxy
+
+
+def test_sync_client_accepts_ca_path(tmp_path):
+    ca = tmp_path / "ca.crt"
+    ca.write_text("dummy")
+    c = Client(endpoint="https://api.test", api_key="k", verify_ssl=str(ca))
+    assert c.session.verify == str(ca)
+
+
+def test_sync_client_refuses_verify_false_on_https():
+    with pytest.raises(ValueError, match="not allowed for https"):
+        Client(endpoint="https://api.test", api_key="k", verify_ssl=False)
+
+
+def test_sync_client_allows_verify_false_on_http():
+    c = Client(endpoint="http://api.test", api_key="k", verify_ssl=False)
+    assert c.session.verify is False
 
 
 def _mock_response(payload: dict, status_code: int = 200) -> MagicMock:
@@ -50,7 +67,7 @@ class TestSyncClientPause:
         assert body == {"namespace": "ns", "snapshot": "snap1"}
 
     def test_pause_does_not_accept_legacy_kwargs(self):
-        """Spec 10c: pvc and snapshot_class were removed from the SDK surface."""
+        """pvc and snapshot_class were removed from the SDK surface."""
         import inspect
 
         sig = inspect.signature(Client.pause)
@@ -176,6 +193,11 @@ class TestAsyncClient:
 
 
 # --- Smoke: AsyncClient construction requires httpx --------------------------
+
+
+def test_async_client_refuses_verify_false_on_https():
+    with pytest.raises(ValueError, match="not allowed for https"):
+        AsyncClient(endpoint="https://api.test", api_key="k", verify_ssl=False)
 
 
 def test_async_client_requires_httpx(monkeypatch):

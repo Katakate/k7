@@ -1,4 +1,4 @@
-"""Spec 11a: ``katakate`` PyPI shim re-exports ``k7_sdk`` with a deprecation warning."""
+"""``katakate`` PyPI shim re-exports ``k7_sdk`` with a deprecation warning."""
 
 import warnings
 

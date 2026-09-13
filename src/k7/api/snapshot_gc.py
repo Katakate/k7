@@ -1,4 +1,4 @@
-"""Snapshot garbage-collection entrypoint (Spec 10e, Option C backstop).
+"""Snapshot garbage-collection entrypoint (Option C backstop).
 
 Run as ``python -m k7.api.snapshot_gc`` inside the ``k7-api`` container.
 The accompanying CronJob (``snapshot-gc-cronjob.yaml``) invokes this
@@ -12,6 +12,10 @@ Behaviour:
 - Honours the same ``keep_fork_for`` window as :meth:`K7Core.gc_snapshots`.
 - Skips anything that isn't ``kind=fork`` — pause and named snapshots are
   never touched.
+- Reaps orphan ``VolumeSnapshotContent`` objects (and stuck
+  ``pvc-as-source-protection`` PVC finalizers) whose VolumeSnapshot is
+  already gone. That is what otherwise pins ``k7-test-*`` namespaces in
+  Terminating after snapshot-lifecycle tests.
 - Environment overrides: ``K7_GC_KEEP_FORK_FOR_MINUTES`` (default ``10``),
   ``K7_GC_DRY_RUN`` (``true``/``false``, default ``false``).
 """

@@ -1,4 +1,4 @@
-# Spec 10b workload: small but realistic. apt + pip generate thousands of
+# Benchmark workload: small but realistic. apt + pip generate thousands of
 # small files (metadata pressure), git clone is inode/dir-creation heavy,
 # ``dd ... conv=fsync`` measures large-block sync write throughput. Each
 # layer is bounded so the whole no-cache build completes in a few minutes

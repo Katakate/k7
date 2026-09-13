@@ -5,6 +5,7 @@ Flannel), so the file is safe to run on any k7 node.
 """
 
 import asyncio
+import os
 import subprocess
 import time
 
@@ -167,8 +168,8 @@ class TestCiliumFqdnEgress:
             await k7_core.delete_sandbox("integ-fqdn-net", namespace=test_namespace)
 
     async def test_docker_pull_through_fqdn_whitelist(self, k7_core: K7Core, test_namespace: str):
-        """`docker pull` from Docker Hub through an FQDN egress whitelist
-        (spec 18f issue 3). Hub blobs are served from CDN hosts with nested
+        """`docker pull` from Docker Hub through an FQDN egress whitelist.
+        Hub blobs are served from CDN hosts with nested
         subdomains (production.cloudfront.docker.com) and 30-60s DNS TTLs —
         this exercises the `*.` → `**.` matchPattern translation and the
         dnsProxy.minTtl tuning end-to-end."""
@@ -201,7 +202,151 @@ class TestCiliumFqdnEgress:
             pull = await k7_core.exec_command(name, "docker pull alpine:3.20 2>&1 | tail -3", namespace=test_namespace)
             assert "Downloaded newer image" in pull.stdout or "Image is up to date" in pull.stdout, (
                 f"docker pull through FQDN whitelist failed — CDN egress is broken again "
-                f"(spec 18f issue 3): stdout={pull.stdout!r} stderr={pull.stderr!r}"
+                f"stdout={pull.stdout!r} stderr={pull.stderr!r}"
             )
         finally:
+            await k7_core.delete_sandbox(name, namespace=test_namespace)
+
+
+_KUBECONFIG = "/etc/rancher/k3s/k3s.yaml"
+_HUBBLE = "/usr/local/bin/hubble"
+_CILIUM = "/usr/local/bin/cilium"
+
+
+def _hubble_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["KUBECONFIG"] = _KUBECONFIG
+    return env
+
+
+def _hubble_relay_ready() -> bool:
+    try:
+        result = subprocess.run(
+            [
+                _K3S,
+                "kubectl",
+                "-n",
+                "kube-system",
+                "get",
+                "deployment",
+                "hubble-relay",
+                "-o",
+                "jsonpath={.status.readyReplicas}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and result.stdout.strip() not in ("", "0")
+    except FileNotFoundError:
+        return False
+
+
+requires_hubble = pytest.mark.skipif(
+    not _hubble_relay_ready(),
+    reason="Hubble relay not installed (re-run k7 install --hubble)",
+)
+
+
+def _start_hubble_port_forward() -> subprocess.Popen:
+    """Background `cilium hubble port-forward` and wait until observe works.
+
+    Verified on the node: hubble-relay is ClusterIP :80; this command
+    prints "Hubble Relay is available at 127.0.0.1:4245" and `hubble
+    status` then reports Healthcheck (via localhost:4245): Ok.
+    """
+    proc = subprocess.Popen(
+        [_CILIUM, "hubble", "port-forward"],
+        env=_hubble_env(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    deadline = time.time() + 30
+    last_err = ""
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            err = proc.stderr.read().decode() if proc.stderr else ""
+            raise RuntimeError(f"cilium hubble port-forward exited {proc.returncode}: {err}")
+        probe = subprocess.run(
+            [_HUBBLE, "status"],
+            env=_hubble_env(),
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            return proc
+        last_err = probe.stderr or probe.stdout
+        time.sleep(1)
+    proc.terminate()
+    raise TimeoutError(f"hubble status never succeeded via port-forward: {last_err}")
+
+
+def _stop_hubble_port_forward(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+@requires_cilium
+@requires_hubble
+class TestHubbleObserveDropped:
+    async def test_hubble_observe_surfaces_fqdn_drop(self, k7_core: K7Core, test_namespace: str):
+        """A non-whitelisted curl must show up as DROPPED in `hubble observe`."""
+        name = "integ-hubble-drop"
+        cfg = SandboxConfig(
+            name=name,
+            image="alpine:3.20",
+            namespace=test_namespace,
+            egress_whitelist=["example.com"],
+            before_script="apk add --no-cache curl >/dev/null",
+        )
+        result = await k7_core.create_sandbox(cfg)
+        assert result.success, f"create failed: {result.error}"
+        pf = None
+        try:
+            await _wait_ready(k7_core, name, test_namespace)
+            blocked = await k7_core.exec_command(
+                name,
+                "curl -sS -o /dev/null --max-time 8 https://www.iana.org/ && echo OK || echo BLOCKED",
+                namespace=test_namespace,
+            )
+            assert "BLOCKED" in blocked.stdout, (
+                f"Expected non-whitelisted domain to be blocked, got stdout={blocked.stdout!r} "
+                f"stderr={blocked.stderr!r}"
+            )
+
+            pf = _start_hubble_port_forward()
+            deadline = time.time() + 45
+            observe_out = ""
+            while time.time() < deadline:
+                observe = subprocess.run(
+                    [
+                        _HUBBLE,
+                        "observe",
+                        "--namespace",
+                        test_namespace,
+                        "--verdict",
+                        "DROPPED",
+                        "--last",
+                        "50",
+                    ],
+                    env=_hubble_env(),
+                    capture_output=True,
+                    text=True,
+                )
+                observe_out = (observe.stdout or "") + (observe.stderr or "")
+                if observe.returncode == 0 and "DROPPED" in observe.stdout:
+                    return
+                time.sleep(2)
+            raise AssertionError(
+                f"hubble observe --verdict DROPPED did not surface the FQDN drop in {test_namespace}: {observe_out!r}"
+            )
+        finally:
+            if pf is not None:
+                _stop_hubble_port_forward(pf)
             await k7_core.delete_sandbox(name, namespace=test_namespace)

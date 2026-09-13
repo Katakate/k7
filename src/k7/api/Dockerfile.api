@@ -11,7 +11,7 @@ RUN uv venv /app/.venv && \
 
 # crictl (pinned): k7d VM ops (pause/resume/fork) resolve a pod to its CRI
 # sandbox id via `crictl pods` against the node's containerd socket, which
-# the k7-api deployment hostPath-mounts (spec 18f issue 2). The node's own
+# the k7-api deployment hostPath-mounts. The node's own
 # /usr/local/bin/crictl is a k3s symlink and can't be mounted usefully.
 ARG CRICTL_VERSION=v1.31.1
 ARG CRICTL_SHA256=0a03ba6b1e4c253d63627f8d210b2ea07675a8712587e697657b236d06d7d231
@@ -28,7 +28,7 @@ ENV PYTHONPATH="/app"
 WORKDIR /app
 
 # lvm2: the k7-agent DaemonSet (same image, `k7.api.agent:app`) reports the
-# kfd thin-pool utilization via `lvs` (spec 18g) — needs the privileged
+# kfd thin-pool utilization via `lvs` — needs the privileged
 # agent container with /dev hostPath-mounted.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

@@ -5,8 +5,10 @@ metadata:
   labels:
     app: k7-api
 rules:
+  # services: the `{name}-expose` NodePort. Delete always attempts this
+  # cleanup; a missing verb is 403, not 404, so every API delete 400s.
   - apiGroups: [""]
-    resources: ["pods", "pods/exec", "pods/log", "secrets", "configmaps", "persistentvolumeclaims", "namespaces", "nodes"]
+    resources: ["pods", "pods/exec", "pods/log", "secrets", "configmaps", "persistentvolumeclaims", "namespaces", "nodes", "services"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments", "deployments/scale"]
@@ -14,7 +16,7 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # FQDN egress (Spec 4a) is enforced via CiliumNetworkPolicy, so the API
+  # FQDN egress is enforced via CiliumNetworkPolicy, so the API
   # must be able to manage them to apply/delete sandbox egress rules.
   - apiGroups: ["cilium.io"]
     resources: ["ciliumnetworkpolicies"]

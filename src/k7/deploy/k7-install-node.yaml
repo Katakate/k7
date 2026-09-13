@@ -10,27 +10,53 @@
     longhorn_version: "v1.10.1"
     firecracker_version: "v1.14.0"
     jailer_version: "v1.14.0"
-    # k7d backend (spec 9a M11): release artifact source. Override
+    # k7d backend: release artifact source. Override
     # `k7d_artifact_local_path` (path on the Ansible controller) to install
     # from a locally built tarball instead of the GitHub release.
-    k7d_version: "0.2.1"
+    k7d_version: "0.6.0"
     k7d_artifact_url: "https://github.com/katakate/k7d/releases/download/v{{ k7d_version }}/k7d-v{{ k7d_version }}-x86_64-linux.tar.gz"
     k7d_artifact_local_path: ""
     # Sparse XFS (reflink=1) loopback image backing /var/lib/k7d/disks —
     # k7d's writable volume images live there so warm forks can CoW-clone
     # them with FICLONE reflinks. Per-node override in the inventory:
     # `k7d_disks_image_size=64G`. Sizing + failure modes: docs/BACKENDS.md
-    # "Disk pool sizing" (spec 18f issue 5).
+    # "Disk pool sizing".
     k7d_disks_image_size: "32G"
     # Size of the LVM physical volume carved out of the spare disk for the
     # kfd kata-vg/thin-pool (the rest of the disk stays unused). Per-node
     # override in the inventory: `kata_thinpool_pv_size=400G`.
+    # Docker-heavy kfd nodes share this pool with the docker graph LVs
+    # (StorageClass k7-docker-lvm); raise it rather than resizing
+    # silently.
     kata_thinpool_pv_size: "100G"
+    # OpenEBS LVM CSI for kfd --docker block volumes. Chart +
+    # driver tag are the same pin; sidecar image tags come from the chart.
+    helm_version: "v3.16.4"
+    helm_sha256: "fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179"
+    openebs_lvm_localpv_version: "1.10.1"
+    openebs_lvm_driver_image: "docker.io/openebs/lvm-driver:1.10.1"
     # CNI: "cilium" (default) enables FQDN egress via CiliumNetworkPolicy.
     # "flannel" retains K3s's bundled CNI (CIDR-only egress).
     k7_cni_default: "cilium"
     cilium_cli_version: "v0.19.2"
     cilium_version: "1.19.2"
+    # Hubble CLI is a separate repo from Cilium; the 1.19 line skipped
+    # v1.19.2 (no such tag). Pin v1.19.3, which vendors Cilium 1.19.2+.
+    hubble_cli_version: "v1.19.3"
+    # Must be 2^n - 1 and <= 65535. Default is 4095; 2047 is the
+    # conservative observe buffer (nodes also run Kata + Longhorn + k3s).
+    hubble_event_buffer_capacity: "2047"
+    # k7-api TLS. Default is HTTPS + playbook CA. The CLI
+    # forwards these extra-vars; empty / false keeps the documented
+    # defaults when the playbook is invoked directly.
+    k7_api_insecure_http: false
+    k7_api_hostname: ""
+    k7_api_tls_cert_src: ""
+    k7_api_tls_key_src: ""
+    k7_api_acme_staging: false
+    # linux/amd64 digest for caddy:2.10.2 (Docker Hub, 2026-02-11).
+    # Keep in sync with CADDY_IMAGE in k7_api_tls.py (unit-tested).
+    k7_caddy_image: "caddy:2.10.2@sha256:d8c17a862962def15cde69863a3a463f25a2664942eafd7bdbf050e9c3116b83"
     # Map ansible_architecture to Debian/Kata arch format
     arch_map:
       x86_64: amd64
@@ -40,6 +66,7 @@
   tasks:
     - name: Gather facts (ensures ansible_distribution_release is available)
       ansible.builtin.setup:
+      tags: ['always']
 
     # ──────────────────────────────────────────────────────────────────────
     # Compute per-host backend set + cluster role
@@ -53,6 +80,7 @@
             else ([k7_backend] if (k7_backend is defined and k7_backend | length > 0)
                   else [k7_backend_default])
           }}
+      tags: ['always']
 
     - name: Normalize deprecated backend aliases
       ansible.builtin.set_fact:
@@ -62,9 +90,11 @@
             | map('regex_replace', '^(fd|kfd|firecracker-devmapper)$', 'kata-firecracker-devmapper')
             | map('regex_replace', '^(ql|kql|qemu-longhorn)$', 'kata-qemu-longhorn')
             | map('regex_replace', '^k7$', 'k7d')
+            | map('regex_replace', '^k7-fc$', 'k7d-fc')
             | unique
             | list
           }}
+      tags: ['always']
 
     - name: Warn on deprecated backend names
       ansible.builtin.debug:
@@ -73,20 +103,24 @@
           {{ k7_backends_raw }} → {{ k7_backends_list }}.
           Prefer kata-firecracker-devmapper (kfd) / kata-qemu-longhorn (kql).
       when: k7_backends_raw != k7_backends_list
+      tags: ['always']
 
     - name: Validate backends list
       ansible.builtin.fail:
-        msg: "Unknown backend(s) in k7_backends={{ k7_backends_list }}; allowed: kata-firecracker-devmapper, kata-qemu-longhorn, k7d"
-      when: k7_backends_list | difference(['kata-firecracker-devmapper', 'kata-qemu-longhorn', 'k7d']) | length > 0
+        msg: "Unknown backend(s) in k7_backends={{ k7_backends_list }}; allowed: kata-firecracker-devmapper, kata-qemu-longhorn, k7d, k7d-fc"
+      when: k7_backends_list | difference(['kata-firecracker-devmapper', 'kata-qemu-longhorn', 'k7d', 'k7d-fc']) | length > 0
+      tags: ['always']
 
     - name: Normalize CNI selection
       ansible.builtin.set_fact:
         k7_cni_effective: "{{ (k7_cni | default(k7_cni_default)) | lower }}"
+      tags: ['always']
 
     - name: Validate CNI selection
       ansible.builtin.fail:
         msg: "Unknown CNI '{{ k7_cni_effective }}'; allowed: cilium, flannel"
       when: k7_cni_effective not in ['cilium', 'flannel']
+      tags: ['always']
 
     # The Kubernetes node object is named after the machine hostname, not
     # the Ansible inventory alias — `k7 install` (no hosts) runs against
@@ -97,6 +131,7 @@
       ansible.builtin.set_fact:
         k7_k8s_node_name: >-
           {{ ansible_hostname if inventory_hostname in ['localhost', '127.0.0.1'] else inventory_hostname }}
+      tags: ['always']
 
     - name: Compute cluster role and shortcuts
       ansible.builtin.set_fact:
@@ -107,14 +142,65 @@
         longhorn_replicas_effective: "{{ longhorn_replicas | default([3, ((groups['k7_cluster'] | default([inventory_hostname])) | length)] | min) }}"
         k7_has_devmapper: "{{ 'kata-firecracker-devmapper' in k7_backends_list }}"
         k7_has_longhorn: "{{ 'kata-qemu-longhorn' in k7_backends_list }}"
-        k7_has_k7d: "{{ 'k7d' in k7_backends_list }}"
+        k7_has_k7d: "{{ 'k7d' in k7_backends_list or 'k7d-fc' in k7_backends_list }}"
+        k7_has_k7d_fc: "{{ 'k7d-fc' in k7_backends_list }}"
         k7_cni_is_cilium: "{{ k7_cni_effective == 'cilium' }}"
+      tags: ['always']
+
+    # opt-in source-CIDR allowlist for the k7-api NodePort. Values
+    # are validated by the CLI (`ipaddress.ip_network`) before we get here.
+    - name: Normalise the k7-api source-CIDR allowlist
+      ansible.builtin.set_fact:
+        k7_api_allow_cidrs_list: >-
+          {{ (k7_api_allow_cidrs | default('')).split(',') | map('trim') | reject('equalto', '') | list }}
+
+    - name: Fail if an API allowlist is requested without Cilium
+      ansible.builtin.fail:
+        msg: >-
+          Error: --api-allow-cidr requires the Cilium CNI (got --cni {{ k7_cni_effective }}).
+          The reserved host/remote-node/health/kube-apiserver peers the kubelet probes need
+          are not expressible in a v1 NetworkPolicy.
+      when:
+        - k7_api_allow_cidrs_list | length > 0
+        - k7_cni_effective != 'cilium'
+
+    - name: Fail if Hubble requested without Cilium
+      ansible.builtin.fail:
+        msg: "Error: --hubble requires the Cilium CNI (got --cni {{ k7_cni_effective }})."
+      when:
+        - k7_hubble_enabled | default(false) | bool
+        - k7_cni_effective != 'cilium'
+
+    # The CLI already refuses these combinations. Repeat the
+    # check here so a direct ansible-playbook invocation fails loud too.
+    - name: Fail if insecure HTTP is combined with a TLS cert source
+      ansible.builtin.fail:
+        msg: >-
+          Error: --api-insecure-http cannot be combined with --api-hostname
+          or --api-tls-cert/--api-tls-key.
+      when:
+        - k7_api_insecure_http | default(false) | bool
+        - (k7_api_hostname | default('') | length > 0) or (k7_api_tls_cert_src | default('') | length > 0)
+
+    - name: Fail if --api-hostname is combined with operator certs
+      ansible.builtin.fail:
+        msg: "Error: --api-hostname cannot be combined with --api-tls-cert/--api-tls-key."
+      when:
+        - k7_api_hostname | default('') | length > 0
+        - k7_api_tls_cert_src | default('') | length > 0
+
+    - name: Compute k7-api TLS mode
+      ansible.builtin.set_fact:
+        k7_api_tls_enabled: "{{ not (k7_api_insecure_http | default(false) | bool) }}"
+        k7_api_tls_acme: "{{ (k7_api_hostname | default('') | length > 0) }}"
+        k7_api_tls_operator: "{{ (k7_api_tls_cert_src | default('') | length > 0) }}"
 
     - name: Show node configuration
       ansible.builtin.debug:
         msg: >-
           host={{ inventory_hostname }} role={{ k7_node_role }}
           backends={{ k7_backends_list }} first_master={{ k7_first_master }}
+          hubble={{ k7_hubble_enabled | default(false) | bool }}
 
     - name: Update apt cache and upgrade all packages
       ansible.builtin.apt:
@@ -272,6 +358,17 @@
         remote_src: true
       tags: ['cni']
 
+    - name: Check whether k3s is already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_bin_stat
+      tags: ['cni']
+
+    # First install only. On a re-run the running Cilium agent has
+    # /etc/cni/net.d bind-mounted; deleting the directory leaves its mount
+    # on a dead inode, every CNI-config write fails, the agent reports
+    # unhealthy until the liveness probe kills it 5 minutes later, and
+    # "Wait for Cilium to report ready" (also 5 minutes) races it and loses.
     - name: Wipe CNI conf dirs before first k3s start
       ansible.builtin.file:
         path: "{{ item }}"
@@ -279,6 +376,7 @@
       loop:
         - /etc/cni/net.d
         - /var/lib/rancher/k3s/agent/etc/cni/net.d
+      when: not k3s_bin_stat.stat.exists
       tags: ['cni']
 
     - name: Re-create /etc/cni/net.d directory
@@ -642,7 +740,7 @@
       when: k7_has_devmapper
       tags: ['kata', 'config', 'jailer']
 
-    # Spec 18g (kql-r3 dind IO wedge, CHALLENGES.md): kata's default
+    # The kql-r3 dind IO wedge (CHALLENGES.md): kata's default
     # virtiofsd runs with --thread-pool-size=1, so ALL virtio-fs IO of a
     # kata-qemu sandbox (container rootfs + every Longhorn PVC mount,
     # e.g. a dind /var/lib/docker) serializes through ONE thread. Under a
@@ -651,7 +749,7 @@
     # blocks behind it, the shim's agent health ping (CheckRequest) times
     # out, and the shim kills the (perfectly healthy) VM. A 16-thread pool
     # keeps agent-touched IO out of the write burst's convoy.
-    - name: Widen virtiofsd thread pool for kata-qemu (spec 18g wedge fix)
+    - name: Widen virtiofsd thread pool for kata-qemu (IO wedge fix)
       ansible.builtin.lineinfile:
         path: /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
         regexp: '^virtio_fs_extra_args\s*='
@@ -662,7 +760,7 @@
     # Core stamps io.katacontainers.config.hypervisor.default_memory on
     # kata sandboxes with a memory limit; kata rejects the whole pod
     # ("annotation ... is not enabled") unless the annotation is
-    # allowlisted here. Found during spec 18g: `k7 create --backend kql
+    # allowlisted here. Found in testing: `k7 create --backend kql
     # --memory 2Gi` could not create a pod at all.
     - name: Allow hypervisor memory annotation for kata-qemu
       ansible.builtin.lineinfile:
@@ -674,12 +772,73 @@
 
     # Same stamp/allowlist as kata-qemu above. Without this (and without
     # pod_annotations on runtimes.kata), `k7 create --backend kfd --memory`
-    # silently boots the default 2048 MiB VM — found in spec 18g, fixed 18h.
+    # silently boots the default 2048 MiB VM.
     - name: Allow hypervisor memory annotation for kata-fc
       ansible.builtin.lineinfile:
         path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
         regexp: '^enable_annotations\s*='
         line: 'enable_annotations = ["enable_iommu", "virtio_fs_extra_args", "kernel_params", "default_memory"]'
+      when: k7_has_devmapper
+      tags: ['kata', 'config']
+
+    # Kata ships with guest seccomp
+    # bypassed, so the sandbox container's RuntimeDefault never reaches
+    # guest runc. Turn the bypass off for every Kata guest (not
+    # --docker-only). Fail loud if the key is missing — do not append
+    # it outside [runtime].
+    - name: Assert disable_guest_seccomp exists in kata-qemu config
+      ansible.builtin.command:
+        cmd: grep -E '^#?\s*disable_guest_seccomp\s*=' /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+      register: qemu_guest_seccomp
+      changed_when: false
+      failed_when: false
+      when: k7_has_longhorn
+      tags: ['kata', 'config']
+
+    - name: Fail loud if kata-qemu config has no disable_guest_seccomp
+      ansible.builtin.fail:
+        msg: >-
+          configuration-qemu.toml has no disable_guest_seccomp key.
+          Refusing to leave Kata guest seccomp bypassed or to append the
+          key outside [runtime].
+      when:
+        - k7_has_longhorn
+        - qemu_guest_seccomp.rc != 0
+      tags: ['kata', 'config']
+
+    - name: Enforce guest seccomp in kata-qemu guests
+      ansible.builtin.lineinfile:
+        path: /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+        regexp: '^#?\s*disable_guest_seccomp\s*='
+        line: 'disable_guest_seccomp = false'
+      when: k7_has_longhorn
+      tags: ['kata', 'config']
+
+    - name: Assert disable_guest_seccomp exists in kata-fc config
+      ansible.builtin.command:
+        cmd: grep -E '^#?\s*disable_guest_seccomp\s*=' /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+      register: fc_guest_seccomp
+      changed_when: false
+      failed_when: false
+      when: k7_has_devmapper
+      tags: ['kata', 'config']
+
+    - name: Fail loud if kata-fc config has no disable_guest_seccomp
+      ansible.builtin.fail:
+        msg: >-
+          configuration-fc.toml has no disable_guest_seccomp key.
+          Refusing to leave Kata guest seccomp bypassed or to append the
+          key outside [runtime].
+      when:
+        - k7_has_devmapper
+        - fc_guest_seccomp.rc != 0
+      tags: ['kata', 'config']
+
+    - name: Enforce guest seccomp in kata-fc guests
+      ansible.builtin.lineinfile:
+        path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+        regexp: '^#?\s*disable_guest_seccomp\s*='
+        line: 'disable_guest_seccomp = false'
       when: k7_has_devmapper
       tags: ['kata', 'config']
 
@@ -691,7 +850,7 @@
       tags: ['kata', 'containerd']
 
     # ------------------------------------------------------------------
-    # Orphaned VMM reaper (spec 18f issue 1b, CHALLENGES.md #6).
+    # Orphaned VMM reaper (CHALLENGES.md #6).
     #
     # Kata 3.24.0 + jailer: `jailer --daemonize` double-forks, so the shim
     # records the (immediately-exiting) jailer PID and its SIGTERM fallback
@@ -710,7 +869,7 @@
         mode: '0755'
         content: |
           #!/bin/bash
-          # Reap orphaned kata VMM processes (spec 18f issue 1b).
+          # Reap orphaned kata VMM processes.
           set -u
           for pid in $(pgrep -x firecracker); do
             id=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | awk 'prev=="--id"{print; exit} {prev=$0}')
@@ -736,7 +895,7 @@
         mode: '0644'
         content: |
           [Unit]
-          Description=Reap orphaned kata VMM processes (k7 spec 18f issue 1b)
+          Description=Reap orphaned kata VMM processes
 
           [Service]
           Type=oneshot
@@ -1077,7 +1236,7 @@
       tags: ['lvm']
 
     # ------------------------------------------------------------------
-    # k7d backend (spec 9a M11): install the k7d daemon, containerd shim,
+    # k7d backend: install the k7d daemon, containerd shim,
     # and guest artifacts from the release tarball; provision the host
     # prerequisites (vhost-vsock, erofs tools, reflink-capable XFS for
     # writable volume images) and run k7d as a systemd service.
@@ -1322,6 +1481,24 @@
       changed_when: false
       tags: ['k7d']
 
+    - name: K7d — check for a docker payload in the release tarball
+      ansible.builtin.stat:
+        path: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/docker/bin/dockerd"
+      register: k7d_docker_payload
+      when: k7_has_k7d
+      tags: ['k7d']
+
+    - name: K7d — install docker payload to /usr/local/share/k7d/docker
+      ansible.builtin.copy:
+        src: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/docker/"
+        dest: /usr/local/share/k7d/docker/
+        mode: '0755'
+        remote_src: true
+      when:
+        - k7_has_k7d
+        - k7d_docker_payload.stat.exists
+      tags: ['k7d']
+
     - name: K7d — wait for the control socket /run/k7d/k7d.sock
       ansible.builtin.wait_for:
         path: /run/k7d/k7d.sock
@@ -1329,6 +1506,48 @@
         timeout: 30
       when: k7_has_k7d
       tags: ['k7d']
+
+    # k7d-fc: pinned upstream Firecracker + jailer (NOT Kata's
+    # /opt/kata/bin firecracker). Sha mismatch is fatal.
+    - name: K7d-fc — create /opt/k7d-fc and /etc/k7d
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/k7d-fc
+        - /etc/k7d
+      when: k7_has_k7d_fc
+      tags: ['k7d', 'k7d-fc']
+
+    - name: K7d-fc — stage install-firecracker.sh and pins
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: k7d-fc/install-firecracker.sh, dest: /opt/k7d-fc/install-firecracker.sh, mode: '0755' }
+        - { src: k7d-fc/pins.env, dest: /opt/k7d-fc/pins.env, mode: '0644' }
+      loop_control:
+        label: "{{ item.dest }}"
+      when: k7_has_k7d_fc
+      tags: ['k7d', 'k7d-fc']
+
+    - name: K7d-fc — install pinned Firecracker + jailer (sha verified)
+      ansible.builtin.command: /opt/k7d-fc/install-firecracker.sh
+      register: k7d_fc_install
+      changed_when: "'already' not in (k7d_fc_install.stdout | default(''))"
+      when: k7_has_k7d_fc
+      tags: ['k7d', 'k7d-fc']
+
+    - name: K7d-fc — write shim ConfigPath toml
+      ansible.builtin.copy:
+        dest: /etc/k7d/shim-k7-fc.toml
+        content: |
+          backend = "firecracker"
+        mode: '0644'
+      when: k7_has_k7d_fc
+      tags: ['k7d', 'k7d-fc']
 
     # ------------------------------------------------------------------
     # Containerd template — merged based on per-host backend set
@@ -1384,6 +1603,20 @@
             pod_annotations = ["k7d.katakate.org/*"]
             privileged_without_host_devices = true
             snapshotter   = "overlayfs"
+          {% endif %}
+
+          {% if k7_has_k7d_fc %}
+          # k7-fc: same shim binary, ConfigPath selects Firecracker.
+          # k3s 1.36 / containerd 2.3.3 does not stamp
+          # io.kubernetes.cri.runtime-handler (k7d CHALLENGES #228).
+          # Do NOT add BinaryName.
+          [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc]
+            runtime_type  = "io.containerd.k7.v1"
+            pod_annotations = ["k7d.katakate.org/*"]
+            privileged_without_host_devices = true
+            snapshotter   = "overlayfs"
+            [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc.options]
+              ConfigPath = "/etc/k7d/shim-k7-fc.toml"
           {% endif %}
       tags: ['kata', 'containerd', 'k7d']
 
@@ -1461,11 +1694,91 @@
       when: k7_cni_is_cilium
       tags: ['cilium']
 
-    - name: Check if Cilium is already installed in the cluster
-      ansible.builtin.command: k3s kubectl -n kube-system get daemonset cilium
-      register: cilium_installed_check
+    - name: Check if Hubble CLI is already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/hubble
+      register: hubble_cli_stat
+      when:
+        - k7_cni_is_cilium
+        - k7_hubble_enabled | default(false) | bool
+      tags: ['cilium', 'hubble']
+
+    - name: Download Hubble CLI tarball
+      ansible.builtin.get_url:
+        url: "https://github.com/cilium/hubble/releases/download/{{ hubble_cli_version }}/hubble-linux-{{ deb_arch }}.tar.gz"
+        dest: /tmp/hubble-cli.tar.gz
+        mode: '0644'
+        timeout: 60
+      register: hubble_cli_dl
+      retries: 5
+      delay: 10
+      until: hubble_cli_dl is success
+      when:
+        - k7_cni_is_cilium
+        - k7_hubble_enabled | default(false) | bool
+        - not hubble_cli_stat.stat.exists
+      tags: ['cilium', 'hubble']
+
+    - name: Extract Hubble CLI
+      ansible.builtin.unarchive:
+        src: /tmp/hubble-cli.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+        extra_opts: ['hubble']
+      when:
+        - k7_cni_is_cilium
+        - k7_hubble_enabled | default(false) | bool
+        - not hubble_cli_stat.stat.exists
+      tags: ['cilium', 'hubble']
+
+    - name: Ensure Hubble CLI is executable
+      ansible.builtin.file:
+        path: /usr/local/bin/hubble
+        mode: '0755'
+      when:
+        - k7_cni_is_cilium
+        - k7_hubble_enabled | default(false) | bool
+      tags: ['cilium', 'hubble']
+
+    # Present / absent / unknown. A busy apiserver is unknown
+    # (retry, then fail loud), never "not installed" — that used to start
+    # `cilium install` on a cluster that already had Cilium.
+    # Keep in sync with src/k7/deploy/k8s-object-presence.sh.
+    - name: Classify Cilium DaemonSet presence
+      ansible.builtin.shell: |
+        set -eu
+        retries=5
+        delay=5
+        attempt=1
+        while [ "$attempt" -le "$retries" ]; do
+          set +e
+          out=$(k3s kubectl -n kube-system get daemonset cilium 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo present
+            exit 0
+          fi
+          if printf '%s' "$out" | grep -qiE 'notfound|not found'; then
+            echo absent
+            exit 0
+          fi
+          echo "kubectl error (attempt ${attempt}/${retries}): $out" >&2
+          if [ "$attempt" -eq "$retries" ]; then
+            echo unknown >&2
+            exit 2
+          fi
+          sleep "$delay"
+          attempt=$((attempt + 1))
+        done
+        exit 2
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: cilium_presence
+      failed_when: cilium_presence.rc == 2
       changed_when: false
-      failed_when: false
       run_once: true
       delegate_to: "{{ k7_first_master }}"
       when: k7_cni_is_cilium
@@ -1489,7 +1802,7 @@
     #   DNS TTLs of 30-60s, but clients like dockerd cache the resolved IP
     #   and keep dialing it for minutes across retries. With minTtl=0 the
     #   FQDN→identity mapping expires with the upstream TTL and every
-    #   later SYN is policy-dropped (spec 18f issue 3). Keep learned IPs
+    #   later SYN is policy-dropped. Keep learned IPs
     #   allowed for 1h after the lookup.
     - name: Install Cilium (kube-proxy replacement, FQDN support)  # noqa: no-changed-when
       ansible.builtin.shell: |
@@ -1504,23 +1817,150 @@
           --set operator.replicas=1 \
           --set MTU=1450 \
           --set socketLB.hostNamespaceOnly=true \
-          --set dnsProxy.minTtl=3600
+          --set dnsProxy.minTtl=3600{% if k7_hubble_enabled | default(false) | bool %} \
+          --set hubble.enabled=true \
+          --set hubble.relay.enabled=true \
+          --set hubble.ui.enabled=false \
+          --set hubble.eventBufferCapacity={{ hubble_event_buffer_capacity }}{% endif %}
       args:
         executable: /bin/bash
       run_once: true
       delegate_to: "{{ k7_first_master }}"
       when:
         - k7_cni_is_cilium
-        - cilium_installed_check.rc != 0
+        - cilium_presence.stdout == "absent"
       tags: ['cilium']
 
-    - name: Wait for Cilium to report ready  # noqa: no-changed-when
+    # cilium install is skipped when the DaemonSet already exists, so
+    # --set hubble.* on that command is a no-op on every re-run. Enable
+    # Hubble on existing clusters with a separate, idempotent task.
+    # `cilium hubble enable` Helm-upgrades the Cilium release and
+    # restarts the agent DaemonSet — do not run as a side effect of an
+    # unrelated `k7 install` (gated on --hubble).
+    # Same three-state split as the Cilium DaemonSet check. A blipped
+    # `kubectl get` must not fall through to `cilium hubble enable`
+    # (Helm-upgrade + agent restart).
+    - name: Classify Hubble relay presence
+      ansible.builtin.shell: |
+        set -eu
+        retries=5
+        delay=5
+        attempt=1
+        while [ "$attempt" -le "$retries" ]; do
+          set +e
+          out=$(k3s kubectl -n kube-system get deployment hubble-relay 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo present
+            exit 0
+          fi
+          if printf '%s' "$out" | grep -qiE 'notfound|not found'; then
+            echo absent
+            exit 0
+          fi
+          echo "kubectl error (attempt ${attempt}/${retries}): $out" >&2
+          if [ "$attempt" -eq "$retries" ]; then
+            echo unknown >&2
+            exit 2
+          fi
+          sleep "$delay"
+          attempt=$((attempt + 1))
+        done
+        exit 2
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: hubble_presence
+      failed_when: hubble_presence.rc == 2
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when:
+        - k7_cni_is_cilium
+        - k7_hubble_enabled | default(false) | bool
+      tags: ['cilium', 'hubble']
+
+    - name: Enable Hubble
+      ansible.builtin.shell: |
+        set -eu
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        # cilium-cli v0.19.2 only accepts --relay/--ui here (no --helm-set).
+        # Relay is on by default; do not pass --ui (no auth, public node IP).
+        /usr/local/bin/cilium hubble enable
+      args:
+        executable: /bin/bash
+      register: hubble_enable
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when:
+        - k7_cni_is_cilium
+        - k7_hubble_enabled | default(false) | bool
+        - hubble_presence.stdout == "absent"
+      tags: ['cilium', 'hubble']
+
+    - name: Wait for Hubble relay to be Ready  # noqa: no-changed-when
+      ansible.builtin.command: k3s kubectl -n kube-system rollout status deployment/hubble-relay --timeout=300s
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when:
+        - k7_cni_is_cilium
+        - k7_hubble_enabled | default(false) | bool
+      tags: ['cilium', 'hubble']
+
+    # First install: the DaemonSet just appeared. Full --wait is the right gate.
+    - name: Wait for Cilium to report ready (first install)  # noqa: no-changed-when
       ansible.builtin.command: /usr/local/bin/cilium status --wait --wait-duration 5m
       environment:
         KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       run_once: true
       delegate_to: "{{ k7_first_master }}"
-      when: k7_cni_is_cilium
+      when:
+        - k7_cni_is_cilium
+        - cilium_presence.stdout == "absent"
+      tags: ['cilium']
+
+    # Reinstall: do not fail the play because `cilium status` printed
+    # warnings while the DaemonSet is Ready (a measured flake).
+    # Fail loud only if the agent is actually not Ready.
+    - name: Confirm Cilium agent is Ready (reinstall)  # noqa: command-instead-of-shell no-changed-when
+      ansible.builtin.shell: |
+        set -eu
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        ds_ready() {
+          ready=$(k3s kubectl -n kube-system get ds cilium -o jsonpath='{.status.numberReady}')
+          desired=$(k3s kubectl -n kube-system get ds cilium -o jsonpath='{.status.desiredNumberScheduled}')
+          [ -n "$ready" ] && [ -n "$desired" ] && [ "$desired" != "0" ] && [ "$ready" = "$desired" ]
+        }
+        if ds_ready; then
+          echo "Cilium DaemonSet Ready; cilium status warnings are not a failure"
+          /usr/local/bin/cilium status || true
+          exit 0
+        fi
+        i=1
+        while [ "$i" -le 3 ]; do
+          /usr/local/bin/cilium status --wait --wait-duration 1m || true
+          if ds_ready; then
+            echo "Cilium DaemonSet Ready after wait ${i}"
+            exit 0
+          fi
+          i=$((i + 1))
+        done
+        echo "Cilium agent not Ready after 3m" >&2
+        /usr/local/bin/cilium status || true
+        k3s kubectl -n kube-system get ds cilium || true
+        exit 1
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when:
+        - k7_cni_is_cilium
+        - cilium_presence.stdout == "present"
       tags: ['cilium']
 
     - name: Wait for cluster nodes to be Ready (run on first master)
@@ -1606,8 +2046,33 @@
       changed_when: "'created' in apply_k7.stdout"
       run_once: true
       delegate_to: "{{ k7_first_master }}"
-      when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['k7d']) | length > 0
+      when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['k7d', 'k7d-fc']) | length > 0
       tags: ['k7d', 'k3s']
+
+    - name: Create RuntimeClass 'k7-fc' (cluster-wide)
+      ansible.builtin.shell: |
+        cat <<'EOF' | k3s kubectl apply -f -
+        apiVersion: node.k8s.io/v1
+        kind: RuntimeClass
+        metadata:
+          name: k7-fc
+        handler: k7-fc
+        overhead:
+          podFixed:
+            cpu: 50m
+            memory: 32Mi
+        EOF
+      args:
+        executable: /bin/bash
+      register: apply_k7_fc
+      retries: 12
+      delay: 5
+      until: "'created' in apply_k7_fc.stdout or 'unchanged' in apply_k7_fc.stdout"
+      changed_when: "'created' in apply_k7_fc.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['k7d-fc']) | length > 0
+      tags: ['k7d', 'k7d-fc', 'k3s']
 
     # ------------------------------------------------------------------
     # Per-node backend labels — each node labels itself via first master
@@ -1620,7 +2085,7 @@
       until: node_check.rc == 0
       changed_when: false
       delegate_to: "{{ k7_first_master }}"
-      tags: ['labels']
+      tags: ['labels', 'k7d', 'k7d-fc']
 
     - name: Remove deprecated backend labels
       ansible.builtin.command: >
@@ -1640,7 +2105,16 @@
       loop: "{{ k7_backends_list }}"
       delegate_to: "{{ k7_first_master }}"
       changed_when: true
-      tags: ['labels']
+      tags: ['labels', 'k7d', 'k7d-fc']
+
+    - name: Label native k7d selector when only k7d-fc was requested
+      ansible.builtin.command: >
+        k3s kubectl label node {{ k7_k8s_node_name }}
+        k7.katakate.org/backend-k7d=true --overwrite
+      when: k7_has_k7d_fc and ('k7d' not in k7_backends_list)
+      delegate_to: "{{ k7_first_master }}"
+      changed_when: true
+      tags: ['labels', 'k7d', 'k7d-fc']
 
     - name: Label first master so the k7-api pod has a stable home
       ansible.builtin.command: >
@@ -1665,6 +2139,14 @@
         content: "{{ k7_backends_list[0] }}"
         mode: '0644'
       tags: ['k7', 'config']
+
+    - name: Record installed k7d version for --docker capability checks
+      ansible.builtin.copy:
+        dest: /etc/k7/k7d_version
+        content: "{{ k7d_version }}\n"
+        mode: '0644'
+      when: k7_has_k7d
+      tags: ['k7', 'config', 'k7d']
 
     - name: Show K3s node status
       ansible.builtin.command: k3s kubectl get nodes -o wide
@@ -2011,6 +2493,114 @@
       delegate_to: "{{ k7_first_master }}"
       tags: ['k7', 'api']
 
+    # LVM CSI for kfd --docker graph volumes (kata-vg/thin-pool).
+    - name: Set fact for any kfd node in cluster
+      ansible.builtin.set_fact:
+        cluster_has_devmapper: >-
+          {{
+            groups['k7_cluster']
+            | map('extract', hostvars, 'k7_backends_list')
+            | flatten | unique
+            | intersect(['kata-firecracker-devmapper'])
+            | length > 0
+          }}
+      tags: ['docker-lvm']
+
+    - name: Install helm (pinned) for OpenEBS LVM LocalPV
+      ansible.builtin.shell: |
+        set -eu
+        if command -v helm >/dev/null 2>&1 && helm version --short | grep -q '{{ helm_version }}'; then
+          echo "helm {{ helm_version }} already installed"
+          exit 0
+        fi
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        curl -fsSL -o "$tmp/helm.tgz" "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+        echo "{{ helm_sha256 }}  $tmp/helm.tgz" | sha256sum -c -
+        tar -xzf "$tmp/helm.tgz" -C "$tmp"
+        install -m 0755 "$tmp/linux-amd64/helm" /usr/local/bin/helm
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_devmapper | default(false) | bool
+      tags: ['docker-lvm']
+
+    - name: Install OpenEBS LVM LocalPV chart
+      ansible.builtin.shell: |
+        set -eu
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        helm repo add openebs-lvm https://openebs.github.io/lvm-localpv
+        helm repo update openebs-lvm
+        cat >/tmp/k7-docker-lvm-values.yaml <<EOF
+        lvmPlugin:
+          image:
+            registry: docker.io
+            repository: openebs/lvm-driver
+            tag: "{{ openebs_lvm_localpv_version }}"
+        lvmNode:
+          kubeletDir: "/var/lib/kubelet/"
+          nodeSelector:
+            k7.katakate.org/backend-kata-firecracker-devmapper: "true"
+        # Longhorn already installed snapshot CRDs + snapshot-controller.
+        # OpenEBS GetCapacity reports VG VFree (leftover after thin-pool),
+        # not thin-pool free — CSIStorageCapacity would refuse the 20Gi graph.
+        crds:
+          csi:
+            volumeSnapshots:
+              enabled: false
+        lvmController:
+          snapshotController:
+            enabled: false
+        storageCapacity: false
+        EOF
+        helm upgrade --install openebs-lvm openebs-lvm/lvm-localpv \
+          --version {{ openebs_lvm_localpv_version }} \
+          --namespace openebs --create-namespace \
+          --values /tmp/k7-docker-lvm-values.yaml
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_devmapper | default(false) | bool
+      tags: ['docker-lvm']
+
+    - name: Wait for OpenEBS LVM pods
+      ansible.builtin.command: k3s kubectl -n openebs wait --for=condition=Ready pod --all --timeout=180s
+      retries: 5
+      delay: 10
+      register: lvm_pods
+      until: lvm_pods.rc == 0
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_devmapper | default(false) | bool
+      tags: ['docker-lvm']
+
+    - name: Apply StorageClass k7-docker-lvm
+      ansible.builtin.shell: |
+        set -eu
+        cat <<'EOF' | k3s kubectl apply -f -
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata:
+          name: k7-docker-lvm
+        provisioner: local.csi.openebs.io
+        reclaimPolicy: Delete
+        volumeBindingMode: WaitForFirstConsumer
+        allowVolumeExpansion: false
+        parameters:
+          storage: "lvm"
+          volgroup: "kata-vg"
+          thinProvision: "yes"
+        EOF
+      args:
+        executable: /bin/bash
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      when: cluster_has_devmapper | default(false) | bool
+      tags: ['docker-lvm']
+
     - name: Verify k7 repo root contains the API Dockerfile
       ansible.builtin.stat:
         path: "{{ k7_repo_root_resolved }}/src/k7/api/Dockerfile.api"
@@ -2086,7 +2676,7 @@
       when: k7_api_enabled | default(true) | bool
       tags: ['k7', 'api']
 
-    # Spec 18g: shared token authenticating k7-api → k7-agent (and root CLI →
+    # Shared token authenticating k7-api → k7-agent (and root CLI →
     # agent) traffic. Generated once on the first master, distributed to
     # /etc/k7/agent_token (0600) on every node; both the API deployment and
     # the agent DaemonSet read it through the /etc/k7 hostPath mount.
@@ -2135,8 +2725,410 @@
       delegate_to: "{{ k7_first_master }}"
       tags: ['k7', 'api']
 
+    # Older installs shipped this CiliumNetworkPolicy at the top
+    # level; copy does not prune, so remove the stale copy explicitly.
+    - name: Remove legacy top-level agent-networkpolicy.yaml (moved to cilium/)
+      ansible.builtin.file:
+        path: /etc/k7/manifests/k7-api/agent-networkpolicy.yaml
+        state: absent
+      when: k7_api_enabled | default(true) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    # The k7-api ingress allowlist is rendered from the operator's
+    # --api-allow-cidr values, so it cannot ship as a static manifest. Rendered
+    # here with `copy: content:` rather than `template:` because the playbook
+    # itself runs from a tempfile on the controller, which makes a
+    # controller-side template `src` unreliable.
+    #
+    # The `fromEntities` block is mandatory, not decorative: an `ingress:`
+    # section flips the k7-api endpoint to default-deny, and `host` is what
+    # carries the kubelet liveness/readiness probes. Drop it and the API pod
+    # crash-loops. Never widen this to anything that could touch port 22 or
+    # the k3s API port — this policy selects one pod endpoint, not the host.
+    #
+    # No `fromEndpoints` rule is needed for k7-snapshot-gc: it runs
+    # `python -m k7.api.snapshot_gc`, which drives K7Core against the
+    # Kubernetes API in-process (re-verified), never HTTP to
+    # k7-api. Should it ever become an HTTP client, it needs one.
+    - name: Render the k7-api ingress allowlist policy
+      ansible.builtin.copy:
+        dest: /etc/k7/manifests/k7-api/cilium/k7-api-ingress.yaml
+        mode: '0644'
+        content: |
+          # Rendered by `k7 install --api-allow-cidr`. Edits are overwritten.
+          apiVersion: cilium.io/v2
+          kind: CiliumNetworkPolicy
+          metadata:
+            name: k7-api-ingress
+            namespace: kube-system
+          spec:
+            description: "Restrict k7-api ingress to operator-supplied source CIDRs"
+            endpointSelector:
+              matchLabels:
+                app: k7-api
+            ingress:
+              - fromEntities: ["host", "remote-node", "health", "kube-apiserver"]
+              - fromCIDR: {{ k7_api_allow_cidrs_list | to_json }}
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_allow_cidrs_list | length > 0
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api', 'cilium']
+
+    - name: Drop the rendered k7-api ingress policy when no allowlist is configured
+      ansible.builtin.file:
+        path: /etc/k7/manifests/k7-api/cilium/k7-api-ingress.yaml
+        state: absent
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_allow_cidrs_list | length == 0
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api', 'cilium']
+
+    # first-master InternalIP is a SAN and the host in
+    # /etc/k7/api_endpoint. Fail loud if the lookup is empty — a
+    # playbook-minted cert without the node IP is an outage.
+    - name: Resolve first-master IPv4 for TLS SANs and api_endpoint
+      ansible.builtin.shell: >
+        k3s kubectl get nodes -l k7.katakate.org/first-master=true -o json |
+        python3 -c "import sys,json;
+        items=json.load(sys.stdin)['items'];
+        items or sys.exit('no first-master node');
+        addrs=items[0]['status']['addresses'];
+        print(next(a['address'] for a in addrs if a['type']=='InternalIP' and ':' not in a['address']))"
+      when: k7_api_enabled | default(true) | bool
+      register: k7_first_master_ip_cmd
+      changed_when: false
+      failed_when: k7_first_master_ip_cmd.rc != 0 or k7_first_master_ip_cmd.stdout | trim | length == 0
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Record first-master IPv4
+      ansible.builtin.set_fact:
+        k7_first_master_ip: "{{ hostvars[k7_first_master]['k7_first_master_ip_cmd']['stdout'] | trim }}"
+      when: k7_api_enabled | default(true) | bool
+      tags: ['k7', 'api']
+
+    - name: Read first-master hostname for the server-cert SAN
+      ansible.builtin.command: hostname -s
+      register: k7_first_master_hostname_cmd
+      changed_when: false
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+        - not (k7_api_tls_acme | bool)
+        - not (k7_api_tls_operator | bool)
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Fail if --api-hostname does not resolve to the first master
+      ansible.builtin.shell: |
+        set -euo pipefail
+        resolved="$(getent ahostsv4 "{{ k7_api_hostname }}" | awk '{print $1; exit}')"
+        if [ -z "${resolved}" ]; then
+          echo "Error: --api-hostname {{ k7_api_hostname }} has no A record" >&2
+          exit 1
+        fi
+        if [ "${resolved}" != "{{ k7_first_master_ip }}" ]; then
+          echo "Error: --api-hostname {{ k7_api_hostname }} resolves to ${resolved}, not first-master {{ k7_first_master_ip }}" >&2
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_acme | bool
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Create /etc/k7/tls on the first master
+      ansible.builtin.file:
+        path: /etc/k7/tls
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Create /etc/k7/caddy on the first master (mode 0700)
+      ansible.builtin.file:
+        path: /etc/k7/caddy
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    # Track A: playbook cluster CA. Reuse the CA; re-issue the server
+    # cert only when it is missing or has fewer than 30 days left.
+    # ca.key is 0600 root and is never copied into a Secret or volume.
+    - name: Issue or reuse the playbook cluster CA and server cert (track A)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        TLS_DIR=/etc/k7/tls
+        IP="{{ k7_first_master_ip }}"
+        HOST="{{ hostvars[k7_first_master]['k7_first_master_hostname_cmd']['stdout'] | trim }}"
+        if [ -z "${IP}" ] || [ -z "${HOST}" ]; then
+          echo "Error: first-master IP or hostname is empty; refusing to mint a server cert" >&2
+          exit 1
+        fi
+        if [ ! -f "${TLS_DIR}/ca.crt" ] || [ ! -f "${TLS_DIR}/ca.key" ]; then
+          openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+            -keyout "${TLS_DIR}/ca.key" -out "${TLS_DIR}/ca.crt" \
+            -subj "/CN=k7-cluster-ca"
+          chmod 0600 "${TLS_DIR}/ca.key"
+          chmod 0644 "${TLS_DIR}/ca.crt"
+        fi
+        need_issue=1
+        if [ -f "${TLS_DIR}/server.crt" ] && [ -f "${TLS_DIR}/server.key" ]; then
+          if openssl x509 -checkend $((30*24*3600)) -noout -in "${TLS_DIR}/server.crt"; then
+            need_issue=0
+          fi
+        fi
+        if [ "${need_issue}" -eq 1 ]; then
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout "${TLS_DIR}/server.key" -out /tmp/k7-server.csr \
+            -subj "/CN=k7-api"
+          printf 'subjectAltName=IP:%s,IP:127.0.0.1,DNS:localhost,DNS:%s\nextendedKeyUsage=serverAuth\n' \
+            "${IP}" "${HOST}" > /tmp/k7-san.ext
+          openssl x509 -req -in /tmp/k7-server.csr \
+            -CA "${TLS_DIR}/ca.crt" -CAkey "${TLS_DIR}/ca.key" \
+            -CAcreateserial -out "${TLS_DIR}/server.crt" -days 365 -sha256 \
+            -extfile /tmp/k7-san.ext
+          chmod 0600 "${TLS_DIR}/server.key"
+          chmod 0644 "${TLS_DIR}/server.crt"
+          rm -f /tmp/k7-server.csr /tmp/k7-san.ext
+        fi
+      args:
+        executable: /bin/bash
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+        - not (k7_api_tls_acme | bool)
+        - not (k7_api_tls_operator | bool)
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Copy operator-supplied server certificate (track C)
+      ansible.builtin.copy:
+        src: "{{ k7_api_tls_cert_src }}"
+        dest: /etc/k7/tls/server.crt
+        owner: root
+        group: root
+        mode: '0644'
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_operator | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Copy operator-supplied server key (track C)
+      ansible.builtin.copy:
+        src: "{{ k7_api_tls_key_src }}"
+        dest: /etc/k7/tls/server.key
+        owner: root
+        group: root
+        mode: '0600'
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_operator | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Warn if the operator cert SAN list omits the first-master IP
+      ansible.builtin.shell: |
+        set -euo pipefail
+        text="$(openssl x509 -in /etc/k7/tls/server.crt -noout -text)"
+        if ! echo "${text}" | grep -q "{{ k7_first_master_ip }}"; then
+          echo "Warning: operator cert SAN list does not include first-master IP {{ k7_first_master_ip }}"
+        fi
+      args:
+        executable: /bin/bash
+      register: k7_operator_san_check
+      changed_when: false
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_operator | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Show operator-cert SAN warning
+      ansible.builtin.debug:
+        msg: "{{ k7_operator_san_check.stdout }}"
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_operator | bool
+        - k7_operator_san_check.stdout is defined
+        - k7_operator_san_check.stdout | length > 0
+      run_once: true
+      tags: ['k7', 'api']
+
+    - name: Create or update the k7-api TLS Secret (tracks A and C)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        k3s kubectl -n kube-system create secret tls k7-api-tls \
+          --cert=/etc/k7/tls/server.crt --key=/etc/k7/tls/server.key \
+          --dry-run=client -o yaml | k3s kubectl apply -f -
+      args:
+        executable: /bin/bash
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+        - not (k7_api_tls_acme | bool)
+      register: k7_api_tls_secret
+      changed_when: "'configured' in k7_api_tls_secret.stdout or 'created' in k7_api_tls_secret.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Pull the pinned Caddy image
+      ansible.builtin.command: docker pull {{ k7_caddy_image }}
+      register: k7_caddy_pull
+      changed_when: "'Downloaded newer image' in k7_caddy_pull.stdout or 'Pull complete' in k7_caddy_pull.stdout"
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    # docker save of a digest-only name produces a tar ctr imports as
+    # nothing. Tag a repository:tag first (measured).
+    - name: Tag the pulled Caddy image as caddy:2.10.2 for export
+      ansible.builtin.command: docker tag {{ k7_caddy_image }} caddy:2.10.2
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Export the Caddy image to a tarball
+      ansible.builtin.command: docker save caddy:2.10.2 -o /tmp/k7-caddy.tar
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Import the Caddy image into k3s containerd on the first master
+      ansible.builtin.command: k3s ctr images import /tmp/k7-caddy.tar
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Tag the imported Caddy image to the digest pin the pod uses
+      ansible.builtin.command: >
+        k3s ctr images tag docker.io/library/caddy:2.10.2 {{ item }}
+      loop:
+        - "{{ k7_caddy_image }}"
+        - "docker.io/library/{{ k7_caddy_image }}"
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Clean up the Caddy image tarball
+      ansible.builtin.file:
+        path: /tmp/k7-caddy.tar
+        state: absent
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Overlay the TLS Deployment, Service, and Caddyfile
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ k7_repo_root_resolved }}/src/k7/deploy/k7_api_tls.py"
+          - write
+          - --manifest-dir
+          - /etc/k7/manifests/k7-api
+          - --caddy-dir
+          - /etc/k7/caddy
+          - --mode
+          - "{{ 'acme' if (k7_api_tls_acme | bool) else 'files' }}"
+          - --hostname
+          - "{{ k7_api_hostname | default('') }}"
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+        - not (k7_api_acme_staging | default(false) | bool)
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Overlay the TLS manifests with Let's Encrypt staging
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ k7_repo_root_resolved }}/src/k7/deploy/k7_api_tls.py"
+          - write
+          - --manifest-dir
+          - /etc/k7/manifests/k7-api
+          - --caddy-dir
+          - /etc/k7/caddy
+          - --mode
+          - acme
+          - --hostname
+          - "{{ k7_api_hostname }}"
+          - --acme-staging
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_api_tls_enabled | bool
+        - k7_api_acme_staging | default(false) | bool
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    - name: Delete a leftover k7-api TLS Secret on --api-insecure-http
+      ansible.builtin.command: k3s kubectl -n kube-system delete secret k7-api-tls --ignore-not-found
+      when:
+        - k7_api_enabled | default(true) | bool
+        - not (k7_api_tls_enabled | bool)
+      register: k7_api_tls_secret_delete
+      changed_when: "'deleted' in k7_api_tls_secret_delete.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
+    # Non-recursive on purpose: manifests/k7-api/cilium/ holds Cilium CRs
+    # that would fail `kubectl apply` on a Flannel cluster (no cilium.io
+    # CRDs), aborting the whole directory apply. They are applied below,
+    # gated on the CNI.
     - name: Apply K7 API manifests
-      ansible.builtin.command: k3s kubectl apply -f /etc/k7/manifests/k7-api/
+      ansible.builtin.command: k3s kubectl apply --recursive=false -f /etc/k7/manifests/k7-api/
       when: k7_api_enabled | default(true) | bool
       register: api_apply
       changed_when: "'created' in api_apply.stdout or 'configured' in api_apply.stdout"
@@ -2144,8 +3136,55 @@
       delegate_to: "{{ k7_first_master }}"
       tags: ['k7', 'api']
 
+    - name: Apply Cilium-only K7 manifests
+      ansible.builtin.command: k3s kubectl apply -f /etc/k7/manifests/k7-api/cilium/
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_cni_is_cilium
+      register: api_cilium_apply
+      changed_when: "'created' in api_cilium_apply.stdout or 'configured' in api_cilium_apply.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api', 'cilium']
+
+    # Reversal path: re-running `k7 install` without --api-allow-cidr removes
+    # the policy, so a wrong CIDR is undone by a reinstall as well as by the
+    # documented `kubectl delete ciliumnetworkpolicy k7-api-ingress`.
+    - name: Delete a stale k7-api ingress policy when no allowlist is configured
+      ansible.builtin.command: >
+        k3s kubectl -n kube-system delete ciliumnetworkpolicy k7-api-ingress --ignore-not-found
+      when:
+        - k7_api_enabled | default(true) | bool
+        - k7_cni_is_cilium
+        - k7_api_allow_cidrs_list | length == 0
+      register: api_cnp_delete
+      changed_when: "'deleted' in api_cnp_delete.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api', 'cilium']
+
+    # externalTrafficPolicy: Local preserves the external client's source IP,
+    # without which the CIDR allowlist above would see a node IP for every
+    # caller. Only flipped when an allowlist is configured; patching back to
+    # Cluster otherwise is a no-op on a default install and reverts a
+    # previously-hardened one. Consequence with Local: the NodePort answers
+    # only on the node running the k7-api pod (pinned to the first master),
+    # which is exactly what /etc/k7/api_endpoint points at.
+    - name: Set k7-api externalTrafficPolicy to match the allowlist
+      ansible.builtin.command: >
+        k3s kubectl -n kube-system patch svc k7-api -p
+        '{"spec":{"externalTrafficPolicy":"{{ 'Local' if k7_api_allow_cidrs_list | length > 0 else 'Cluster' }}"}}'
+      when: k7_api_enabled | default(true) | bool
+      register: api_etp_patch
+      changed_when: "'no change' not in api_etp_patch.stdout"
+      run_once: true
+      delegate_to: "{{ k7_first_master }}"
+      tags: ['k7', 'api']
+
     - name: Wait for K7 API deployment to be ready
-      ansible.builtin.command: k3s kubectl rollout status deployment/k7-api -n kube-system --timeout=120s
+      ansible.builtin.command: >
+        k3s kubectl rollout status deployment/k7-api -n kube-system
+        --timeout={{ '300s' if (k7_api_tls_acme | default(false) | bool) else '180s' }}
       when: k7_api_enabled | default(true) | bool
       register: api_rollout
       retries: 3
@@ -2156,7 +3195,7 @@
       delegate_to: "{{ k7_first_master }}"
       tags: ['k7', 'api']
 
-    - name: Wait for k7-agent DaemonSet rollout (spec 18g)
+    - name: Wait for k7-agent DaemonSet rollout
       ansible.builtin.command: k3s kubectl rollout status daemonset/k7-agent -n kube-system --timeout=180s
       when: k7_api_enabled | default(true) | bool
       register: agent_rollout
@@ -2179,23 +3218,17 @@
       delegate_to: "{{ k7_first_master }}"
       tags: ['k7', 'api']
 
-    - name: Get node IPv4 address for API endpoint
-      ansible.builtin.shell: >
-        k3s kubectl get nodes -o json |
-        python3 -c "import sys,json;
-        addrs=json.load(sys.stdin)['items'][0]['status']['addresses'];
-        print(next(a['address'] for a in addrs if a['type']=='InternalIP' and ':' not in a['address']))"
+    - name: Compute API endpoint host and scheme
+      ansible.builtin.set_fact:
+        k7_api_endpoint_scheme: "{{ 'http' if (k7_api_insecure_http | default(false) | bool) else 'https' }}"
+        k7_api_endpoint_host: "{{ k7_api_hostname if (k7_api_hostname | default('') | length > 0) else k7_first_master_ip }}"
       when: k7_api_enabled | default(true) | bool
-      register: node_ip
-      changed_when: false
-      run_once: true
-      delegate_to: "{{ k7_first_master }}"
       tags: ['k7', 'api']
 
     - name: Store API endpoint in /etc/k7/api_endpoint on every host
       ansible.builtin.copy:
         dest: /etc/k7/api_endpoint
-        content: "http://{{ hostvars[k7_first_master]['node_ip']['stdout'] }}:{{ hostvars[k7_first_master]['api_nodeport']['stdout'] }}"
+        content: "{{ k7_api_endpoint_scheme }}://{{ k7_api_endpoint_host }}:{{ hostvars[k7_first_master]['api_nodeport']['stdout'] }}"
         mode: '0644'
       when: k7_api_enabled | default(true) | bool
       tags: ['k7', 'api']

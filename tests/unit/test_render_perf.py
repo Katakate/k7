@@ -206,3 +206,24 @@ def test_render_known_byte_stable_snapshot(tmp_path: Path, render):
         """
     )
     assert out == expected, f"--- expected ---\n{expected}\n--- got ---\n{out}"
+
+
+def test_render_k7d_fc_fork_rows(tmp_path: Path, render):
+    """k7d-fc column and fork ops appear only when the CSV has them."""
+    rows = [
+        ("k7d", "run_io", 1, 1.2),
+        ("k7d", "run_io", 2, 1.3),
+        ("k7d", "fork_to_ready", 1, 2.4),
+        ("k7d-fc", "run_io", 1, 1.4),
+        ("k7d-fc", "run_io", 2, 1.5),
+        ("k7d-fc", "fork_to_ready", 1, 2.6),
+    ]
+    csv = _write_csv(tmp_path, rows)
+    out = render(csv, title="k7d-fc", hardware_note="hw")
+    assert "| k7d |" in out or "| k7d | k7d-fc |" in out
+    assert "k7d-fc" in out
+    assert "fork → Ready + overlay2" in out
+    assert "fork warm engine" not in out  # not in this CSV
+    io_row = next(line for line in out.splitlines() if line.startswith("| run io"))
+    assert "1.25 s" in io_row
+    assert "1.45 s" in io_row

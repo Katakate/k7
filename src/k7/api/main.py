@@ -202,6 +202,9 @@ async def create_sandbox(config: dict, key_data: dict = Depends(verify_api_key))
                 "namespace": sandbox_config.namespace,
                 "image": sandbox_config.image,
             }
+            # NodePort URLs for --expose-port, when there are any.
+            if result.data and result.data.get("endpoints"):
+                resource["endpoints"] = result.data["endpoints"]
             location = f"/api/v1/sandboxes/{sandbox_config.name}?namespace={sandbox_config.namespace}"
             return success_response(resource, status_code=status.HTTP_201_CREATED, headers={"Location": location})
         else:
@@ -340,7 +343,7 @@ async def get_sandbox_logs(
     since: int = 0,
     key_data: dict = Depends(verify_api_key),
 ):
-    """Read pod logs (snapshot; no streaming yet — see Spec 10g risks)."""
+    """Read pod logs (snapshot; no streaming yet)."""
     authorize_namespace(key_data, namespace)
     core = K7Core()
     result = await core.get_logs(
@@ -392,11 +395,16 @@ async def install_node(install_data: dict):
         raise HTTPException(status_code=400, detail=result.error)
 
 
-@app.get("/api/v1/nodes/storage", dependencies=[Depends(verify_api_key)])
-async def get_nodes_storage():
+@app.get("/api/v1/nodes/storage")
+async def get_nodes_storage(key_data: dict = Depends(verify_api_key)):
     """Per-node storage-pool utilization (kfd thin-pool + k7d disks pool),
-    aggregated from the k7-agent DaemonSet (spec 18g). A node whose agent
-    is unreachable gets an ``{"error": ...}`` entry — never omitted."""
+    aggregated from the k7-agent DaemonSet. A node whose agent
+    is unreachable gets an ``{"error": ...}`` entry — never omitted.
+
+    Cluster-scoped (all-namespaces): a namespace-scoped key is 403.
+    Fail loud — do not silently narrow the per-node map.
+    """
+    authorize_namespace(key_data, None, all_namespaces=True)
     core = K7Core()
     return success_response(await core.nodes_storage())
 
@@ -411,7 +419,7 @@ async def get_sandbox_metrics(namespace: str | None = None, key_data: dict = Dep
 
 
 # ---------------------------------------------------------------------------
-# Spec 10e: VolumeSnapshot lifecycle endpoints.
+# VolumeSnapshot lifecycle endpoints.
 # ---------------------------------------------------------------------------
 
 
@@ -497,7 +505,7 @@ async def delete_snapshot(name: str, namespace: str = "default", key_data: dict 
 
 @app.post("/api/v1/snapshots/{name}/restore")
 async def restore_snapshot(name: str, body: dict, key_data: dict = Depends(verify_api_key)):
-    """Boot a brand-new sandbox from a standalone VolumeSnapshot (Spec 10f).
+    """Boot a brand-new sandbox from a standalone VolumeSnapshot.
 
     Body keys:
       ``new_sandbox_name`` (required),

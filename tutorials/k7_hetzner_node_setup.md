@@ -80,9 +80,9 @@ sudo apt update
 sudo apt install k7
 
 # dual-NVMe box: let the playbook auto-detect the raw spare disk.
-# PPA k7 0.2.1 still defaults k7d to 0.1.0 — pin the public v0.2.1 release.
+# PPA k7 0.2.1 still defaults k7d to 0.1.0 — this tree pins k7d 0.6.0.
 # Run from a checkout of this repo (or Katakate/k7) so k7-api:local can build.
-sudo k7 install --backend kfd,kql,k7d --k7d-version 0.2.1
+sudo k7 install --backend kfd,kql,k7d
 ```
 
 `k7 install` provisions the LVM thin-pool on that disk for the `kfd` backend.

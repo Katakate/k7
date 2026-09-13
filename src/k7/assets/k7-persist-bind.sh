@@ -73,6 +73,43 @@ bind_mount_dir() {
   echo "k7-persist: bound $target -> $persist"
 }
 
+install_docker_plugin() {
+  src="$1"
+  dst="$2"
+  [ -x "$src" ] || {
+    echo "k7-persist: missing docker plugin $src" >&2
+    exit 1
+  }
+  mkdir -p "$(dirname "$dst")"
+  # Docker CLI plugin discovery skips symlinks; copy a regular file.
+  cp -a "$src" "$dst"
+  chmod +x "$dst"
+}
+
+restore_k7_docker_cli() {
+  # persist-bind overlays /usr and would hide the CLI subPath mounts.
+  # Restage from the emptyDir at /run/k7/docker-cli (not under /usr).
+  # Call after /usr and /root binds so these writes land on the PVC.
+  if [ ! -x /run/k7/docker-cli/bin/docker ]; then
+    return 0
+  fi
+  mkdir -p /usr/local/bin /usr/local/lib/docker/cli-plugins /root/.docker/cli-plugins
+  cp -a /run/k7/docker-cli/bin/docker /usr/local/bin/docker
+  chmod +x /usr/local/bin/docker
+  install_docker_plugin /run/k7/docker-cli/cli-plugins/docker-compose \
+    /usr/local/lib/docker/cli-plugins/docker-compose
+  install_docker_plugin /run/k7/docker-cli/cli-plugins/docker-buildx \
+    /usr/local/lib/docker/cli-plugins/docker-buildx
+  install_docker_plugin /run/k7/docker-cli/cli-plugins/docker-compose \
+    /root/.docker/cli-plugins/docker-compose
+  install_docker_plugin /run/k7/docker-cli/cli-plugins/docker-buildx \
+    /root/.docker/cli-plugins/docker-buildx
+  if [ ! -f /root/.docker/config.json ]; then
+    printf '%s\n' '{"cliPluginsExtraDirs":["/run/k7/docker-cli/cli-plugins"]}' >/root/.docker/config.json
+  fi
+  echo "k7-persist: docker CLI -> /run/k7/docker-cli" >&2
+}
+
 bind_mount_dir /etc etc
 bind_mount_dir /var var
 bind_mount_dir /usr usr
@@ -83,10 +120,22 @@ bind_mount_dir /bin bin
 bind_mount_dir /sbin sbin
 bind_mount_dir /lib lib
 bind_mount_dir /lib64 lib64
+restore_k7_docker_cli
 
 SCRIPT_END=$(date +%s)
 SCRIPT_ELAPSED=$((SCRIPT_END - SCRIPT_START))
 echo "k7-persist: script completed in ${SCRIPT_ELAPSED}s" >&2
+
+# Directory socket share. Tools that ignore DOCKER_HOST and
+# hardcode /var/run/docker.sock get a symlink; never overlay /var/run.
+if [ -d /run/k7/docker ]; then
+  mkdir -p /run
+  ln -sfn /run/k7/docker/docker.sock /run/docker.sock
+  if [ -d /var/run ]; then
+    ln -sfn /run/k7/docker/docker.sock /var/run/docker.sock
+  fi
+  echo "k7-persist: docker.sock -> /run/k7/docker/docker.sock" >&2
+fi
 
 date > "${MIGRATION_MARK}" 2>/dev/null || true
 if [ "$#" -eq 0 ]; then

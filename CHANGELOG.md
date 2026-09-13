@@ -5,6 +5,132 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.0] — 2026-09-12
+
+HTTPS-by-default for `k7-api`, cluster-wide Cilium isolation, first-class
+`--docker` on Kata and k7d, and RuntimeClass `k7-fc`. The playbook now
+pins k7d **0.6.0**.
+
+### Changed
+
+- **`k7 install` serves `k7-api` over HTTPS by default**.
+  `/etc/k7/api_endpoint` is now `https://<first-master-ip>:31007`. A
+  Caddy sidecar terminates TLS; the API container and its HTTP probes
+  stay on `:8000`. The default cert is a playbook-minted cluster CA
+  (`/etc/k7/tls/ca.crt`) — Let's Encrypt cannot issue for a bare IP.
+  **Breaking for existing laptop clients:** `K7_API_URL=http://...` must
+  switch to `https://` and, on the default track, install the CA
+  (`k7 config set api.ca ./ca.crt`, or `--api-ca` / `K7_API_CA`).
+  `verify=False` on an `https://` URL is an error. Optional
+  `--api-hostname` (Let's Encrypt via Caddy, not Certbot) and
+  `--api-tls-cert`/`--api-tls-key`. `--api-insecure-http` restores
+  today's HTTP NodePort. Keys no longer travel in cleartext; there is
+  still no rate limiting.
+
+### Added
+
+- **Cluster-wide sandbox platform isolation**. A deny-only
+  `CiliumClusterwideNetworkPolicy` (`k7-sandbox-platform-deny`) stops every
+  sandbox — in every egress mode, including `--egress-open` — from reaching
+  the node it runs on, the other nodes, the Kubernetes API server, cloud
+  metadata / link-local, and the `kube-system` + `longhorn-system` pods
+  (CoreDNS excepted). Previously an `--egress-open` sandbox could dial the
+  node's SSH/kubelet/k3s ports, `10.43.0.1:443`, `k7-api` and Longhorn.
+  The policy sets `enableDefaultDeny: false`; on Cilium 1.19 an
+  `egressDeny` section alone would otherwise switch the selected sandboxes
+  to default-deny and break open egress. Cilium-only: `--cni flannel`
+  clusters do not get this isolation (documented in `SECURITY.md`).
+- **Opt-in sandbox ingress** — `--ingress-port` opens TCP ports on a
+  sandbox and `--ingress-from` (`sandbox:<name>` / `namespace:<ns>` /
+  `cidr:<cidr>`) scopes who may connect, as stock v1 `NetworkPolicy` rules
+  (so it works on Flannel too). Default is unchanged: deny all ingress. An
+  opened port with no source is reachable only from sandboxes in the same
+  namespace; the internet needs `cidr:0.0.0.0/0` spelled out. `k7 create`
+  warns that a `cidr:` source does not scope in-cluster peers on Cilium
+  (an `ipBlock` peer is not evaluated for pod-to-pod traffic) — use
+  `sandbox:` / `namespace:` for that.
+- **`--expose-port`** — publishes a sandbox port outside the cluster through
+  a `NodePort` Service with `externalTrafficPolicy: Local`, so the pod sees
+  the real client IP instead of a SNAT'd one. Requires a matching
+  `--ingress-port`, prints the resolved `http://<node-ip>:<nodeport>`,
+  reports NodePorts in `k7 list`, and is removed by `k7 delete`.
+- **`k7 install --api-allow-cidr`** (repeatable) — restricts the `k7-api`
+  NodePort to the operator's source CIDRs via a `CiliumNetworkPolicy` on
+  the API pod (`k7-api-ingress`) plus `externalTrafficPolicy: Local` so the
+  pod sees the real client IP. Off by default: without the flag no policy
+  is created and the Service is untouched. Cilium-only (`--cni flannel`
+  fails at the CLI — the reserved `host` / `remote-node` / `health` /
+  `kube-apiserver` peers the kubelet probes need are not expressible in a
+  v1 `NetworkPolicy`); invalid CIDRs fail before Ansible runs, and
+  `0.0.0.0/0` warns. This is defence in depth for operators who know their
+  client CIDRs, **not** a secure API: the NodePort is HTTPS by default (see
+  Changed above) and there is still no rate limiting. The policy selects a
+  pod endpoint, never the host, so a wrong CIDR never affects SSH or the
+  k3s API port.
+- **`k7 install --hubble`** — opt-in Cilium Hubble flow observability
+  (relay + pinned `hubble` CLI). Off by default; not a security control.
+  Combined with `--cni flannel` it fails loudly. Hubble UI is not
+  installed (no auth, public node IP).
+- **`--docker`** — first-class Docker as a guest service. On `k7d` and
+  `k7d-fc` the guest agent supervises a pinned `dockerd` with overlay2
+  on a per-sandbox virtio-blk disk; forks stay overlay2. On Kata (`kfd`
+  / `kql`) the same flag injects a privileged docker-vehicle with
+  overlay2 on a block disk (`kql` persists/forks the graph; `kfd` is
+  ephemeral). `--sidecar docker` remains a deprecated alias.
+- **RuntimeClass `k7-fc`** (`--backend k7d-fc`) — Firecracker under the
+  jailer next to the k7d daemon, CRI exec, and overlay2 on forked
+  `--docker` graphs.
+- Kata guest seccomp is on (`disable_guest_seccomp = false`).
+- Playbook default `k7d_version` is **0.6.0** (was 0.5.0). `--docker` and
+  `k7-fc` need that tarball; an older k7d fails loudly.
+
+### Fixed
+
+- **API sandbox delete returned 400 on every call** because
+  `k7 delete` always removes the `{name}-expose` Service and the
+  `k7-api` ClusterRole had no `services` verbs. Kubernetes answers
+  403 (not 404) when the verb is missing, so even sandboxes that
+  never used `--expose-port` failed to delete through the API.
+- **`k7 snapshot gc` left orphan VolumeSnapshotContents behind**, so
+  snapshot-lifecycle tests (and operator deletes) pinned namespaces in
+  Terminating on `volumesnapshotcontent-bound-protection` /
+  `pvc-as-source-protection`. GC now reaps contents whose
+  VolumeSnapshot is already gone or deleting, then drops the PVC
+  source-protection finalizer (merge-patch — strategic-merge leaves
+  those CRD/PVC finalizers in place). Integration teardown calls that
+  same sweep instead of a kubectl jsonpath that silently missed items.
+
+- **`k7 install` treated a busy apiserver as "Cilium is missing"**. The
+  DaemonSet check used `failed_when: false` and `rc != 0` as absent, so a
+  brief `unable to handle the request` started `cilium install` on a
+  cluster that already had Cilium. Presence is now present / absent /
+  unknown: unknown retries, then fails loud, and never installs. The
+  Hubble relay check got the same split (`cilium hubble enable`
+  Helm-upgrades the agent — do not run it because kubectl blipped). A
+  reinstall no longer fails `cilium status --wait` on warnings when the
+  DaemonSet is Ready.
+- **`GET /api/v1/nodes/storage` skipped namespace authorization**
+  (CWE-862 / CWE-285). A leftover from the 0.2.1 scoping fix: this
+  cluster-scoped route was guarded only by `verify_api_key`, so a
+  namespace-scoped tenant key could read cluster-wide per-node storage
+  topology (node names, pool utilization, per-agent error strings). The
+  route now calls `authorize_namespace(..., all_namespaces=True)`;
+  scoped keys get 403, unscoped keys are unchanged. Reported privately
+  by **Ahmed Ibrahim** ([@skeletonsec](https://github.com/skeletonsec)),
+  who held disclosure — thank you.
+- `k7 install --cni flannel` failed at "Apply K7 API manifests" because the
+  directory contained a `CiliumNetworkPolicy` and no `cilium.io` CRD
+  exists on Flannel. Cilium-only manifests now live in
+  `manifests/k7-api/cilium/` and are applied by a separate task gated on
+  the CNI.
+- **`k7 fork` produced a sandbox with no network policy at all** — neither
+  the deny-ingress `NetworkPolicy` nor the egress policy was created, so a
+  fork of a locked-down sandbox came up with unrestricted egress. Forks now
+  inherit the source's egress configuration and are rolled back if their
+  policy cannot be created.
+
 ## [0.2.2] — 2026-08-18
 
 Docs and install-path release for a two-node `apt` install that ships

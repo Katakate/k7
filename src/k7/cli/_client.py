@@ -1,4 +1,4 @@
-"""CLI ↔ API client plumbing (Spec 10g).
+"""CLI ↔ API client plumbing.
 
 This module owns:
 
@@ -39,6 +39,7 @@ from ._config import get_config_value
 
 _ETC_API_ENDPOINT = Path("/etc/k7/api_endpoint")
 _ETC_API_KEYS = Path("/etc/k7/api_keys.json")
+_ETC_API_CA = Path("/etc/k7/tls/ca.crt")
 
 
 def _resolve_api_url(flag: str | None) -> str | None:
@@ -103,6 +104,28 @@ def _resolve_api_key(flag: str | None) -> str | None:
     return None
 
 
+def _resolve_api_ca(flag: str | None) -> str | None:
+    """Look up a CA file: ``--api-ca`` > ``K7_API_CA`` > ``api.ca`` > ``/etc/k7/tls/ca.crt``."""
+    if flag:
+        return flag
+    env = os.environ.get("K7_API_CA")
+    if env:
+        return env
+    cfg = get_config_value("api.ca")
+    if cfg:
+        return cfg
+    if _ETC_API_CA.exists():
+        return str(_ETC_API_CA)
+    return None
+
+
+def verify_ssl_for_url(url: str, ca: str | None) -> bool | str:
+    """SDK ``verify_ssl`` value. Never ``False`` for ``https://``."""
+    if url.startswith("https://"):
+        return ca if ca else True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # CliContext + adapters.
 # ---------------------------------------------------------------------------
@@ -125,12 +148,13 @@ class CliContext:
     use_core: bool = False
     api_url: str | None = None
     api_key: str | None = None
+    api_ca: str | None = None
     _client: Client | None = None
 
     def client(self) -> Client:
         """Resolve and cache the SDK client; exits 1 when the URL / key are unset."""
         if self._client is None:
-            self._client = resolve_client(self.api_url, self.api_key)
+            self._client = resolve_client(self.api_url, self.api_key, self.api_ca)
         return self._client
 
 
@@ -138,12 +162,14 @@ class ApiUnreachable(RuntimeError):
     """Raised when the SDK can't reach the API at all (connection / timeout)."""
 
 
-def resolve_client(api_url: str | None, api_key: str | None) -> Client:
-    """Build a ``katakate.Client`` from the resolved URL + key.
+def resolve_client(api_url: str | None, api_key: str | None, api_ca: str | None = None) -> Client:
+    """Build a ``katakate.Client`` from the resolved URL + key + CA.
 
-    Raises ``typer.Exit(1)`` with a pointed message when either is
-    missing — the CLI should never silently fall through to a broken
-    Client constructor.
+    Raises ``typer.Exit(1)`` with a pointed message when either the URL
+    or the key is missing — the CLI should never silently fall through
+    to a broken Client constructor. ``verify=False`` is never used for
+    an ``https://`` URL: a missing CA falls through to the
+    system trust store (Let's Encrypt); a broken CA is an error.
     """
     url = _resolve_api_url(api_url)
     if not url:
@@ -162,10 +188,11 @@ def resolve_client(api_url: str | None, api_key: str | None) -> Client:
             err=True,
         )
         raise typer.Exit(1)
-    # NodePort exposes plain HTTP; off-cluster setups should put the API
-    # behind ingress + TLS, in which case verify_ssl=True (the default)
-    # does the right thing. For local/demo HTTP, the SDK skips verify.
-    return Client(endpoint=url, api_key=key, verify_ssl=url.startswith("https://"))
+    ca = _resolve_api_ca(api_ca)
+    if ca and not Path(ca).is_file():
+        typer.echo(f"❌ API CA file not found: {ca}", err=True)
+        raise typer.Exit(1)
+    return Client(endpoint=url, api_key=key, verify_ssl=verify_ssl_for_url(url, ca))
 
 
 T = TypeVar("T")

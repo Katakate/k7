@@ -1,4 +1,4 @@
-# Spec 10b: keep the directory but ignore generated artifacts. Logs / CSVs /
+# Keep the directory but ignore generated artifacts. Logs / CSVs /
 # rendered sections live here; the published numbers go in PERFORMANCE.md.
 *.log
 *.csv

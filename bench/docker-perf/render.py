@@ -1,4 +1,4 @@
-"""CSV → Markdown renderer for the Spec 10b Docker benchmark.
+"""CSV → Markdown renderer for the Docker benchmark.
 
 Input CSV (produced by ``run_all.sh`` from ``/tmp/bench-<label>-*.log``):
 
@@ -16,7 +16,7 @@ Output: two Markdown tables.
      ``run_io``, ``run_cpu``), each sandbox env's median divided by host
      median. The number that lands on Hacker News.
 
-The renderer gates publishability on the spec-10b rule "(max - min) /
+The renderer gates publishability on the rule "(max - min) /
 median > 0.30 → investigate". Failing cells are tagged with ``⚠``.
 
 Deterministic: ``--input`` and stable column ordering mean the same CSV
@@ -35,7 +35,7 @@ from pathlib import Path
 from statistics import median
 
 # Stable column ordering for the rendered tables.
-ENVS: list[str] = ["host", "k7-fd", "k7-ql-r1", "k7-ql-r2", "k7-ql-r3", "k7d"]
+ENVS: list[str] = ["host", "k7-fd", "k7-ql-r1", "k7-ql-r2", "k7-ql-r3", "k7d", "k7d-fc"]
 
 # Stable row ordering, plus the human-readable column label for each op.
 OP_DISPLAY: list[tuple[str, str]] = [
@@ -45,6 +45,8 @@ OP_DISPLAY: list[tuple[str, str]] = [
     ("run_cpu", "run cpu (10s budget)"),
     ("run_io", "run io (2k small + 512 MB)"),
     ("run_read", "run read (venv tree cat)"),
+    ("fork_warm_engine", "fork warm engine (API)"),
+    ("fork_to_ready", "fork → Ready + overlay2"),
 ]
 
 # Operations included in the ratio-vs-host table — the ones that genuinely
@@ -57,7 +59,7 @@ RATIO_OPS: list[tuple[str, str]] = [
     ("run_cpu", "run cpu ratio"),
 ]
 
-RANGE_GATE = 0.30  # spec 10b: (max - min) / median > 0.30 → ⚠
+RANGE_GATE = 0.30  # (max - min) / median > 0.30 → ⚠
 
 
 def _load_rows(csv_path: Path) -> list[dict[str, str]]:
@@ -157,7 +159,12 @@ def render(
     sep = "|".join("-" * (len(e) + 2) for e in envs)
     lines.append(f"| Operation                 |{header_envs}|")
     lines.append(f"|---------------------------|{sep}|")
+    ops_with_data = {op for _, op in agg}
     for op_key, op_display in OP_DISPLAY:
+        # k7d-family-only ops: omit the rows unless at least one env measured them
+        # so host/kfd/kql-only CSVs keep the historical six-row layout.
+        if op_key in ("fork_warm_engine", "fork_to_ready") and op_key not in ops_with_data:
+            continue
         cells = "|".join(f" {_fmt_cell(agg.get((env, op_key)))} " for env in envs)
         lines.append(f"| {op_display:<26}|{cells}|")
     lines.append("")

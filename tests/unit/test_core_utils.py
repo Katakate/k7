@@ -2,7 +2,7 @@
 
 import pytest
 
-from k7.core.core import K7Core, _classify_egress_entries
+from k7.core.core import K7Core, _classify_egress_entries, _classify_ingress_sources
 
 # --- _memory_limit_to_mib ---
 
@@ -268,3 +268,34 @@ class TestClassifyEgressEntries:
         cidrs, fqdns = _classify_egress_entries(["10.0.0.5/8"])
         assert cidrs == ["10.0.0.0/8"]
         assert fqdns == []
+
+
+# --- _classify_ingress_sources ---
+
+
+class TestClassifyIngressSources:
+    def test_empty_list(self):
+        assert _classify_ingress_sources([]) == []
+
+    def test_sandbox_becomes_pod_selector(self):
+        peers = _classify_ingress_sources(["sandbox:alice"])
+        assert peers[0].pod_selector.match_labels == {"katakate.org/sandbox": "alice"}
+        assert peers[0].namespace_selector is None
+        assert peers[0].ip_block is None
+
+    def test_namespace_becomes_namespace_selector(self):
+        peers = _classify_ingress_sources(["namespace:team-a"])
+        assert peers[0].namespace_selector.match_labels == {"kubernetes.io/metadata.name": "team-a"}
+
+    def test_cidr_becomes_ip_block_and_is_normalized(self):
+        peers = _classify_ingress_sources(["cidr:10.0.0.5/8"])
+        assert peers[0].ip_block.cidr == "10.0.0.0/8"
+
+    @pytest.mark.parametrize(
+        "entry",
+        ["nonsense", "sandbox:", "pod:alice", "cidr:not-a-cidr", "10.0.0.0/8"],
+    )
+    def test_unparseable_source_is_a_hard_error(self, entry: str):
+        """No default interpretation: an unreadable security rule must fail loudly."""
+        with pytest.raises(ValueError):
+            _classify_ingress_sources([entry])

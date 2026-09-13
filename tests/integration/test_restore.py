@@ -1,4 +1,4 @@
-"""Integration tests for ``k7 restore`` (Spec 10f), multi-node cluster.
+"""Integration tests for ``k7 restore``, multi-node cluster.
 
 Coverage:
 

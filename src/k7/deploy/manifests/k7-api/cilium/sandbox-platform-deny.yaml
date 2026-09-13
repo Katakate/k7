@@ -1,0 +1,56 @@
+# Sandboxes are untrusted code. Deny them the platform itself,
+# in EVERY egress mode including --egress-open. Deny-only on purpose:
+# adding an `egress:` allow section here would flip every sandbox to
+# default-deny and break `--egress-open`.
+#
+# enableDefaultDeny is load-bearing. On Cilium 1.19 an `egressDeny`
+# section on its own ALSO switches the selected endpoints to default-deny
+# for egress (verified empirically: an --egress-open sandbox lost DNS the
+# moment a TEST-NET-1-only egressDeny CCNP was applied). Setting it to
+# false makes this a pure "drop these, allow everything else you would
+# otherwise allow" policy.
+#
+# Do NOT add 10.0.0.0/8 or 10.43.0.0/16 here: pod CIDR is 10.42.0.0/16,
+# service CIDR is 10.43.0.0/16, CoreDNS is 10.43.0.10 — that denies DNS
+# and every ClusterIP for every sandbox. The apiserver is covered by the
+# kube-apiserver entity (node IP:6443 and 10.43.0.1:443), not by CIDR.
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: k7-sandbox-platform-deny
+spec:
+  description: "Deny sandbox egress to node, control plane and metadata"
+  enableDefaultDeny:
+    egress: false
+    ingress: false
+  endpointSelector:
+    matchExpressions:
+      - key: katakate.org/sandbox
+        operator: Exists
+  egressDeny:
+    # M1: the node itself (SSH, kubelet :10250, k3s :6443, k7d/containerd
+    # sockets' owner), the other nodes of an HA cluster, and the apiserver
+    # however it is reached. CoreDNS is a normal pod, not hostNetwork, so
+    # DNS is unaffected.
+    - toEntities:
+        - host
+        - remote-node
+        - kube-apiserver
+    # Cloud metadata (169.254.169.254) and the rest of link-local. Cilium
+    # here runs VXLAN and does not use 169.254.1.1 as the pod gateway.
+    - toCIDR:
+        - 169.254.0.0/16
+    # M2: platform pods (k7-api, Longhorn managers/engines, metrics-server,
+    # hubble-relay, ...) by ClusterIP or pod IP. They are pod endpoints,
+    # not `host`, so M1 does not cover them. The kube-dns exclusion is
+    # load-bearing: CoreDNS (k3s labels it k8s-app=kube-dns) lives in
+    # kube-system and denying it silently breaks every sandbox's DNS,
+    # including the FQDN egress path.
+    - toEndpoints:
+        - matchExpressions:
+            - key: k8s:io.kubernetes.pod.namespace
+              operator: In
+              values: [kube-system, longhorn-system]
+            - key: k8s:k8s-app
+              operator: NotIn
+              values: [kube-dns]

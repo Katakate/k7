@@ -3,6 +3,7 @@
 import asyncio
 import builtins
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -33,6 +34,7 @@ from k7 import __version__ as K7_VERSION
 from k7.cli._client import CliContext, handle_api_call
 from k7.cli._config import config_app
 from k7.core.core import K7Core
+from k7.core.docker import parse_docker_disk
 from k7.core.models import SandboxConfig, SandboxConfigOverrides
 from k7.core.sidecar import SIDECAR_REGISTRY
 
@@ -63,6 +65,12 @@ def _main(
         envvar="K7_API_KEY",
         help="API key for the K7 API (overrides env / config file).",
     ),
+    api_ca: str | None = typer.Option(
+        None,
+        "--api-ca",
+        envvar="K7_API_CA",
+        help="CA file to trust for https:// API URLs (overrides env / config / /etc/k7/tls/ca.crt).",
+    ),
     use_core: bool = typer.Option(
         False,
         "--core",
@@ -82,7 +90,7 @@ def _main(
         raise typer.Exit()
     # CliContext is built lazily — handlers that never call ``ctx.obj.client()``
     # (install / start-api / config / ...) don't trigger the missing-URL error.
-    ctx.obj = CliContext(use_core=use_core, api_url=api_url, api_key=api_key)
+    ctx.obj = CliContext(use_core=use_core, api_url=api_url, api_key=api_key, api_ca=api_ca)
     if ctx.invoked_subcommand is None:
         # Show top-level help when no command is provided
         try:
@@ -93,6 +101,7 @@ def _main(
 
 
 API_KEYS_FILE = Path(os.getenv("K7_API_KEYS_FILE", "/etc/k7/api_keys.json"))
+_ETC_K7_API_ENDPOINT = Path("/etc/k7/api_endpoint")
 # The k7-api container runs as this fixed non-root uid (`useradd -u 1000
 # k7user` in src/k7/api/Dockerfile.api) and reads the key store through a
 # hostPath mount. The store holds sha256 *hashes* (never raw keys), but we
@@ -123,11 +132,12 @@ def _write_api_keys(api_keys: dict) -> None:
         )
 
 
-BACKEND_ALLOWED = {"kata-firecracker-devmapper", "kata-qemu-longhorn", "k7d"}
+BACKEND_ALLOWED = {"kata-firecracker-devmapper", "kata-qemu-longhorn", "k7d", "k7d-fc"}
 BACKEND_ALIASES = {
     "kfd": "kata-firecracker-devmapper",
     "kql": "kata-qemu-longhorn",
     "k7": "k7d",
+    "k7-fc": "k7d-fc",
 }
 # Deprecated short + pre-rename full names. Still accepted; emit a warning.
 BACKEND_DEPRECATED_ALIASES = {
@@ -158,7 +168,7 @@ def _normalize_backend(backend: str | None) -> str | None:
         return value
     allowed = ", ".join(sorted(BACKEND_ALLOWED))
     raise typer.BadParameter(
-        f"Unsupported backend '{backend}'. Use {allowed} (aliases: kfd, kql, k7; deprecated: fd, ql)."
+        f"Unsupported backend '{backend}'. Use {allowed} (aliases: kfd, kql, k7, k7-fc; deprecated: fd, ql)."
     )
 
 
@@ -237,16 +247,72 @@ def _build_default_inventory(
     return "\n".join(lines)
 
 
+def _tls_cert_key_match(cert: Path, key: Path) -> None:
+    """Refuse a cert/key pair that openssl does not consider matching."""
+    if not cert.is_file():
+        raise typer.BadParameter(f"--api-tls-cert '{cert}' is not a file")
+    if not key.is_file():
+        raise typer.BadParameter(f"--api-tls-key '{key}' is not a file")
+    cert_pub = subprocess.run(
+        ["openssl", "x509", "-in", str(cert), "-noout", "-pubkey"],
+        capture_output=True,
+        text=True,
+    )
+    key_pub = subprocess.run(
+        ["openssl", "pkey", "-in", str(key), "-pubout"],
+        capture_output=True,
+        text=True,
+    )
+    if cert_pub.returncode != 0:
+        raise typer.BadParameter(f"--api-tls-cert is not a readable PEM certificate: {cert_pub.stderr.strip()}")
+    if key_pub.returncode != 0:
+        raise typer.BadParameter(f"--api-tls-key is not a readable PEM private key: {key_pub.stderr.strip()}")
+    if cert_pub.stdout != key_pub.stdout:
+        raise typer.BadParameter("--api-tls-cert and --api-tls-key are not a matching pair")
+
+
+def _validate_api_hostname(name: str) -> str:
+    host = name.strip()
+    if not host:
+        raise typer.BadParameter("--api-hostname must be a DNS name")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    raise typer.BadParameter(
+        "--api-hostname must be a DNS name, not an IP (Let's Encrypt will not issue for a bare IP)"
+    )
+
+
 def _read_api_endpoint(kubectl: list[str]) -> str | None:
-    """Read the K7 API NodePort endpoint from the K3s service."""
+    """Read the K7 API NodePort endpoint from the file the playbook wrote, or the Service."""
+    etc = _ETC_K7_API_ENDPOINT
+    if etc.exists():
+        try:
+            written = etc.read_text().strip()
+            if written:
+                return written
+        except OSError:
+            pass
     port_result = subprocess.run(
-        kubectl + ["get", "svc", "k7-api", "-n", "kube-system", "-o", "jsonpath={.spec.ports[0].nodePort}"],
+        kubectl
+        + [
+            "get",
+            "svc",
+            "k7-api",
+            "-n",
+            "kube-system",
+            "-o",
+            "jsonpath={.spec.ports[0].nodePort},{.spec.ports[0].targetPort}",
+        ],
         capture_output=True,
         text=True,
     )
     if port_result.returncode != 0 or not port_result.stdout.strip():
         return None
-    node_port = port_result.stdout.strip()
+    node_port, _, target_port = port_result.stdout.strip().partition(",")
+    if not node_port:
+        return None
 
     # Get node addresses as JSON and pick the first IPv4 InternalIP
     node_result = subprocess.run(
@@ -265,7 +331,8 @@ def _read_api_endpoint(kubectl: list[str]) -> str | None:
         except (json.JSONDecodeError, TypeError, KeyError):
             pass
 
-    return f"http://{node_ip}:{node_port}"
+    scheme = "https" if target_port.strip() == "8443" else "http"
+    return f"{scheme}://{node_ip}:{node_port}"
 
 
 def _get_api_manifests_dir() -> str:
@@ -304,16 +371,16 @@ def install(
         "-b",
         help=(
             "Comma-separated sandbox backends to install on this node. "
-            "Choices: kata-firecracker-devmapper (kfd), kata-qemu-longhorn (kql), k7d. "
-            "Default installs the two Kata backends; add k7d explicitly for the "
-            "warm-fork microVM runtime."
+            "Choices: kata-firecracker-devmapper (kfd), kata-qemu-longhorn (kql), k7d, k7d-fc (alias k7-fc). "
+            "Default installs the two Kata backends; add k7d / k7d-fc explicitly for the "
+            "warm-fork microVM runtime (k7d-fc is Firecracker under the jailer)."
         ),
         show_default=True,
     ),
     k7d_version: str | None = typer.Option(
         None,
         "--k7d-version",
-        help="k7d release version to install (k7d backend only; default from playbook: 0.2.1)",
+        help="k7d release version to install (k7d backend only; default from playbook: 0.6.0)",
     ),
     k7d_artifact: str | None = typer.Option(
         None,
@@ -365,6 +432,46 @@ def install(
         help="CNI plugin: cilium (default, enables FQDN egress) or flannel (CIDR-only)",
         show_default=True,
     ),
+    hubble: bool = typer.Option(
+        False,
+        "--hubble",
+        help=("Enable Cilium Hubble flow observability (relay + CLI; no UI). Off by default. Requires --cni cilium."),
+    ),
+    api_allow_cidr: list[str] | None = typer.Option(
+        None,
+        "--api-allow-cidr",
+        help=(
+            "Restrict the k7-api NodePort to these source CIDRs (repeatable, e.g. 203.0.113.4/32). "
+            "Off by default: the API answers any client that has an API key. Requires --cni cilium. "
+            "Defence in depth only — this is not rate limiting and not a secure-API claim."
+        ),
+    ),
+    api_insecure_http: bool = typer.Option(
+        False,
+        "--api-insecure-http",
+        help="Serve k7-api as today's plain HTTP NodePort (no Caddy sidecar, keys travel in cleartext).",
+    ),
+    api_hostname: str | None = typer.Option(
+        None,
+        "--api-hostname",
+        help="DNS name pointing at the first master; Caddy obtains a Let's Encrypt cert (HTTP-01 on :80).",
+    ),
+    api_tls_cert: str | None = typer.Option(
+        None,
+        "--api-tls-cert",
+        help="Operator-supplied server certificate (PEM). Requires --api-tls-key.",
+    ),
+    api_tls_key: str | None = typer.Option(
+        None,
+        "--api-tls-key",
+        help="Operator-supplied server private key (PEM). Requires --api-tls-cert.",
+    ),
+    api_acme_staging: bool = typer.Option(
+        False,
+        "--api-acme-staging",
+        hidden=True,
+        help="Use the Let's Encrypt staging ACME directory (integration tests).",
+    ),
     no_api: bool = typer.Option(
         False,
         "--no-api",
@@ -377,8 +484,9 @@ def install(
     Single-node (default): `k7 install` provisions localhost with **both**
     Kata backends (kata-firecracker-devmapper + kata-qemu-longhorn). Pass
     `--backend kfd,kql,k7d` to also install the k7d warm-fork runtime
-    (downloads `Katakate/k7d` v0.2.1 unless `--k7d-version` / `--k7d-artifact`
-    override it).
+    (downloads `Katakate/k7d` v0.6.0 unless `--k7d-version` / `--k7d-artifact`
+    override it). `--backend k7d-fc` (alias `k7-fc`) adds RuntimeClass
+    `k7-fc` and the pinned Firecracker+jailer next to that daemon.
 
     Multi-node: `k7 install -i inventory.ini` reads roles, backends, and disks
     from the Ansible inventory. See `inventory.ini.example` for the layout.
@@ -391,6 +499,56 @@ def install(
     cni_value = (cni or "").strip().lower()
     if cni_value not in ("cilium", "flannel"):
         raise typer.BadParameter(f"--cni must be 'cilium' or 'flannel', got '{cni}'")
+    if hubble and cni_value != "cilium":
+        raise typer.BadParameter(f"--hubble requires the Cilium CNI (got --cni {cni_value}).")
+
+    # Validate the k7-api allowlist here, before Ansible runs. A bad
+    # CIDR must never reach a security policy.
+    api_cidrs = [c.strip() for c in (api_allow_cidr or []) if c.strip()]
+    if api_cidrs:
+        if cni_value != "cilium":
+            raise typer.BadParameter(
+                f"--api-allow-cidr requires the Cilium CNI (got --cni {cni_value}). The reserved "
+                "host/remote-node/health/kube-apiserver peers are not expressible in a v1 "
+                "NetworkPolicy, and a v1 policy without `host` would break the kubelet probes on "
+                "the k7-api pod."
+            )
+        for cidr in api_cidrs:
+            try:
+                network = ipaddress.ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise typer.BadParameter(f"--api-allow-cidr '{cidr}' is not a valid CIDR: {exc}") from exc
+            if network.prefixlen == 0:
+                typer.echo(
+                    f"⚠️  --api-allow-cidr {cidr} allows every source address — that is today's "
+                    "behaviour with extra steps. Pass the CIDRs your clients actually come from.",
+                    err=True,
+                )
+
+    # TLS flag combinations fail here, before Ansible.
+    hostname = (api_hostname or "").strip() or None
+    cert_path = Path(api_tls_cert).expanduser() if api_tls_cert else None
+    key_path = Path(api_tls_key).expanduser() if api_tls_key else None
+    if api_insecure_http and (hostname or cert_path or key_path):
+        raise typer.BadParameter(
+            "--api-insecure-http cannot be combined with --api-hostname or --api-tls-cert/--api-tls-key"
+        )
+    if hostname and (cert_path or key_path):
+        raise typer.BadParameter("--api-hostname cannot be combined with --api-tls-cert/--api-tls-key")
+    if (cert_path is None) ^ (key_path is None):
+        raise typer.BadParameter("--api-tls-cert and --api-tls-key must be passed together")
+    if hostname:
+        hostname = _validate_api_hostname(hostname)
+    if cert_path is not None and key_path is not None:
+        _tls_cert_key_match(cert_path.resolve(), key_path.resolve())
+    if api_insecure_http and api_cidrs:
+        typer.echo(
+            "⚠️  --api-insecure-http with --api-allow-cidr: the allowlist still applies, "
+            "but API keys still travel in cleartext.",
+            err=True,
+        )
+    if api_acme_staging and not hostname:
+        raise typer.BadParameter("--api-acme-staging requires --api-hostname")
 
     if join and not join_token:
         raise typer.BadParameter("--join requires --join-token")
@@ -517,12 +675,23 @@ def install(
             "longhorn_data_path": longhorn_data_path,
             "longhorn_extra_disk": longhorn_extra_disk,
             "k7_cni": cni_value,
+            "k7_hubble_enabled": "true" if hubble else "false",
             "k7_repo_root": repo_root,
-            # Spec 10d: ``--no-api`` flips the playbook's existing
+            # ``--no-api`` flips the playbook's existing
             # ``k7_api_enabled`` gate (default true) so the API
             # manifests aren't applied.
             "k7_api_enabled": "false" if no_api else "true",
-            # k7d backend artifact source overrides (spec 9a M11).
+            # Empty means no CiliumNetworkPolicy and no Service
+            # change — today's install, bit for bit.
+            "k7_api_allow_cidrs": ",".join(api_cidrs),
+            # Default is HTTPS + playbook CA. Extra-vars are
+            # strings so Ansible's `| bool` filter stays deterministic.
+            "k7_api_insecure_http": "true" if api_insecure_http else "false",
+            "k7_api_hostname": hostname or "",
+            "k7_api_tls_cert_src": str(cert_path.resolve()) if cert_path else "",
+            "k7_api_tls_key_src": str(key_path.resolve()) if key_path else "",
+            "k7_api_acme_staging": "true" if api_acme_staging else "false",
+            # k7d backend artifact source overrides.
             "k7d_version": k7d_version,
             "k7d_artifact_local_path": k7d_artifact,
         }
@@ -531,7 +700,7 @@ def install(
         # Ansible extra-vars have the highest precedence and would clobber
         # per-host `k7_backends` declared in a user-supplied inventory. Only
         # forward the CLI value when the user explicitly passed --backend;
-        # otherwise the inventory is authoritative (spec 18e).
+        # otherwise the inventory is authoritative.
         backend_explicit = ctx.get_parameter_source("backend") == ParameterSource.COMMANDLINE
         if inventory_user_supplied and not backend_explicit:
             extra_vars.pop("k7_backends", None)
@@ -596,6 +765,28 @@ def create(
             "Without this flag and without --egress, all egress is blocked."
         ),
     ),
+    ingress_port: list[int] | None = typer.Option(
+        None,
+        "--ingress-port",
+        help=("TCP port to open for inbound traffic. Repeatable. Default (no --ingress-port): deny all ingress."),
+    ),
+    ingress_from: list[str] | None = typer.Option(
+        None,
+        "--ingress-from",
+        help=(
+            "Who may reach --ingress-port: sandbox:<name> | namespace:<ns> | cidr:<cidr>. Repeatable. "
+            "Default when --ingress-port is given: sandboxes in the same namespace. "
+            "Reaching the sandbox from anywhere needs cidr:0.0.0.0/0, spelled out."
+        ),
+    ),
+    expose_port: list[int] | None = typer.Option(
+        None,
+        "--expose-port",
+        help=(
+            "Publish a TCP port outside the cluster through a NodePort Service. Repeatable. "
+            "Requires a matching --ingress-port. On a public node the node IP is public too."
+        ),
+    ),
     before_script: str | None = typer.Option(
         None,
         "--before-script",
@@ -645,20 +836,42 @@ def create(
         None,
         "--backend",
         "-b",
-        help="Backend: kata-firecracker-devmapper (kfd) or kata-qemu-longhorn (kql) (auto-detected if not specified)",
+        help="Backend: kfd, kql, k7d, or k7d-fc (alias k7-fc) (auto-detected if not specified)",
     ),
     sidecar: str | None = typer.Option(
         None,
         "--sidecar",
-        help="Sidecar daemon type to inject (e.g. 'docker'). See SIDECAR_REGISTRY for available types.",
+        help=(
+            "Sidecar daemon type to inject. --sidecar docker is a deprecated alias of "
+            "--docker. Other types: see SIDECAR_REGISTRY."
+        ),
+    ),
+    docker: bool = typer.Option(
+        False,
+        "--docker",
+        help=(
+            "Run a pinned dockerd (overlay2 on a block graph disk). "
+            "k7d/k7d-fc: guest agent service, forkable. Kata (kfd/kql): privileged "
+            "docker-vehicle in the VM; kql persists the graph, kfd is ephemeral."
+        ),
+    ),
+    docker_disk: str | None = typer.Option(
+        None,
+        "--docker-disk",
+        help="Docker graph disk size for --docker (e.g. 20Gi, 40Gi). Default 20Gi on all backends.",
     ),
 ):
     """Create a new sandbox from YAML config or CLI arguments."""
-    # Spec 18f issue 4: three explicit egress modes. --egress-open → open
+    # Three explicit egress modes. --egress-open → open
     # (no policy, egress_whitelist=None); --egress ... → whitelist; neither
     # → block-all ([]). Combining both is ambiguous — fail loudly.
     if egress_open and egress_whitelist:
         raise typer.BadParameter("--egress-open cannot be combined with --egress (pick one egress mode)")
+
+    # Sources without ports open nothing — the user believes they
+    # exposed the sandbox and did not, so fail instead of guessing.
+    if ingress_from and not ingress_port:
+        raise typer.BadParameter("--ingress-from requires --ingress-port (sources alone open no port)")
 
     # Auto-detect default config file in current directory when not provided
     if not config:
@@ -685,6 +898,12 @@ def create(
             sandbox_config.egress_whitelist = None
         elif egress_whitelist:
             sandbox_config.egress_whitelist = egress_whitelist
+        if ingress_port:
+            sandbox_config.ingress_ports = ingress_port
+        if ingress_from:
+            sandbox_config.ingress_from = ingress_from
+        if expose_port:
+            sandbox_config.expose_ports = expose_port
         if before_script:
             sandbox_config.before_script = before_script
         # Security overrides from CLI take precedence when provided
@@ -708,6 +927,10 @@ def create(
             sandbox_config.backend = _normalize_backend(backend)
         if sidecar is not None:
             sandbox_config.sidecar = sidecar
+        if docker:
+            sandbox_config.docker = True
+        if docker_disk is not None:
+            sandbox_config.docker_disk = docker_disk
 
         if not sandbox_config.image:
             raise typer.BadParameter("image is required")
@@ -742,6 +965,9 @@ def create(
             namespace=namespace,
             env_file=env_file,
             egress_whitelist=None if egress_open else (egress_whitelist or []),
+            ingress_ports=ingress_port or None,
+            ingress_from=ingress_from or None,
+            expose_ports=expose_port or None,
             limits=limits if limits else None,
             before_script=before_script or "",
             entrypoint=entrypoint,
@@ -754,15 +980,34 @@ def create(
             runtime_class_name=runtime_class,
             root_disk_size=root_disk_size,
             backend=_normalize_backend(backend) if backend else None,
+            docker=docker,
+            docker_disk=docker_disk,
         )
 
     resolved_backend = _normalize_backend(sandbox_config.backend) if sandbox_config.backend else None
     if root_disk_size and resolved_backend == "kata-firecracker-devmapper":
         typer.echo("⚠️  --root-disk-size has no effect with the kata-firecracker-devmapper backend", err=True)
 
+    if sandbox_config.sidecar == "docker":
+        typer.echo("⚠️  --sidecar docker is deprecated; use --docker", err=True)
+        sandbox_config.docker = True
+        sandbox_config.sidecar = None
+
+    if sandbox_config.docker and sandbox_config.sidecar:
+        raise typer.BadParameter("--docker and --sidecar are mutually exclusive until multiple guest services exist")
+
+    if sandbox_config.docker_disk:
+        if not sandbox_config.docker:
+            raise typer.BadParameter("--docker-disk requires --docker")
+        try:
+            sandbox_config.docker_disk = parse_docker_disk(sandbox_config.docker_disk)
+        except ValueError as e:
+            raise typer.BadParameter(str(e)) from e
+
     if sandbox_config.sidecar is not None and sandbox_config.sidecar not in SIDECAR_REGISTRY:
-        available = ", ".join(sorted(SIDECAR_REGISTRY.keys()))
-        raise typer.BadParameter(f"Unknown sidecar type '{sandbox_config.sidecar}'. Available: {available}")
+        others = ", ".join(sorted(k for k in SIDECAR_REGISTRY if k != "docker"))
+        hint = others if others else "no non-docker sidecar types (--sidecar docker is --docker)"
+        raise typer.BadParameter(f"Unknown sidecar type '{sandbox_config.sidecar}'. Available: {hint}")
 
     core = K7Core()
     progress = Progress(
@@ -885,10 +1130,42 @@ def create(
     except Exception:
         cap_drop_display = "unknown"
 
+    # A NodePort on a Hetzner dedicated box lands on a public IP: say so on
+    # every create, not just once in the docs.
+    if sandbox_config.expose_ports and "cidr:0.0.0.0/0" in (sandbox_config.ingress_from or []):
+        typer.echo(
+            f"⚠️  {sandbox_config.name} is exposed on ports {sandbox_config.expose_ports} to cidr:0.0.0.0/0 — "
+            "on a public node this publishes the sandbox to the internet.",
+            err=True,
+        )
+
+    if sandbox_config.ingress_ports:
+        ingress_mode = (
+            f"ports={sandbox_config.ingress_ports} from="
+            f"{sandbox_config.ingress_from or ['sandboxes in this namespace']}"
+        )
+    else:
+        ingress_mode = "deny_all"
+
+    expose_mode = f"NodePort for {sandbox_config.expose_ports}" if sandbox_config.expose_ports else "none"
+
+    # Measured on Cilium: an ipBlock peer is not evaluated for pod-to-pod
+    # traffic, so a rule carrying one degrades to a port-only allow in-cluster.
+    # The flag reads like a restriction, so say plainly that it is not one.
+    if any((s or "").strip().startswith("cidr:") for s in sandbox_config.ingress_from or []):
+        typer.echo(
+            f"⚠️  {sandbox_config.name}: a cidr: source does not restrict in-cluster peers on Cilium — "
+            f"ports {sandbox_config.ingress_ports} are reachable from any sandbox in the cluster. "
+            "Use sandbox:<name> or namespace:<ns> to scope in-cluster access.",
+            err=True,
+        )
+
     params_lines = [
         f"Image: {sandbox_config.image}",
         f"Namespace: {sandbox_config.namespace}",
         f"Egress: {egress_mode}",
+        f"Ingress: {ingress_mode}",
+        f"Expose: {expose_mode}",
         f"Before script: {'present' if (sandbox_config.before_script or '').strip() else 'none'}",
         f"Pod non-root: {getattr(sandbox_config, 'pod_non_root', False)}",
         f"Container non-root: {getattr(sandbox_config, 'container_non_root', False)}",
@@ -1136,6 +1413,7 @@ def create(
             pass
 
     cli_ctx: CliContext = ctx.obj
+    endpoints: builtins.list[dict] = []
     if cli_ctx.use_core:
         group = RichGroup(status_text, details_text, progress)
         with RichLive(group, refresh_per_second=8, transient=False) as live:
@@ -1143,6 +1421,7 @@ def create(
         if not result.success:
             typer.echo(f"❌ Failed to create sandbox: {result.error}", err=True)
             raise typer.Exit(1)
+        endpoints = (result.data or {}).get("endpoints") or []
         sandboxes_for_ready = asyncio.run(core.list_sandboxes(sandbox_config.namespace))
         target_ready = any(s.name == sandbox_config.name and s.ready == "True" for s in sandboxes_for_ready)
     else:
@@ -1154,6 +1433,12 @@ def create(
         handle_api_call(lambda: cli_ctx.client().create(sandbox_config.to_dict()))
         sandboxes = handle_api_call(lambda: cli_ctx.client().list(namespace=sandbox_config.namespace))
         target_ready = any(s.get("name") == sandbox_config.name and s.get("ready") == "True" for s in sandboxes)
+        if sandbox_config.expose_ports:
+            # The SDK's create() returns a proxy, so the API path cannot show a
+            # resolved URL here. Point at the NodePorts instead of guessing one.
+            typer.echo(f"🌐 Exposed ports: see the NodePorts in k7 list --name {sandbox_config.name}")
+    for endpoint in endpoints:
+        typer.echo(f"🌐 Port {endpoint['port']} exposed at {endpoint['url']}")
     if target_ready:
         typer.echo(f"✅ Sandbox {sandbox_config.name} created.")
         typer.echo(
@@ -1221,6 +1506,7 @@ def list(
     table.add_column("Image", style="green")
     table.add_column("Backend", style="magenta")
     table.add_column("Node", style="yellow")
+    table.add_column("NodePorts", style="yellow")
     table.add_column("Error", style="red")
 
     for sandbox in sandboxes:
@@ -1247,6 +1533,7 @@ def list(
             sandbox.get("image", ""),
             sandbox.get("backend", ""),
             sandbox.get("node", ""),
+            ",".join(str(p) for p in sandbox.get("node_ports") or []),
             sandbox.get("error_message", ""),
         )
 
@@ -1899,7 +2186,7 @@ def _build_and_import_api_image() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Spec 10d: ``k7 api ...`` sub-app — feature-toggle framing for the API server.
+# ``k7 api ...`` sub-app — feature-toggle framing for the API server.
 # The API is deployed by ``k7 install`` (gated on ``k7_api_enabled``) and lives
 # on as a normal Kubernetes Deployment from then on. ``api enable/disable``
 # scale that Deployment up/down for temporary off/on; ``status``/``endpoint``
@@ -1935,7 +2222,7 @@ def _api_scale_deployment(replicas: int) -> None:
 
     Errors are loud — they exit the CLI with a non-zero status — because
     "I asked to disable but nothing happened" is exactly the silent
-    failure mode 10d is trying to eliminate.
+    failure mode this is meant to eliminate.
     """
     kubectl = _kubectl_cmd()
     result = subprocess.run(
@@ -2145,7 +2432,7 @@ def _deprecated_get_api_endpoint():
 
 
 # ---------------------------------------------------------------------------
-# Spec 18h: ``k7 nodes …`` sub-app for cluster-node queries.
+# ``k7 nodes …`` sub-app for cluster-node queries.
 # ---------------------------------------------------------------------------
 
 
@@ -2205,7 +2492,7 @@ def nodes_storage(
     _print_nodes_storage_table(data)
 
 
-# Spec 10e: ``k7 snapshot …`` sub-app for VolumeSnapshot CRUD + GC.
+# ``k7 snapshot …`` sub-app for VolumeSnapshot CRUD + GC.
 # ---------------------------------------------------------------------------
 
 
@@ -2387,7 +2674,8 @@ def snapshot_gc(
 ):
     """Delete stale ``kind=fork`` snapshots older than ``--keep-fork-for``.
 
-    Pause snapshots and named snapshots are never touched.
+    Pause snapshots and named snapshots are never touched. Also reaps
+    orphan VolumeSnapshotContents whose VolumeSnapshot is already gone.
     """
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:

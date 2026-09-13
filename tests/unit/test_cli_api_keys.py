@@ -1,4 +1,4 @@
-"""Unit tests for API key generation / namespace scoping (spec 10h)."""
+"""Unit tests for API key generation / namespace scoping."""
 
 import json
 from pathlib import Path

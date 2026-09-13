@@ -1,4 +1,4 @@
-# Spec 18g: restrict pod-originated ingress to the k7-agent DaemonSet to
+# Restrict pod-originated ingress to the k7-agent DaemonSet to
 # the k7-api pod only. `host` / `remote-node` entities stay allowed so
 # kubelet health probes and root CLI usage on cluster nodes keep working —
 # those callers still need the shared token (/etc/k7/agent_token, root

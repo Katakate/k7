@@ -27,7 +27,7 @@ spec:
           image: k7-api:local
           imagePullPolicy: Never
           # Same image as k7-api, different app: only the node-local VM ops
-          # and the storage endpoint (spec 18g).
+          # and the storage endpoint.
           command: ["uvicorn", "k7.api.agent:app", "--host", "0.0.0.0", "--port", "8000"]
           # Privileged: `lvs` (kfd thin-pool utilization) issues device-mapper
           # ioctls and reads raw block devices under the hostPath-mounted

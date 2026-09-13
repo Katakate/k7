@@ -1,4 +1,4 @@
-"""Unit tests for the ``k7 pause`` CLI command (Spec 10c).
+"""Unit tests for the ``k7 pause`` CLI command.
 
 These verify the cleaned-up CLI surface:
 - ``k7 pause NAME`` → no snapshot, snapshot_name=None forwarded to Core.
@@ -31,7 +31,7 @@ def test_pause_no_snapshot():
     patcher, fake = _mock_pause_returning_success()
     try:
         # ``--core`` forces the K7Core path so the mocked K7Core in
-        # ``_mock_pause_returning_success`` is exercised. Spec 10g default
+        # ``_mock_pause_returning_success`` is exercised. Default
         # routing is through the HTTP API (see test_cli_routing.py).
         result = runner.invoke(app, ["--core", "pause", "demo"])
     finally:
@@ -106,7 +106,7 @@ def test_pause_with_namespace():
 
 
 def test_pause_unknown_pvc_flag_rejected():
-    """Spec 10c: --pvc was removed. Passing it must fail fast."""
+    """--pvc was removed. Passing it must fail fast."""
     result = runner.invoke(app, ["pause", "demo", "--pvc=demo-root-lh"])
     assert result.exit_code != 0
     combined = (result.output or "") + (result.stderr or "")
@@ -114,7 +114,7 @@ def test_pause_unknown_pvc_flag_rejected():
 
 
 def test_pause_unknown_snapshot_class_flag_rejected():
-    """Spec 10c: --snapshot-class was removed. Passing it must fail fast."""
+    """--snapshot-class was removed. Passing it must fail fast."""
     result = runner.invoke(app, ["pause", "demo", "--snapshot-class=longhorn"])
     assert result.exit_code != 0
     combined = (result.output or "") + (result.stderr or "")

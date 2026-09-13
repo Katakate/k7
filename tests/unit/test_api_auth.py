@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -185,3 +185,35 @@ class TestAuthorizeNamespace:
                 params={"namespace": "beta"},
             )
         assert resp.status_code == 403
+
+    async def test_scoped_key_nodes_storage_returns_403(self, _patch_keys_file, keys_file: Path):
+        future_ts = int(time.time()) + 86400
+        data = _make_keys_data(expires=future_ts, namespaces=["alpha"])
+        keys_file.write_text(json.dumps(data))
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/api/v1/nodes/storage",
+                headers={"X-API-Key": TEST_KEY},
+            )
+        assert resp.status_code == 403
+        assert "all-namespaces" in resp.json()["error"]["message"]
+
+    async def test_unscoped_key_nodes_storage_returns_200(self, _patch_keys_file, keys_file: Path):
+        future_ts = int(time.time()) + 86400
+        data = _make_keys_data(expires=future_ts)
+        keys_file.write_text(json.dumps(data))
+        payload = {"node-a": {"kata_thinpool": {"size_bytes": 1}}}
+
+        with patch("k7.api.main.K7Core") as core_cls:
+            core_cls.return_value.nodes_storage = AsyncMock(return_value=payload)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get(
+                    "/api/v1/nodes/storage",
+                    headers={"X-API-Key": TEST_KEY},
+                )
+        assert resp.status_code == 200
+        assert resp.json()["data"] == payload
+        core_cls.return_value.nodes_storage.assert_awaited_once()

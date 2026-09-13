@@ -1,6 +1,7 @@
 """Unit tests for pure CLI utility functions."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -75,6 +76,12 @@ class TestNormalizeBackend:
     def test_k7_alias_maps_to_k7d(self):
         assert _normalize_backend("k7") == "k7d"
 
+    def test_k7d_fc_accepted(self):
+        assert _normalize_backend("k7d-fc") == "k7d-fc"
+
+    def test_k7_fc_alias_maps_to_k7d_fc(self):
+        assert _normalize_backend("k7-fc") == "k7d-fc"
+
 
 # --- _kubectl_cmd ---
 
@@ -109,6 +116,11 @@ _DUAL_STACK = json.dumps(
 
 
 class TestReadApiEndpoint:
+    @pytest.fixture(autouse=True)
+    def _ignore_on_node_endpoint_file(self, tmp_path: Path):
+        with patch("k7.cli.k7._ETC_K7_API_ENDPOINT", tmp_path / "missing"):
+            yield
+
     def test_returns_endpoint_on_success(self):
         port_proc = MagicMock(returncode=0, stdout="31007")
         node_proc = MagicMock(returncode=0, stdout=_SINGLE_STACK)
@@ -138,6 +150,14 @@ class TestReadApiEndpoint:
         with patch("k7.cli.k7.subprocess.run", side_effect=[port_proc, node_proc]):
             result = _read_api_endpoint(["kubectl"])
             assert result == "http://localhost:31007"
+
+    def test_https_when_service_targets_8443(self):
+        port_proc = MagicMock(returncode=0, stdout="31007,8443")
+        node_proc = MagicMock(returncode=0, stdout=_SINGLE_STACK)
+
+        with patch("k7.cli.k7.subprocess.run", side_effect=[port_proc, node_proc]):
+            result = _read_api_endpoint(["kubectl"])
+            assert result == "https://10.0.0.1:31007"
 
 
 # --- _build_default_inventory ---
@@ -239,6 +259,9 @@ class TestParseBackends:
 
     def test_aliases(self):
         assert _parse_backends("kfd,kql") == ["kata-firecracker-devmapper", "kata-qemu-longhorn"]
+
+    def test_k7d_fc_alias(self):
+        assert _parse_backends("k7d,k7-fc") == ["k7d", "k7d-fc"]
 
     def test_deprecated_aliases(self):
         assert _parse_backends("fd,ql") == ["kata-firecracker-devmapper", "kata-qemu-longhorn"]

@@ -1,6 +1,6 @@
-"""Cross-node Longhorn replication integration tests (spec 3c).
+"""Cross-node Longhorn replication integration tests.
 
-These tests require a multi-node k7 cluster with topology affinity (specs 3a + 3b)
+These tests require a multi-node k7 cluster with topology affinity
 and Longhorn replicaCount >= 2. They are skipped on single-node setups.
 """
 

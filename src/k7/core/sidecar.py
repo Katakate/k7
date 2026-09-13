@@ -22,6 +22,10 @@ class SidecarSpec:
 
 
 SIDECAR_REGISTRY: dict[str, SidecarSpec] = {
+    # Deprecated as the user-facing Docker path (``--docker``). Nothing
+    # routes Docker through this entry on any
+    # backend. Kept so a real CRI sidecar still injects, and so
+    # ``k7 fork`` on k7d can still reject it loudly (test_k7d_sidecar_fork_rejected_loudly).
     "docker": SidecarSpec(
         image="docker:27.5-dind",
         socket_mount="/var/run",

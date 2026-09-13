@@ -35,7 +35,7 @@ whose fork carries live memory. kfd has no fork by design. Docker-in-VM
 sidecar (`--sidecar docker`) works on all three; k7d's `hello-world` pull
 is the slow path (tmpfs + virtio + NAT), matching the 2026-08-10 note.
 
-## Backend lifecycle: kql vs k7d — 2026-08-10 (spec 9a M11)
+## Backend lifecycle: kql vs k7d — 2026-08-10
 
 Hetzner AX41 dedicated node (Ryzen 5 3600, 64 GiB, NVMe), Ubuntu 24.04,
 kernel 6.8.0-137, k3s v1.36.3, flannel CNI, Longhorn 1.10 (r=1), k7d 0.1.0.
@@ -90,7 +90,7 @@ Fork is ~3x slower than a cold create. The snapshot and clone PVC steps add ~6s,
 
 Measured via integration tests (`tests/integration/test_qemu.py`) on 2026-04-10.
 
-## Docker workloads inside sandboxes — 2026-05-29 (spec 10b)
+## Docker workloads inside sandboxes — 2026-05-29
 
 Hetzner AX52 dedicated node (Ryzen 7 7700, 64 GiB, NVMe), Ubuntu 24.04,
 kernel 6.8.0-100, k3s v1.35.5, docker host 29.5.2 / sandbox 27.5.1,
@@ -238,14 +238,14 @@ Raw per-leg logs and the aggregated CSV are under `bench/docker-perf/results/`
 (gitignored — keep them in agent or local scratch space, paste into the
 table above when adding a new run).
 
-## Docker-in-VM under real Longhorn replica counts (2026-08, spec 18e/18h)
+## Docker-in-VM under real Longhorn replica counts (2026-08)
 
 The "r=2 vs r=1 indistinguishable" result above is **invalid**: the old
 bench patched a Longhorn *setting* that only affects newly-created volumes,
 so both legs actually ran r=1 (CHALLENGES.md #2). `bench_docker_perf.py` now
 sets real per-volume replica counts (`k7-ql-r3` leg). Host / kfd / r1 / r2
-medians from the 18e HA run (5 reps); **k7-ql-r3 column re-filled in
-spec 18h** after the virtiofsd wedge fix (5 reps, zero VM restarts):
+medians from the HA run (5 reps); **k7-ql-r3 column re-filled later** after
+the virtiofsd wedge fix (5 reps, zero VM restarts):
 
 | op | host | k7-fd | k7-ql-r1 | k7-ql-r2 | k7-ql-r3 |
 |---|---|---|---|---|---|
@@ -254,37 +254,132 @@ spec 18h** after the virtiofsd wedge fix (5 reps, zero VM restarts):
 | run read (venv tree cat) | — | — | — | — | 47.7s |
 | run cpu (10s budget) | 10.5s | 10.4s | 41.5s | 47.8s | 56.4s |
 
-Two takeaways (spec 18f issue 8 / 18h):
+Two takeaways:
 
 - **The r1→r2 jump dominates the redundancy cost** (build 108→271s; r2→r3
   adds only ~8% on build): the second replica forces synchronous
   cross-node writes, the third mostly parallelizes with them. Post-wedge
   r3 `run io` (88.3s) is higher than the old single-rep 64.5s sample —
   that sample was the lucky survivor of a ~50% kill rate, not a median.
-- **kql-r3 IO wedge — root-caused and FIXED (spec 18g):** the "VM exec
-  path dies after a run_io rep" wedge was not guest memory, not dockerd,
-  and not Longhorn faulting — the guest was healthy (load 0.4, 1.5 GB
-  free, zero dirty pages, clean dmesg) at the moment of death. The killer
-  was the **kata shim**: kata's default virtiofsd runs with
+- **kql-r3 IO wedge — root-caused and FIXED:** the "VM exec path dies
+  after a run_io rep" wedge was not guest memory, not dockerd, and not
+  Longhorn faulting — the guest was healthy (load 0.4, 1.5 GB free, zero
+  dirty pages, clean dmesg) at the moment of death. The killer was the
+  **kata shim**: kata's default virtiofsd runs with
   `--thread-pool-size=1`, so all virtio-fs IO (container rootfs + the
-  Longhorn-PVC-backed `/var/lib/docker`) serializes through one thread.
-  A `docker run` of the ~790 MB bench image makes vfs copy the whole
-  rootfs and then fsync 512 MB through that single thread against an
-  r=3 volume (~60–80 s saturated); any agent RPC touching virtio-fs
-  blocks behind it, the shim's agent health ping (`CheckRequest`) times
-  out, and the shim declares "Dead agent" and kills the healthy VM
-  (`sandbox stopped unexpectedly`, pod sandbox recreated). Repro rate was
-  ~50% per run_io rep. Fix: `k7 install` now sets
-  `virtio_fs_extra_args = ["--thread-pool-size=16", ...]` in the
-  kata-qemu config — 18h re-ran 5/5 `run_io` + 5/5 `run_read` with zero
-  VM restarts on the same r=3 volume (`run_read` median 47.7s).
-  Exec-probe pressure was reduced too (kubelet's default 1 s exec-probe
-  timeout sprayed cancelled ttrpc execs — `docker info` legitimately
-  takes >1 s while dockerd copies vfs layers), which cuts the
-  `ttrpc: received message on inactive stream` noise but was NOT
-  sufficient on its own.
+  Longhorn-PVC-backed `/var/lib/docker`) serializes through one thread. A
+  `docker run` of the ~790 MB bench image makes vfs copy the whole rootfs
+  and then fsync 512 MB through that single thread against an r=3 volume
+  (~60–80 s saturated); any agent RPC touching virtio-fs blocks behind
+  it, the shim's agent health ping (`CheckRequest`) times out, and the
+  shim declares "Dead agent" and kills the healthy VM (`sandbox stopped
+  unexpectedly`, pod sandbox recreated). Repro rate was ~50% per run_io
+  rep. Fix: `k7 install` now sets `virtio_fs_extra_args =
+  ["--thread-pool-size=16", ...]` in the kata-qemu config — we re-ran 5/5
+  `run_io` + 5/5 `run_read` with zero VM restarts on the same r=3 volume
+  (`run_read` median 47.7s). Exec-probe pressure was reduced too
+  (kubelet's default 1 s exec-probe timeout sprayed cancelled ttrpc execs
+  — `docker info` legitimately takes >1 s while dockerd copies vfs
+  layers), which cuts the `ttrpc: received message on inactive stream`
+  noise but was NOT sufficient on its own.
 
-## k7d docker-perf leg (2026-08-11, partial)
+## k7d vs k7d-fc `--docker` overlay2 — 2026-09-10
+
+Same node as the 08-10 lifecycle cut (k7-node-01 / Hetzner AX41, Ryzen 5
+3600, 64 GiB, NVMe), Ubuntu 24.04, kernel 6.8.0-139, k3s v1.36.3, k7d
+0.5.0 (locally built artifact, not the public GitHub tarball of the same
+version string). Guests 3Gi / 4 CPU, `DOCKER_BUILDKIT=0`, graph on
+virtio-blk scratch, `Storage Driver: overlay2` on the source **and** on
+the forked child. 3 runs per cell after one warm-up; median (range).
+⚠ marks `(max−min)/median > 0.30`.
+
+```bash
+K7_BENCH_ENVS=k7d,k7d-fc K7_BENCH_REPS=3 K7_BENCH_WARMUP=1 \
+  K7_BENCH_OUT=/tmp/bench-out \
+  uv run pytest -m bench tests/integration/bench_docker_perf.py::test_bench_k7d \
+    tests/integration/bench_docker_perf.py::test_bench_k7d_fc -v -s
+uv run python bench/docker-perf/render.py -i /tmp/bench-out/bench-results-*.csv \
+  --title "k7d vs k7d-fc --docker overlay2" --hardware "<one-line note>"
+```
+
+| Operation                 | k7d | k7d-fc |
+|---------------------------|-----|--------|
+| pull debian:12-slim       | 11.3 s (9.06 s–11.5 s) | ⚠ 8.16 s (7.24 s–11.2 s) |
+| build (no-cache)          | 52.0 s (49.8 s–53.2 s) | 51.6 s (50.4 s–52.5 s) |
+| build (cached)            | ⚠ 469 ms (269 ms–477 ms) | 470 ms (369 ms–471 ms) |
+| run cpu (10s budget)      | 10.8 s (10.7 s–10.8 s) | 10.7 s (10.6 s–10.7 s) |
+| run io (2k small + 512 MB)| ⚠ 1.18 s (1.11 s–1.48 s) | 1.28 s (1.28 s–1.38 s) |
+| run read (venv tree cat)  | 774 ms (674 ms–789 ms) | 674 ms (670 ms–777 ms) |
+| fork warm engine (API)    | 6.23 s (n=1) | 8.35 s (n=1) |
+| fork → Ready + overlay2   | 6.79 s (n=1) | 9.13 s (n=1) |
+
+Forked-child log line: `# storage_driver_child=Storage Driver: overlay2` on
+both backends (`TestDockerK7d` / `TestDockerK7dFc` also assert this).
+
+k7d-fc is host-parity with k7d on the storage-bound ops (no-cache build
+~52 s, `run_io` ~1.3 s, `run_read` ~0.7 s). That is the overlay2 /
+virtio-blk number, not the vfs-shaped ~37 s `run_io` in the earlier
+sidecar rows or the 4.24 s kql Longhorn-block overlay2 row. Warm-engine
+fork is the k8s adopt path (not the ~5 ms VMM CoW floor); alpine
+create→Ready / fork→exec on the same node this run were **2.15 s /
+2.54 s** (k7d) and **2.14 s / 2.45 s** (k7d-fc), n=1.
+
+k7-fc CRI exec after pause/resume hung (readiness probe timeout,
+`guest_cid=0` retained) — see CHALLENGES #17. Do not quote a
+resume→exec number for k7d-fc from this cut.
+
+## k7d `--docker` (first-class guest service)
+
+`k7 create --docker --backend k7d ubuntu:24.04` stamps
+`k7d.katakate.org/docker=true` (no sidecar, no privileged). Graph is a
+per-sandbox virtio-blk scratch disk (overlay2), so `run io` is no longer
+vfs/tmpfs-shaped. `k7 fork` of a warm engine is in-scope: the child keeps
+dockerd and running inner containers.
+
+Reproduce:
+
+```bash
+K7_BENCH_ENVS=k7d K7_BENCH_REPS=1 K7_BENCH_WARMUP=0 \
+  uv run pytest -m bench tests/integration/bench_docker_perf.py::test_bench_k7d -v -s
+```
+
+1-rep log from k7-node-01 (2026-09-07, k7d + guest docker payload). **Superseded**
+by the 2026-09-10 k7d vs k7d-fc table above (full pull/build/cpu/io/read
+column, child overlay2). Kept as the first overlay2 `run_io` datapoint:
+
+| op | k7d `--docker` | notes |
+|---|---|---|
+| `run_io` | **1.24 s** | overlay2 on virtio-blk; 2k files + 512 MB fsync |
+| `fork_warm_engine` | **6.26 s** | CoW of live dockerd (not the 100–300 ms memory-fork floor; includes k7 Deployment adopt) |
+
+Historical sidecar/tmpfs numbers from 2026-08-11 are in the section below.
+
+## kql `--docker` (overlay2 on Longhorn block)
+
+`k7 create --docker --backend kql ubuntu:24.04` injects a privileged
+`docker-vehicle` and a second Longhorn **Block** PVC (`<name>-docker-lh`).
+The graph is ext4 on that device; dockerd is forced to overlay2. This is
+the number that used to be vfs-shaped (~37 s `run_io` in the earlier
+sidecar/subPath rows above). Do not treat a vfs `run_io` as the kql
+`--docker` baseline.
+
+Reproduce:
+
+```bash
+K7_BENCH_ENVS=k7-ql-r1 K7_BENCH_REPS=1 K7_BENCH_WARMUP=0 \
+  uv run pytest -m bench tests/integration/bench_docker_perf.py::test_bench_k7_ql_r1 -v -s
+```
+
+Numbers from this increment (<node-ip> / k7-node-01, 2026-09-10,
+`K7_BENCH_ENVS=k7-ql-r1 K7_BENCH_REPS=1 K7_BENCH_WARMUP=0`,
+`# docker_data_path=longhorn-block-overlay2`,
+`Storage Driver: overlay2`, Docker 27.5.1, Longhorn r=1 on one node):
+
+| op | kql `--docker` overlay2 / Longhorn block | notes |
+|---|---|---|
+| `run_io` | **4.24 s** | 2k files + 512 MB `dd conv=fsync`; overlay2 on Block PVC (not the ~37 s vfs row) |
+
+## k7d docker-perf leg (2026-08-11, partial, **sidecar / tmpfs**, superseded)
 
 `test_bench_k7d` is wired (`K7_BENCH_ENVS=k7d`). Guest sized at **3Gi /
 4 vCPU** — largest size that reliably reaches Ready on this k7d build;

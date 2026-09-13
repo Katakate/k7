@@ -56,9 +56,11 @@ class SandboxProxy:
 class Client:
     """K7 Python SDK Client."""
 
-    def __init__(self, endpoint: str, api_key: str, verify_ssl: bool = True):
+    def __init__(self, endpoint: str, api_key: str, verify_ssl: bool | str = True):
         self.base_url = endpoint.rstrip("/")
         self.api_key = api_key
+        if self.base_url.startswith("https://") and verify_ssl is False:
+            raise ValueError("verify_ssl=False is not allowed for https:// endpoints")
         self.session = requests.Session()
         self.session.headers.update({"X-API-Key": api_key})
         self.session.verify = verify_ssl
@@ -70,7 +72,18 @@ class Client:
         return data
 
     def create(self, sandbox_config: dict) -> SandboxProxy:
-        """Create a new sandbox and return a proxy object."""
+        """Create a new sandbox and return a proxy object.
+
+        Ingress is denied unless asked for::
+
+            client.create({
+                "name": "web",
+                "image": "python:3.12-slim",
+                "ingress_ports": [8000],
+                "ingress_from": ["sandbox:client-a"],  # default: same-namespace sandboxes
+                # "expose_ports": [8000],  # NodePort outside the cluster; needs the same ingress_ports
+            })
+        """
         response = self.session.post(f"{self.base_url}/api/v1/sandboxes", json=sandbox_config)
         response.raise_for_status()
 
@@ -180,7 +193,7 @@ class Client:
         return SandboxProxy(new_name, namespace, self)
 
     # ------------------------------------------------------------------
-    # Spec 10e: VolumeSnapshot CRUD + GC.
+    # VolumeSnapshot CRUD + GC.
     # ------------------------------------------------------------------
 
     def list_snapshots(
@@ -249,12 +262,12 @@ class Client:
         overrides: dict | None = None,
         keep_snapshot: bool = True,
     ) -> SandboxProxy:
-        """Restore a brand-new sandbox from a standalone VolumeSnapshot (Spec 10f).
+        """Restore a brand-new sandbox from a standalone VolumeSnapshot.
 
         ``overrides`` is a JSON-serialisable dict matching ``SandboxConfigOverrides``
         on the server (keys: ``image``, ``backend``, ``root_disk_size``, ``sidecar``,
         ``limits``, ``entrypoint``, ``cmd``, ``before_script``). Pass at minimum
-        ``{"image": "..."}`` if the snapshot was created before Spec 10f and
+        ``{"image": "..."}`` if the snapshot is an old one and
         therefore lacks the ``k7.io/source-image`` annotation.
 
         Returns a ``SandboxProxy`` for the new sandbox. The server-side restore
@@ -326,12 +339,14 @@ class AsyncClient:
         self,
         endpoint: str,
         api_key: str,
-        verify_ssl: bool = True,
+        verify_ssl: bool | str = True,
         timeout: float = 30.0,
     ):
         if httpx is None:
             raise RuntimeError("httpx is required for AsyncClient. Install with `pip install httpx`.")
         self.base_url = endpoint.rstrip("/")
+        if self.base_url.startswith("https://") and verify_ssl is False:
+            raise ValueError("verify_ssl=False is not allowed for https:// endpoints")
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={"X-API-Key": api_key},

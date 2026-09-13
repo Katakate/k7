@@ -1,11 +1,11 @@
-"""TOML config file CRUD + ``k7 config`` sub-app (Spec 10g).
+"""TOML config file CRUD + ``k7 config`` sub-app.
 
 Stores per-user CLI config at ``$XDG_CONFIG_HOME/k7/config.toml``
 (falling back to ``~/.config/k7/config.toml``). The single supported
-section today is ``[api]`` with ``url`` and ``key`` keys — enough to
-power the ``_resolve_api_url`` / ``_resolve_api_key`` chain in
-``_client.py`` so users don't have to pass ``--api-url`` /
-``--api-key`` on every invocation.
+section today is ``[api]`` with ``url``, ``key``, and ``ca`` keys —
+enough to power the URL / key / CA chain in ``_client.py`` so users
+don't have to pass ``--api-url`` / ``--api-key`` / ``--api-ca`` on
+every invocation.
 
 The file is the same posture as ``~/.docker/config.json`` and
 ``~/.kube/config`` — plaintext, chmod 0600 on write. A future spec
@@ -24,7 +24,7 @@ from pathlib import Path
 import typer
 
 CONFIG_DIR_ENV = "K7_CONFIG_DIR"  # tests override this to a tmp path
-_SUPPORTED_KEYS: set[str] = {"api.url", "api.key"}
+_SUPPORTED_KEYS: set[str] = {"api.url", "api.key", "api.ca"}
 
 
 def _config_dir() -> Path:
@@ -53,7 +53,7 @@ def _toml_loads_simple(text: str) -> dict:
     """Tiny TOML reader for the section-of-string-values shape this file uses.
 
     Python 3.10 (k7's minimum) lacks ``tomllib`` and we don't want to add
-    ``tomli`` just for two-key parsing. Supports::
+    ``tomli`` just for this file. Supports::
 
         [api]
         url = "https://10.0.0.1:31000"

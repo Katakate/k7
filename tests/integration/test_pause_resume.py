@@ -1,4 +1,4 @@
-"""Integration tests for ``k7 pause`` after Spec 10c.
+"""Integration tests for ``k7 pause``.
 
 These tests live alongside ``tests/integration/test_qemu.py`` (which already
 covers pause/resume/fork via K7Core directly) and exercise the **CLI surface**:
@@ -31,8 +31,8 @@ def _run_cli(*args: str, check: bool = True, timeout: int = 60) -> subprocess.Co
     """Invoke ``dev.sh <args>``.
 
     Forces the ``--core`` global flag so these CLI-flag-handling tests don't
-    require ``K7_API_URL`` / ``K7_API_KEY`` (Spec 10g made the default route
-    the API). Tests that need the API-routed path go through the SDK / HTTP
+    require ``K7_API_URL`` / ``K7_API_KEY`` (the default route is the
+    API). Tests that need the API-routed path go through the SDK / HTTP
     fixtures in ``test_api.py``.
     """
     cmd = [str(_DEV_SH), "--core", *args]
@@ -128,8 +128,8 @@ def ql_sandbox(k7_core: K7Core, test_namespace: str):
 
 
 class TestPauseSnapshotBugRegression:
-    """Spec 10c: ``k7 pause foo --snapshot=bar`` (without ``--pvc``) **must**
-    create a real ``VolumeSnapshot``. Pre-10c this silently did nothing.
+    """``k7 pause foo --snapshot=bar`` (without ``--pvc``) **must**
+    create a real ``VolumeSnapshot``. This used to silently do nothing.
     """
 
     def test_pause_with_snapshot_actually_creates_one(
@@ -146,7 +146,7 @@ class TestPauseSnapshotBugRegression:
             while time.time() < deadline and not _snapshot_exists(snap, test_namespace):
                 time.sleep(2)
             assert _snapshot_exists(snap, test_namespace), (
-                f"VolumeSnapshot {snap} was never created — the spec 10c bug regressed"
+                f"VolumeSnapshot {snap} was never created — the pause bug regressed"
             )
         finally:
             subprocess.run(
@@ -226,7 +226,7 @@ class TestPauseSnapshotBugRegression:
 
 
 class TestRemovedPauseFlags:
-    """Spec 10c: ``--pvc`` and ``--snapshot-class`` were removed from ``k7 pause``."""
+    """``--pvc`` and ``--snapshot-class`` were removed from ``k7 pause``."""
 
     def test_pvc_flag_rejected(self, test_namespace: str):
         result = subprocess.run(

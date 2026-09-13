@@ -1,4 +1,4 @@
-"""Unit tests for the Spec 10d ``k7 api ...`` sub-app + deprecation aliases.
+"""Unit tests for the ``k7 api ...`` sub-app + deprecation aliases.
 
 Coverage:
 
@@ -11,6 +11,8 @@ Coverage:
   forward to the new home.
 - ``k7 install --no-api`` passes ``k7_api_enabled=false`` into the
   Ansible extra_vars (which is what the playbook actually keys off).
+- ``k7 install --hubble`` passes ``k7_hubble_enabled=true``; combined
+  with ``--cni flannel`` it fails loudly.
 """
 
 from __future__ import annotations
@@ -220,6 +222,48 @@ class TestInstallNoApi:
         assert result.exit_code == 0, result.output
         extra_vars = seen["kwargs"]["extra_vars"]
         assert extra_vars.get("k7_api_enabled") == "true"
+
+
+class TestInstallHubble:
+    def test_install_hubble_passes_k7_hubble_enabled_true(self):
+        seen: dict = {}
+
+        def _capture(*args, **kwargs):
+            seen["kwargs"] = kwargs
+            return SimpleNamespace(success=True, message="ok", error="")
+
+        with (
+            patch("k7.cli.k7.K7Core") as core_cls,
+            patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
+        ):
+            core_cls.return_value.install_node = _capture
+            result = runner.invoke(app, ["install", "--hubble", "host"])
+        assert result.exit_code == 0, result.output
+        extra_vars = seen["kwargs"]["extra_vars"]
+        assert extra_vars.get("k7_hubble_enabled") == "true"
+
+    def test_install_without_hubble_passes_k7_hubble_enabled_false(self):
+        seen: dict = {}
+
+        def _capture(*args, **kwargs):
+            seen["kwargs"] = kwargs
+            return SimpleNamespace(success=True, message="ok", error="")
+
+        with (
+            patch("k7.cli.k7.K7Core") as core_cls,
+            patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
+        ):
+            core_cls.return_value.install_node = _capture
+            result = runner.invoke(app, ["install", "host"])
+        assert result.exit_code == 0, result.output
+        extra_vars = seen["kwargs"]["extra_vars"]
+        assert extra_vars.get("k7_hubble_enabled") == "false"
+
+    def test_install_hubble_with_flannel_fails(self):
+        result = runner.invoke(app, ["install", "--hubble", "--cni", "flannel", "host"])
+        assert result.exit_code != 0
+        assert "--hubble requires the Cilium CNI" in result.output
+        assert "flannel" in result.output
 
 
 # ---------------------------------------------------------------------------

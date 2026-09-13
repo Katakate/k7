@@ -41,6 +41,7 @@ def _detect_backends() -> set[str]:
                     "kata-firecracker-devmapper",
                     "kata-qemu-longhorn",
                     "k7d",
+                    "k7d-fc",
                     "firecracker-devmapper",
                     "qemu-longhorn",
                 ):
@@ -57,7 +58,7 @@ def _detect_backends() -> set[str]:
                 "qemu-longhorn": "kata-qemu-longhorn",
             }
             backend = legacy.get(backend, backend)
-            if backend in ("kata-firecracker-devmapper", "kata-qemu-longhorn", "k7d"):
+            if backend in ("kata-firecracker-devmapper", "kata-qemu-longhorn", "k7d", "k7d-fc"):
                 return {backend}
     except FileNotFoundError:
         pass

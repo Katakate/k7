@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from k7.core.core import K7Core
+from k7.core.core import K7Core, _is_k7d_family
 from k7.core.models import SandboxConfig
 
 pytestmark = pytest.mark.bench
@@ -165,7 +165,13 @@ async def _bench_lifecycle(core: K7Core, recorder: Recorder, backend: str, names
     # --- create → Ready ---
     start = time.monotonic()
     result = await core.create_sandbox(
-        SandboxConfig(name=name, image=SANDBOX_IMAGE, namespace=namespace, backend=backend)
+        SandboxConfig(
+            name=name,
+            image=SANDBOX_IMAGE,
+            namespace=namespace,
+            backend=backend,
+            node_name=os.uname().nodename,
+        )
     )
     assert result.success, f"create failed: {result.error}"
     _wait(lambda: _pod_ready(name, namespace), 300, f"{name} Ready")
@@ -204,10 +210,10 @@ async def _bench_lifecycle(core: K7Core, recorder: Recorder, backend: str, names
         await _wait_exec(core, fork_name, namespace)
         recorder.add(backend, "fork_to_ready", time.monotonic() - t0)
 
-        if backend == "k7d":
+        if _is_k7d_family(backend):
             inherited = await core.exec_command(fork_name, "cat /tmp/bench-marker", namespace=namespace)
             assert inherited.exit_code == 0 and "inherited" in inherited.stdout, (
-                "k7d fork lost the source's in-memory state"
+                f"{backend} fork lost the source's in-memory state"
             )
 
         await core.delete_sandbox(fork_name, namespace=namespace)
@@ -216,7 +222,7 @@ async def _bench_lifecycle(core: K7Core, recorder: Recorder, backend: str, names
         t0 = time.monotonic()
         pause = await core.pause_sandbox(name, namespace=namespace)
         assert pause.success, f"pause failed: {pause.error}"
-        if backend != "k7d":
+        if not _is_k7d_family(backend):
             _wait(lambda: _no_pods(name, namespace), 180, f"{name} pods gone")
         recorder.add(backend, "pause_effective", time.monotonic() - t0)
 
@@ -276,6 +282,9 @@ async def test_bench_backend_lifecycle(k7_core: K7Core, test_namespace: str):
             print(f"  rep {rep + 1}/{REPS} backend={backend}", flush=True)
             await _bench_lifecycle(k7_core, recorder, backend, test_namespace, rep)
     for backend in BACKENDS:
+        if _is_k7d_family(backend):
+            print(f"  skip sidecar backend={backend} (use bench_docker_perf --docker)", flush=True)
+            continue
         print(f"  sidecar backend={backend}", flush=True)
         await _bench_sidecar(k7_core, recorder, backend, test_namespace, 0)
 

@@ -11,12 +11,54 @@ import subprocess
 import time
 from pathlib import Path
 
-import httpx
+import httpx as _httpx
 import pytest
 
 pytestmark = pytest.mark.integration
 
+
+class _Httpx:
+    """httpx wrapper that trusts the playbook CA when the API is HTTPS."""
+
+    ConnectError = _httpx.ConnectError
+
+    def get(self, *args, **kwargs):
+        kwargs.setdefault("verify", _tls_verify())
+        return _httpx.get(*args, **kwargs)
+
+    def post(self, *args, **kwargs):
+        kwargs.setdefault("verify", _tls_verify())
+        return _httpx.post(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        kwargs.setdefault("verify", _tls_verify())
+        return _httpx.delete(*args, **kwargs)
+
+    def Client(self, *args, **kwargs):
+        kwargs.setdefault("verify", _tls_verify())
+        return _httpx.Client(*args, **kwargs)
+
+
+httpx = _Httpx()
+
 K7_API_KEYS_FILE = Path("/etc/k7/api_keys.json")
+_API_ENDPOINT_FILE = Path("/etc/k7/api_endpoint")
+_API_CA_FILE = Path("/etc/k7/tls/ca.crt")
+
+
+def _tls_verify() -> bool | str:
+    """httpx/SDK ``verify`` for the current install."""
+    endpoint = _API_ENDPOINT_FILE.read_text().strip() if _API_ENDPOINT_FILE.exists() else ""
+    if endpoint.startswith("http://"):
+        return False
+    if _API_CA_FILE.exists():
+        return str(_API_CA_FILE)
+    return bool(endpoint.startswith("https://"))
+
+
+def _api_scheme() -> str:
+    verify = _tls_verify()
+    return "http" if verify is False else "https"
 
 
 def _get_api_base_url() -> str:
@@ -29,7 +71,7 @@ def _get_api_base_url() -> str:
     if result.returncode != 0 or not result.stdout.strip():
         pytest.skip("k7-api service not found — run 'k7 install' or 'k7 api enable' first")
     port = result.stdout.strip()
-    return f"http://127.0.0.1:{port}"
+    return f"{_api_scheme()}://127.0.0.1:{port}"
 
 
 def _api_pod_ready() -> bool:
@@ -80,6 +122,19 @@ def _generate_test_api_key(*, name: str = "integration-test", namespaces: list[s
     os.chmod(K7_API_KEYS_FILE, 0o600)
     os.chown(K7_API_KEYS_FILE, 1000, 1000)
     return token
+
+
+def _revoke_test_api_key(name: str) -> None:
+    """Remove a test key by name from the on-disk store (try/finally cleanup)."""
+    import os
+
+    if not K7_API_KEYS_FILE.exists():
+        return
+    keys = json.loads(K7_API_KEYS_FILE.read_text())
+    keys = {h: d for h, d in keys.items() if d.get("name") != name}
+    K7_API_KEYS_FILE.write_text(json.dumps(keys, indent=2))
+    os.chmod(K7_API_KEYS_FILE, 0o600)
+    os.chown(K7_API_KEYS_FILE, 1000, 1000)
 
 
 @pytest.fixture(scope="module")
@@ -216,7 +271,7 @@ class TestApiSandboxLifecycle:
             headers=api_headers,
             timeout=30,
         )
-        assert dr.status_code == 200
+        assert dr.status_code == 200, dr.text
 
         # Confirm gone
         gr2 = httpx.get(
@@ -307,7 +362,7 @@ def cleanup_sandbox(api_base_url: str, api_headers: dict):
 
 
 class TestApiPauseResumeFork:
-    """Spec 10a — pause/resume/fork via the HTTP API, multi-node cluster.
+    """Pause/resume/fork via the HTTP API, multi-node cluster.
 
     Uses kata-qemu-longhorn (only backend that supports snapshot + fork).
     """
@@ -383,7 +438,7 @@ class TestApiPauseResumeFork:
         assert r.status_code == 201, r.text
         _wait_for_sandbox_ready(api_base_url, api_headers, name, test_namespace)
 
-        # Spec 10c: ``snapshot`` alone is enough — pvc/snapshot_class derived server-side.
+        # ``snapshot`` alone is enough — pvc/snapshot_class derived server-side.
         pr = httpx.post(
             f"{api_base_url}/api/v1/sandboxes/{name}/pause",
             json={"namespace": test_namespace, "snapshot": snap},
@@ -563,7 +618,7 @@ class TestSdkSandboxProxy:
     ):
         from k7_sdk import Client
 
-        c = Client(endpoint=api_base_url, api_key=api_key, verify_ssl=False)
+        c = Client(endpoint=api_base_url, api_key=api_key, verify_ssl=_tls_verify())
         name = "sdk-prf"
         child = "sdk-prf-child"
         cleanup_sandbox(name, test_namespace)
@@ -606,7 +661,7 @@ class TestSdkSandboxProxy:
 
 
 # ---------------------------------------------------------------------------
-# Spec 10h: SSRF guard + API-key namespace authorization
+# SSRF guard + API-key namespace authorization
 # ---------------------------------------------------------------------------
 
 
@@ -774,3 +829,27 @@ class TestApiNamespaceAuthz:
             timeout=30,
         )
         assert dr.status_code == 200, dr.text
+
+    def test_scoped_key_nodes_storage_forbidden(self, api_base_url: str, api_headers: dict):
+        """Cluster-scoped GET /nodes/storage is 403 for a scoped key; unscoped still 200."""
+        scoped_name = "integ-scoped-nodes-storage"
+        scoped = _generate_test_api_key(name=scoped_name, namespaces=["alpha"])
+        try:
+            scoped_r = httpx.get(
+                f"{api_base_url}/api/v1/nodes/storage",
+                headers={"X-API-Key": scoped},
+                timeout=30,
+            )
+            assert scoped_r.status_code == 403, scoped_r.text
+            assert "all-namespaces" in scoped_r.json()["error"]["message"]
+
+            unscoped_r = httpx.get(
+                f"{api_base_url}/api/v1/nodes/storage",
+                headers=api_headers,
+                timeout=120,
+            )
+            assert unscoped_r.status_code == 200, unscoped_r.text
+            data = unscoped_r.json()["data"]
+            assert isinstance(data, dict) and data, f"expected per-node map, got {data}"
+        finally:
+            _revoke_test_api_key(scoped_name)

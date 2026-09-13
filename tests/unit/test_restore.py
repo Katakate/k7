@@ -1,4 +1,4 @@
-"""Unit tests for the Spec 10f restore-from-snapshot surface.
+"""Unit tests for the restore-from-snapshot surface.
 
 Coverage:
 
@@ -105,6 +105,20 @@ class TestRehydrateConfigFromSnapshot:
         assert result.data.image == "alpine:3.20"
         # Falls back to default backend when neither annotation nor override set.
         assert result.data.backend == "kata-qemu-longhorn"
+
+    def test_docker_annotation_sets_docker_true(self, core: K7Core):
+        ann = {
+            "k7.io/source-image": "ubuntu:24.04",
+            "k7.io/source-backend": "kata-qemu-longhorn",
+            "k7.io/source-docker": "true",
+            "k7.io/source-docker-disk": "20Gi",
+        }
+        result = core._rehydrate_config_from_snapshot(
+            annotations=ann, new_name="r", namespace="default", overrides=None
+        )
+        assert result.success
+        assert result.data.docker is True
+        assert result.data.docker_disk == "20Gi"
 
     def test_malformed_limits_annotation_falls_back_to_none(self, core: K7Core):
         ann = {"k7.io/source-image": "alpine:3.20", "k7.io/source-limits": "not json"}

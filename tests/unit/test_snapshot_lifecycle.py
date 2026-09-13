@@ -1,4 +1,4 @@
-"""Unit tests for the Spec 10e snapshot lifecycle (kind inference + gc filters).
+"""Unit tests for the snapshot lifecycle (kind inference + gc filters).
 
 These exercise ``K7Core`` directly with mocked Kubernetes custom-objects API
 calls, so no cluster is required. They cover:
@@ -12,7 +12,9 @@ calls, so no cluster is required. They cover:
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from kubernetes_asyncio.client.exceptions import ApiException
 
 from k7.core.core import K7Core
 from k7.core.models import (
@@ -107,7 +109,13 @@ def _patch_list(core: K7Core, items: list[dict]) -> None:
     """Patch the dynamic K8s client so ``list_snapshots`` returns ``items``."""
     mock_custom = AsyncMock()
     mock_custom.list_namespaced_custom_object.return_value = {"items": items}
-    mock_custom.list_cluster_custom_object.return_value = {"items": items}
+
+    async def _list_cluster(*, plural: str = "", **_kwargs):
+        if plural == "volumesnapshotcontents":
+            return {"items": []}
+        return {"items": items}
+
+    mock_custom.list_cluster_custom_object.side_effect = _list_cluster
     core._custom_objects_client = mock_custom
     core._config_loaded = True
 
@@ -211,3 +219,76 @@ class TestGcSnapshots:
         assert len(result.data) == 1
         assert result.data[0]["deleted"] is False
         assert "transient" in result.data[0]["error"]
+
+    async def test_reaps_orphan_volumesnapshotcontent(self, core: K7Core):
+        items = [
+            _make_snap(
+                "demo-fork-1700000000",
+                annotations={"k7.io/kind": SNAPSHOT_KIND_FORK, "k7.io/source-sandbox": "demo"},
+                age_minutes=5,
+            ),
+        ]
+        vsc = {
+            "kind": "VolumeSnapshotContent",
+            "metadata": {"name": "snapcontent-orphan", "deletionTimestamp": "2026-09-07T22:00:00Z"},
+            "spec": {"volumeSnapshotRef": {"name": "gone-snap", "namespace": "k7-test-abcd"}},
+        }
+
+        mock_custom = AsyncMock()
+
+        async def _list_cluster(*, plural: str, **_kwargs):
+            if plural == "volumesnapshotcontents":
+                return {"items": [vsc]}
+            return {"items": items}
+
+        mock_custom.list_cluster_custom_object.side_effect = _list_cluster
+        mock_custom.list_namespaced_custom_object.return_value = {"items": items}
+        mock_custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+        mock_custom.patch_cluster_custom_object.return_value = {}
+        mock_custom.delete_cluster_custom_object.return_value = {}
+        core._custom_objects_client = mock_custom
+        core._config_loaded = True
+
+        v1 = MagicMock()
+        v1.list_namespaced_persistent_volume_claim = AsyncMock(return_value=MagicMock(items=[]))
+        core._core_v1_client = v1
+
+        with patch.object(core, "delete_snapshot", new_callable=AsyncMock) as del_snap:
+            result = await core.gc_snapshots(namespace="k7-test-abcd", keep_fork_for=timedelta(minutes=10))
+
+        del_snap.assert_not_called()
+        assert result.success is True
+        assert [r["name"] for r in result.data] == ["snapcontent-orphan"]
+        assert result.data[0]["kind"] == "volumesnapshotcontent"
+        assert result.data[0]["deleted"] is True
+        mock_custom.delete_cluster_custom_object.assert_awaited()
+        patch_kwargs = mock_custom.patch_cluster_custom_object.await_args.kwargs
+        assert patch_kwargs.get("_content_type") == "application/merge-patch+json"
+
+    async def test_leaves_volumesnapshotcontent_for_live_snapshot(self, core: K7Core):
+        live = _make_snap(
+            "exp-baseline",
+            annotations={"k7.io/kind": SNAPSHOT_KIND_NAMED, "k7.io/source-sandbox": "demo"},
+            source_pvc="demo-root-lh",
+        )
+        vsc = {
+            "kind": "VolumeSnapshotContent",
+            "metadata": {"name": "snapcontent-live"},
+            "spec": {"volumeSnapshotRef": {"name": "exp-baseline", "namespace": "default"}},
+        }
+        mock_custom = AsyncMock()
+
+        async def _list_cluster(*, plural: str, **_kwargs):
+            if plural == "volumesnapshotcontents":
+                return {"items": [vsc]}
+            return {"items": [live]}
+
+        mock_custom.list_cluster_custom_object.side_effect = _list_cluster
+        mock_custom.list_namespaced_custom_object.return_value = {"items": [live]}
+        mock_custom.get_namespaced_custom_object.return_value = live
+        core._custom_objects_client = mock_custom
+        core._config_loaded = True
+
+        result = await core.gc_snapshots()
+        assert result.data == []
+        mock_custom.delete_cluster_custom_object.assert_not_called()

@@ -1,10 +1,10 @@
-"""Cluster-wide VMM process leak detection (spec 18f issue 1b).
+"""Cluster-wide VMM process leak detection.
 
 Under parallel kata-fc pod churn the kata shim intermittently fails to
 kill the Firecracker microVM on pod deletion (shim logs "Agent did not
 stop sandbox: Dead agent" / "getting vm status failed: ...
 firecracker.socket: no such file or directory"), leaving orphaned
-``firecracker`` processes spinning at 100% CPU. Spec 18e observed 14
+``firecracker`` processes spinning at 100% CPU. An HA run observed 14
 orphans across the cluster with zero live Kata pods.
 
 This module is named ``test_zz_*`` so pytest runs it LAST: after the
@@ -39,8 +39,14 @@ def _kubectl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 
 def _node_names() -> list[str]:
-    out = _kubectl("get", "nodes", "-o", "jsonpath={.items[*].metadata.name}").stdout
-    return out.split()
+    """Ready nodes only — a NotReady peer cannot run the hostPID scan pod."""
+    data = json.loads(_kubectl("get", "nodes", "-o", "json").stdout)
+    names: list[str] = []
+    for node in data.get("items", []):
+        conds = {c["type"]: c["status"] for c in node.get("status", {}).get("conditions", [])}
+        if conds.get("Ready") == "True":
+            names.append(node["metadata"]["name"])
+    return names
 
 
 def _live_kata_pods_per_node() -> dict[str, dict[str, int]]:
@@ -135,7 +141,7 @@ class TestVmmProcessLeaks:
             "VMM process leak detected (did not converge within "
             f"{_CONVERGE_TIMEOUT}s):\n  " + "\n  ".join(mismatches) + "\n"
             "Orphaned firecracker processes spin at 100% CPU and starve the node "
-            "(spec 18f issue 1b / CHALLENGES.md #6). Inspect with "
+            "(CHALLENGES.md #6). Inspect with "
             "`ps -eo pid,ppid,comm,%cpu | grep -E 'firecracker|qemu'` on the node "
             "and check `journalctl -t kata` for 'Agent did not stop sandbox'."
         )

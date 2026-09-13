@@ -1,4 +1,4 @@
-# Docker workload benchmark — Spec 10b
+# Docker workload benchmark
 
 Quantifies the **storage tax** of running Docker inside a k7 sandbox vs
 natively on the host. Output lands in [`PERFORMANCE.md`](../../PERFORMANCE.md)
@@ -10,9 +10,11 @@ cited verbatim from any blog post.
 | Label       | What it is |
 |-------------|------------|
 | `host`      | Native Docker on the Hetzner node (no k7 involved) |
-| `k7-fd`     | k7 sandbox, `kata-firecracker-devmapper` (kfd) backend, `--sidecar docker` (docker daemon's `/var/lib/docker` is an emptyDir) |
-| `k7-ql-r1`  | k7 sandbox, `kata-qemu-longhorn` (kql) backend, `--sidecar docker`, Longhorn `replicas=1` |
+| `k7-fd`     | k7 sandbox, `kata-firecracker-devmapper` (kfd) backend, `--docker` vehicle (overlay2 on ephemeral LVM) |
+| `k7-ql-r1`  | k7 sandbox, `kata-qemu-longhorn` (kql) backend, `--docker` vehicle, Longhorn `replicas=1` |
 | `k7-ql-r2`  | Same as `k7-ql-r1` but Longhorn `replicas=2` (requires ≥ 2-node cluster) |
+| `k7d`       | k7 sandbox, RuntimeClass `k7`, first-class `--docker` (guest dockerd, overlay2 on virtio-blk, forkable) |
+| `k7d-fc`    | Same guest docker service as `k7d`, RuntimeClass `k7-fc` (Firecracker + jailer) |
 
 The four environments stack the storage path cleanly: `host` → no VM,
 no Longhorn. `k7-fd` → VM but no Longhorn. `k7-ql-r1` → VM + one local

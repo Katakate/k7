@@ -31,8 +31,8 @@ spec:
         - name: k7-api
           image: k7-api:local
           imagePullPolicy: Never
-          # Root is required for the co-located k7d VM-op fallback (spec 18f
-          # issue 2): `crictl` must reach the k3s containerd socket (0660
+          # Root is required for the co-located k7d VM-op fallback:
+          # `crictl` must reach the k3s containerd socket (0660
           # root:root) to resolve a pod's CRI sandbox id before talking to
           # the k7d daemon socket. No added capabilities / not privileged.
           # k7d VM ops only work for sandboxes on THIS node (the first

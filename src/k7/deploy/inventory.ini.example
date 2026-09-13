@@ -75,7 +75,7 @@ longhorn_replicas=2
 ; ansible_ssh_private_key_file=/root/.ssh/id_ed25519
 ; longhorn_replicas=2
 ;
-; 3-node HA with ALL backends on every node — spec 18e. ONE command:
+; 3-node HA with ALL backends on every node. ONE command:
 ;
 ;   k7 install -i inventory.ini --ha --k7d-version 0.2.1
 ;

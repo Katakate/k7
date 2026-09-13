@@ -11,6 +11,7 @@ class SandboxConfig:
     For kata-firecracker-devmapper: image is REQUIRED (the container to run)
     For kata-qemu-longhorn: image is REQUIRED (no bare VM mode)
     For k7d: image is REQUIRED (runs in a k7d microVM, runtimeClassName k7)
+    For k7d-fc: image is REQUIRED (same daemon, runtimeClassName k7-fc)
     """
 
     name: str
@@ -18,7 +19,7 @@ class SandboxConfig:
     namespace: str = "default"
     runtime_class_name: str | None = None
     root_disk_size: str | None = "10Gi"
-    backend: str | None = None  # "kata-firecracker-devmapper", "kata-qemu-longhorn", or "k7d"
+    backend: str | None = None  # "kata-firecracker-devmapper", "kata-qemu-longhorn", "k7d", or "k7d-fc"
     env_file: str | None = None
     egress_whitelist: list[str] | None = None
     limits: dict[str, str] | None = None
@@ -26,6 +27,8 @@ class SandboxConfig:
     entrypoint: list[str] | None = None
     cmd: list[str] | None = None
     sidecar: str | None = None  # key into SIDECAR_REGISTRY, or None
+    docker: bool = False  # first-class dockerd
+    docker_disk: str | None = None  # graph disk size, e.g. "20Gi"; default 20Gi
     # Security toggles (default off) and capabilities configuration
     pod_non_root: bool = False
     container_non_root: bool = False
@@ -34,7 +37,19 @@ class SandboxConfig:
     # Optional explicit node placement (sets pod's node_name). Used by tests
     # that need to inspect host-side state for a sandbox they just created.
     node_name: str | None = None
-    # Note: ingress isolation is enforced by core with a hardcoded NetworkPolicy
+    # Ingress is denied by default and opt-in per sandbox.
+    # ``ingress_ports`` are TCP ports to open; ``None``/``[]`` denies everything.
+    # ``ingress_from`` scopes who may connect (``sandbox:<name>`` /
+    # ``namespace:<ns>`` / ``cidr:<cidr>``); empty with ports set means "other
+    # sandboxes in this namespace" — opening a port never opens it to the world.
+    ingress_ports: list[int] | None = None
+    ingress_from: list[str] | None = None
+    # TCP ports to publish outside the cluster through a NodePort Service.
+    # Each must also be in ``ingress_ports``: a public NodePort
+    # in front of a deny-all policy is a confusing no-op, and one in front of an
+    # accidentally-open policy is a breach — the user states both.
+    expose_ports: list[int] | None = None
+    volumes: list[dict[str, Any]] | None = None  # hostPath/PVC entries; refused on k7d-fc
 
     def __post_init__(self):
         if self.limits is None:
@@ -68,9 +83,12 @@ class SandboxInfo:
     image: str
     backend: str = "unknown"
     # Kubernetes node hosting the sandbox pod ("" while unscheduled). Needed
-    # by API/SDK clients to reason about k7d VM-op node locality (spec 18f
-    # issue 6): k7d pause/resume/fork must run on the sandbox's node.
+    # by API/SDK clients to reason about k7d VM-op node locality: k7d
+    # pause/resume/fork must run on the sandbox's node.
     node: str = ""
+    # NodePorts allocated by the sandbox's `{name}-expose` Service, if any.
+    # Empty when the sandbox is not exposed.
+    node_ports: list[int] | None = None
     error_message: str = ""
 
     def to_dict(self) -> dict:
@@ -99,7 +117,7 @@ class OperationResult:
         return asdict(self)
 
 
-# Spec 10e: VolumeSnapshot kinds, used both for the ``k7.io/kind`` annotation
+# VolumeSnapshot kinds, used both for the ``k7.io/kind`` annotation
 # we stamp at creation time and for the heuristic fallback that classifies
 # pre-existing snapshots by name pattern.
 SNAPSHOT_KIND_PAUSE = "pause"
@@ -109,7 +127,7 @@ SNAPSHOT_KIND_NAMED = "named"
 
 @dataclass
 class SandboxConfigOverrides:
-    """Optional per-call overrides for ``K7Core.restore_sandbox`` (Spec 10f).
+    """Optional per-call overrides for ``K7Core.restore_sandbox``.
 
     Every field is optional. When ``None`` the corresponding value is taken
     from the snapshot's ``k7.io/source-*`` annotations (stamped at snapshot
@@ -122,6 +140,8 @@ class SandboxConfigOverrides:
     backend: str | None = None
     root_disk_size: str | None = None
     sidecar: str | None = None
+    docker: bool | None = None
+    docker_disk: str | None = None
     limits: dict[str, str] | None = None
     entrypoint: list[str] | None = None
     cmd: list[str] | None = None
