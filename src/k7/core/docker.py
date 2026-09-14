@@ -56,6 +56,10 @@ KATA_FORK_GRAPH_REJECT = (
 # Playbook records the installed k7d version here. Guest dockerd
 # and k7-fc shipped in public k7d 0.6.0; a node whose recorded version
 # is older, or that has no docker payload, fails loud.
+#
+# k7-api hostPath-mounts /etc/k7 (so it can read this file) but not
+# /usr/local/share/k7d. Trust a recorded version >= 0.6.0; only look
+# for dockerd on disk when the version file is missing (CLI --core).
 K7D_VERSION_FILE = "/etc/k7/k7d_version"
 K7D_DOCKER_MIN_VERSION = (0, 6, 0)
 K7D_DOCKER_PAYLOAD_DOCKERD = (
@@ -111,14 +115,15 @@ def k7d_docker_payload_present() -> bool:
 def k7d_supports_docker(version_file: str = K7D_VERSION_FILE) -> bool:
     """True when the installed k7d can run ``--docker``.
 
-    Detects via the version the playbook records (and the docker payload
-    the shim execs). Does not create a VM and wait for a timeout.
+    Detects via the version the playbook records. Falls back to the
+    docker payload the shim execs only when that file is absent (the
+    API pod cannot see it). Does not create a VM and wait for a timeout.
     """
     recorded = recorded_k7d_version(version_file)
     if recorded:
         parsed = _parse_version(recorded)
-        if parsed is not None and parsed < K7D_DOCKER_MIN_VERSION:
-            return False
+        if parsed is not None:
+            return parsed >= K7D_DOCKER_MIN_VERSION
     return k7d_docker_payload_present()
 
 

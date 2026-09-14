@@ -1520,14 +1520,17 @@
       when: k7_has_k7d_fc
       tags: ['k7d', 'k7d-fc']
 
+    # The CLI writes this playbook to a tempfile, so playbook_dir-relative
+    # `k7d-fc/install-firecracker.sh` cannot work (same trap as the API
+    # manifests). Copy from the controller checkout at k7_repo_root.
     - name: K7d-fc — stage install-firecracker.sh and pins
       ansible.builtin.copy:
-        src: "{{ item.src }}"
+        src: "{{ (k7_repo_root | default(playbook_dir + '/../../..')) }}/src/k7/deploy/k7d-fc/{{ item.src }}"
         dest: "{{ item.dest }}"
         mode: "{{ item.mode }}"
       loop:
-        - { src: k7d-fc/install-firecracker.sh, dest: /opt/k7d-fc/install-firecracker.sh, mode: '0755' }
-        - { src: k7d-fc/pins.env, dest: /opt/k7d-fc/pins.env, mode: '0644' }
+        - { src: install-firecracker.sh, dest: /opt/k7d-fc/install-firecracker.sh, mode: '0755' }
+        - { src: pins.env, dest: /opt/k7d-fc/pins.env, mode: '0644' }
       loop_control:
         label: "{{ item.dest }}"
       when: k7_has_k7d_fc

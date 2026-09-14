@@ -29,7 +29,7 @@
 
 
 <p align="center">
-  <img src="assets/k7-cover-upgrade.png" alt="Katakate Logo" width="3600" style="vertical-align: middle;"/>
+  <img src="assets/k7-cover-upgrade.png" alt="k7 logo" width="3600" style="vertical-align: middle;"/>
 
 </p>
 
@@ -39,7 +39,7 @@
   </a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"></a>
   <img src="https://img.shields.io/badge/install%20with-apt-blue?logo=debian">
-  <img src="https://img.shields.io/pypi/v/k7-sdk">
+  <a href="https://pypi.org/project/k7-sdk/"><img src="https://img.shields.io/pypi/v/k7-sdk" alt="PyPI k7-sdk"></a>
 </p> 
 
 
@@ -52,7 +52,7 @@
 
 
 
-<i><b>Katakate</b></i> aims to make it easy to create, manage and orchestrate lightweight safe VM sandboxes for executing untrusted code, at scale. It is built on battle-tested VM isolation with Kata, Firecracker, QEMU, Longhorn, and Kubernetes — plus Katakate's own <i><b>k7d</b></i> runtime. It is orignally motivated by AI agents that need to run arbitrary code at scale but it is also great for:
+<i><b>k7</b></i> aims to make it easy to create, manage and orchestrate lightweight safe VM sandboxes for executing untrusted code, at scale. It is built on battle-tested VM isolation with Kata, Firecracker, QEMU, Longhorn, and Kubernetes — plus k7's own <i><b>k7d</b></i> runtime. It is orignally motivated by AI agents that need to run arbitrary code at scale but it is also great for:
 - Custom serverless (like AWS Fargate, but yours)
 - Hardened CI/CD runners (no Docker-in-Docker risks)
 - Blockchain execution layers for AI dApps
@@ -63,14 +63,14 @@
 The Tech Stack
 </h3>
 
-<i><b>Katakate</b></i> is built on:
+<i><b>k7</b></i> is built on:
 - <i><b>Kubernetes</b></i> for orchestration, with K3s which is prod-ready and a great choice for edge nodes,
 - <i><b>Kata</b></i> to encapsulate containers into light-weight virtual-machines,
 - <i><b>Firecracker</b></i> (`kfd`) for super-fast boots, light footprints and minimal attack surface (with the jailer),
 - <i><b>Devmapper Snapshotter</b></i> with <i><b>thin-pool provisioning of logical volumes</b></i> for efficient disk use across many Firecracker VMs per node,
 - <i><b>QEMU</b></i> (`kql`) via Kata when you want a fuller VMM and durable sandbox disks,
 - <i><b>Longhorn</b></i> for replicated PVC-backed root disks on the QEMU path — named snapshots, restore, disk-only fork, and cross-node mobility,
-- <i><b>k7d</b></i> — Katakate's own microVM runtime daemon (<a href="https://github.com/Katakate/k7d">katakate/k7d</a>) with VM-level warm fork (CoW disk+memory) and in-place pause/resume.
+- <i><b>k7d</b></i> — k7's own microVM runtime daemon (<a href="https://github.com/Katakate/k7d">Katakate/k7d</a>) with VM-level warm fork (CoW disk+memory) and in-place pause/resume.
 
 <h3 align="left">
 Sandbox backends
@@ -102,7 +102,7 @@ run (`guest_cid=0` retained — CHALLENGES #17). k7d resume→exec is **0.3s**.
 Also available today
 </h3>
 
-- 🛠️ Docker <code>build</code> / <code>run</code> inside VM sandboxes: <code>k7 create --docker --backend k7d ubuntu:24.04</code> (or <code>--backend k7d-fc</code>). In-guest dockerd, overlay2, forkable. The same <code>--docker</code> flag on Kata (kfd/kql) injects a privileged docker-vehicle with overlay2 on a block disk — kql persists/forks the graph, kfd is ephemeral. <code>--sidecar docker</code> is a deprecated alias. See [PERFORMANCE.md](PERFORMANCE.md)
+- 🛠️ Docker <code>build</code> / <code>run</code> inside VM sandboxes: <code>k7 create --docker --backend k7d --egress-open builder ubuntu:24.04</code> (name then image; or <code>--backend k7d-fc</code>). In-guest dockerd, overlay2, forkable. The same <code>--docker</code> flag on Kata (kfd/kql) injects a privileged docker-vehicle with overlay2 on a block disk — kql persists/forks the graph, kfd is ephemeral. <code>--sidecar docker</code> is a deprecated alias. See [PERFORMANCE.md](PERFORMANCE.md)
 - ⚡ <b>Warm VM fork</b> on the k7d backend: <code>k7 fork</code> CoW-clones a running sandbox's disk <i>and memory</i> in ~5&nbsp;ms at the VMM; end-to-end through k7/Kubernetes is ~2&nbsp;s to a Ready pod
 - 🌐 Multi-node clusters (Ansible + Longhorn)
 - 🔍 Cilium CNI with FQDN egress policies (optional Hubble flow observability via <code>k7 install --hubble</code>; off by default, observability only)
@@ -113,7 +113,7 @@ Also available today
 
 
 <p align="left" style="margin-top: 40px;  font-size: 14px;">
-   <strong>Note:</strong> Katakate is currently in <em>beta</em> and under security review. Use with caution for highly sensitive workloads.
+   <strong>Note:</strong> k7 is currently in <em>beta</em> and under security review. Use with caution for highly sensitive workloads.
 </p>
 
 
@@ -183,21 +183,27 @@ Do not install the Ubuntu `.deb` on macOS.
 
 ### Get your node(s) ready
 
-First install `k7` on your Linux server that will host the VMs:
+The Launchpad PPA currently publishes **0.2.2**. For **0.3.1** (HTTPS API,
+`--docker`, k7d 0.6.0, HA `k7d-fc` copy) install the GitHub release `.deb`,
+then clone the matching source — `k7 install` builds `k7-api:local` from
+the current working directory:
+
 ```shell
-sudo add-apt-repository ppa:katakate.org/k7
-sudo apt update
-sudo apt install k7
+curl -fsSL -O https://github.com/Katakate/k7/releases/download/v0.3.1/k7_0.3.1_amd64.deb
+sudo apt install ./k7_0.3.1_amd64.deb
+git clone --branch v0.3.1 https://github.com/Katakate/k7.git
+cd k7
+sudo apt install -y ansible
+curl -fsSL https://get.docker.com | sh
 ```
 
+Then let `k7` get your node ready:
 
-Then let `k7` get your node ready with everything:
 ```console
-$  k7 install --backend kfd,kql,k7d
+$ k7 install --backend kfd,kql,k7d
 Current task: Reminder about logging out and back in for group changes
   Installing K7 on 1 host(s)... ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:01:41
 ✅ Installation completed successfully!
-
 ```
 
 Optionally pass `-v` for a verbose output.
@@ -310,9 +316,11 @@ k7 delete-all
 ```bash
 # Warm CoW fork (disk + memory) — source must be a k7d sandbox
 k7 create -f k7.yaml --backend k7d          # name from yaml, e.g. my-sandbox-123
-k7 exec my-sandbox-123 sh -c 'echo hi > /tmp/state.txt'
+# exec wraps the argument in `sh -c`, so pass the whole guest command
+# as one string (redirects and quotes survive). Do not add an extra `sh -c`.
+k7 exec my-sandbox-123 -- 'echo hi > /tmp/state.txt'
 k7 fork my-sandbox-123 branch-a
-k7 exec branch-a cat /tmp/state.txt        # inherited memory + disk
+k7 exec branch-a -- 'cat /tmp/state.txt'        # inherited memory + disk
 
 # Disk-only fork (cold boot from cloned PVC) — kql / kata-qemu-longhorn
 k7 create -f k7.yaml --backend kql
@@ -380,8 +388,9 @@ Then use with:
 from k7_sdk import Client
 
 k7 = Client(
-  endpoint='https://<your-endpoint>', 
-  api_key='your-key')
+  endpoint='https://<your-endpoint>',
+  api_key='your-key',
+  verify_ssl='./k7-ca.crt')  # cluster CA from /etc/k7/tls/ca.crt on the node
 
 # Create sandbox (pick backend: kata-firecracker-devmapper | kata-qemu-longhorn | k7d)
 sb = k7.create({

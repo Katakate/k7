@@ -38,3 +38,18 @@ def test_k7d_supports_docker_old_recorded_version(tmp_path: Path):
     version_file = tmp_path / "k7d_version"
     version_file.write_text("0.2.1\n")
     assert k7d_supports_docker(str(version_file)) is False
+
+
+def test_k7d_supports_docker_recorded_06_without_payload(tmp_path: Path):
+    """k7-api sees /etc/k7/k7d_version but not the host dockerd payload."""
+    version_file = tmp_path / "k7d_version"
+    version_file.write_text("0.6.0\n")
+    assert k7d_supports_docker(str(version_file)) is True
+
+
+def test_k7d_supports_docker_missing_version_falls_back_to_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    missing = str(tmp_path / "no-such-version")
+    monkeypatch.setattr("k7.core.docker.k7d_docker_payload_present", lambda: False)
+    assert k7d_supports_docker(missing) is False
+    monkeypatch.setattr("k7.core.docker.k7d_docker_payload_present", lambda: True)
+    assert k7d_supports_docker(missing) is True

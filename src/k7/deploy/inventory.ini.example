@@ -56,9 +56,10 @@ longhorn_replicas=2
 ; 2-node, ALL backends, from the PPA CLI (no --ha — that needs 3+ servers).
 ; After TWO_DISK=1 so each box has a spare raw NVMe:
 ;
-;   sudo add-apt-repository ppa:katakate.org/k7 && sudo apt update && sudo apt install k7
-;   # run from a checkout so the playbook can build k7-api:local
-;   k7 install -i inventory.ini --k7d-version 0.2.1
+;   # PPA is still 0.2.2; prefer the GitHub 0.3.0 .deb, then:
+;   git clone --branch v0.3.0 https://github.com/Katakate/k7.git && cd k7
+;   # run from that checkout so the playbook can build k7-api:local
+;   k7 install -i inventory.ini --k7d-version 0.6.0
 ;
 ; [k7_servers]
 ; k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
@@ -73,11 +74,12 @@ longhorn_replicas=2
 ; [k7_cluster:vars]
 ; ansible_user=root
 ; ansible_ssh_private_key_file=/root/.ssh/id_ed25519
+; ansible_ssh_common_args=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 ; longhorn_replicas=2
 ;
 ; 3-node HA with ALL backends on every node. ONE command:
 ;
-;   k7 install -i inventory.ini --ha --k7d-version 0.2.1
+;   k7 install -i inventory.ini --ha --k7d-version 0.6.0
 ;
 ; [k7_servers]
 ; k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
@@ -90,5 +92,6 @@ longhorn_replicas=2
 ; [k7_cluster:vars]
 ; ansible_user=root
 ; ansible_ssh_private_key_file=/root/.ssh/id_ed25519
+; ansible_ssh_common_args=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 ; longhorn_replicas=3
 ; ──────────────────────────────────────────────────────────────────────

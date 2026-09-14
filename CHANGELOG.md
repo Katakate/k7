@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-14
+
+HA install and API-path `--docker` fixes for the 0.3.0 line. README
+product name is **k7** (Katakate is the org).
+
+### Fixed
+
+- **`k7 install` copies Firecracker pins from the repo root**, so a
+  3-node HA all-backends install no longer looks next to the tempfile
+  playbook and fails to stage `k7d-fc/install-firecracker.sh` (#59).
+- **API-path `--docker`** trusts a playbook-recorded k7d version
+  `>= 0.6.0` instead of a host payload path the API container cannot
+  see, so `--docker` works for CLI/API users (#59).
+- **`k7 exec` takes one `sh -c` string.** Nested `sh -c` was joining
+  wrong and writing a blank file, which made the README fork demo look
+  like memory CoW was broken (#59).
+- HA inventory example adds `ansible_ssh_common_args` so the first
+  master can SSH peers on a first install (#59).
+
+### Changed
+
+- README and the Hetzner tutorial target **0.3.1** (GitHub `.deb`;
+  Launchpad PPA is still 0.2.2 until this upload publishes). Product
+  sentences say **k7**; Katakate stays on org URLs, email, and the
+  deprecated PyPI shim. The PyPI badge links to `k7-sdk`.
+
 ## [0.3.0] — 2026-09-12
 
 HTTPS-by-default for `k7-api`, cluster-wide Cilium isolation, first-class

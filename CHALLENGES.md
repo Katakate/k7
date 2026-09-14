@@ -528,3 +528,64 @@ resume→exec from that run.
 
 **Time lost:** ~15 min on the OutOfcpu wait; lifecycle resume hung until
 the pytest process was killed (~8 min).
+
+---
+
+## 18. `k7 install --backend k7d-fc` cannot find vendored Firecracker installer
+
+**Symptom:** A 3-node HA install with `k7_backends=kfd,kql,k7d,k7d-fc` (public
+k7 0.3.0) failed at `K7d-fc — stage install-firecracker.sh and pins` on every
+node:
+
+```
+Could not find or access 'k7d-fc/install-firecracker.sh'
+Searched in:
+  /tmp/files/k7d-fc/install-firecracker.sh
+  /tmp/k7d-fc/install-firecracker.sh
+  ... on the Ansible Controller.
+```
+
+K3s HA, Cilium, Longhorn, kfd thin-pool, and k7d itself had already succeeded.
+
+**Root cause:** `k7 install` writes the embedded playbook to a tempfile
+(`/tmp/tmp….yaml`) and runs `ansible-playbook` against that. Ansible `copy`
+without `remote_src` looks up `src: k7d-fc/install-firecracker.sh` next to the
+playbook file, i.e. `/tmp/k7d-fc/…`. The vendored files live at
+`src/k7/deploy/k7d-fc/` in the source tree. The API-manifest copy already
+documents this trap and uses `k7_repo_root`; k7d-fc did not.
+
+**Fix:** copy from
+`{{ k7_repo_root }}/src/k7/deploy/k7d-fc/{install-firecracker.sh,pins.env}`
+on the controller (the checkout the CLI already requires for `k7-api:local`).
+
+**Reference:** playbook comment on "Copy K7 API manifests on first master".
+
+**Time lost:** one full 3-node TWO_DISK reset + 6 min install (~45 min).
+
+---
+
+## 19. `k7 create --docker` via the API always said "this k7d has no docker service"
+
+**Symptom:** After a successful 3-node HA install of k7d 0.6.0 (payload at
+`/usr/local/share/k7d/docker/bin/dockerd`, `/etc/k7/k7d_version` = `0.6.0`),
+the docs path `k7 create --docker --backend k7d --egress-open builder ubuntu:24.04`
+failed immediately with `this k7d has no docker service; upgrade`. The same
+create via `k7 --core` (and the integration suite, which uses `--core`)
+succeeded.
+
+**Root cause:** `k7d_supports_docker()` treated a recorded version ≥ 0.6.0 as
+"not old" and then still required `os.path.isfile` of the host dockerd
+payload. k7-api hostPath-mounts `/etc/k7` (so it can read the version file)
+but not `/usr/local/share/k7d`, so the payload check always failed inside the
+API pod. Default CLI routing is the API, so every laptop/docs user hit this;
+`--core` on the node never did.
+
+**Fix:** if the playbook recorded a parseable version, that version is
+authoritative (`>= 0.6.0` → supported). The payload path is only consulted
+when the version file is missing (CLI `--core` / incomplete install).
+
+**Reference:** `src/k7/deploy/manifests/k7-api/deployment.yaml` (`/etc/k7`
+hostPath); `K7D_DOCKER_PAYLOAD_DOCKERD` in `src/k7/core/docker.py`.
+
+**Time lost:** ~30 min diagnosing why the live cluster had dockerd but the
+API refused `--docker`.
