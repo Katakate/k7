@@ -14,10 +14,10 @@ spec:
       labels:
         app: k7-agent
     spec:
-      # Reuses the k7-api ServiceAccount/RBAC: the agent runs the same
-      # K7Core code (pod lookup, deployment annotate/create for
-      # pause/resume/fork).
-      serviceAccountName: k7-api
+      # Dedicated SA with no token and no ClusterRole — VM ops are crictl
+      # + k7d.sock only. Kubernetes writes stay on k7-api.
+      serviceAccountName: k7-agent
+      automountServiceAccountToken: false
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists

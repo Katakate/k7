@@ -52,19 +52,22 @@ async def _main() -> int:
     keep_minutes = _env_int("K7_GC_KEEP_FORK_FOR_MINUTES", 10)
     dry_run = _env_bool("K7_GC_DRY_RUN", False)
     core = K7Core()
-    result = await core.gc_snapshots(
-        all_namespaces=True,
-        keep_fork_for=timedelta(minutes=keep_minutes),
-        dry_run=dry_run,
-    )
-    if not result.success:
-        print(f"❌ snapshot-gc failed: {result.error}", file=sys.stderr)
-        return 1
-    print(result.message)
-    for record in result.data or []:
-        marker = "would-delete" if dry_run else ("deleted" if record.get("deleted") else "failed")
-        print(f"  [{marker}] {record['namespace']}/{record['name']} (age={record['age']})")
-    return 0
+    try:
+        result = await core.gc_snapshots(
+            all_namespaces=True,
+            keep_fork_for=timedelta(minutes=keep_minutes),
+            dry_run=dry_run,
+        )
+        if not result.success:
+            print(f"❌ snapshot-gc failed: {result.error}", file=sys.stderr)
+            return 1
+        print(result.message)
+        for record in result.data or []:
+            marker = "would-delete" if dry_run else ("deleted" if record.get("deleted") else "failed")
+            print(f"  [{marker}] {record['namespace']}/{record['name']} (age={record['age']})")
+        return 0
+    finally:
+        await core.aclose()
 
 
 if __name__ == "__main__":

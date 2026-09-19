@@ -7,6 +7,7 @@ ServiceAccount RBAC, and in-cluster config all work end-to-end.
 
 import hashlib
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -93,7 +94,12 @@ def _api_pod_ready() -> bool:
     return result.returncode == 0 and result.stdout.strip() not in ("", "0")
 
 
-def _generate_test_api_key(*, name: str = "integration-test", namespaces: list[str] | None = None) -> str:
+def _generate_test_api_key(
+    *,
+    name: str = "integration-test",
+    namespaces: list[str] | None = None,
+    nodes: list[str] | None = None,
+) -> str:
     """Write a test API key directly into the keys file, return the raw token."""
     import os
     import secrets as _secrets
@@ -113,6 +119,8 @@ def _generate_test_api_key(*, name: str = "integration-test", namespaces: list[s
     }
     if namespaces:
         entry["namespaces"] = list(namespaces)
+    if nodes:
+        entry["nodes"] = list(nodes)
     keys[key_hash] = entry
     K7_API_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
     K7_API_KEYS_FILE.write_text(json.dumps(keys, indent=2))
@@ -851,5 +859,69 @@ class TestApiNamespaceAuthz:
             assert unscoped_r.status_code == 200, unscoped_r.text
             data = unscoped_r.json()["data"]
             assert isinstance(data, dict) and data, f"expected per-node map, got {data}"
+        finally:
+            _revoke_test_api_key(scoped_name)
+
+
+class TestApiNodeAuthz:
+    """Node-scoped API keys may only place sandboxes on listed nodes."""
+
+    def test_single_node_key_auto_pins_and_rejects_other(
+        self,
+        api_base_url: str,
+        test_namespace: str,
+        cleanup_sandbox,
+    ):
+        local = os.uname().nodename
+        scoped_name = "integ-scoped-node"
+        scoped = _generate_test_api_key(name=scoped_name, nodes=[local])
+        scoped_headers = {"X-API-Key": scoped}
+        name = "node-authz-sb"
+        cleanup_sandbox(name, test_namespace)
+        try:
+            r = httpx.post(
+                f"{api_base_url}/api/v1/sandboxes",
+                json={"name": name, "image": "alpine:3.21", "namespace": test_namespace},
+                headers=scoped_headers,
+                timeout=180,
+            )
+            assert r.status_code == 201, r.text
+            _wait_for_sandbox_ready(api_base_url, scoped_headers, name, test_namespace)
+            got = httpx.get(
+                f"{api_base_url}/api/v1/sandboxes/{name}",
+                params={"namespace": test_namespace},
+                headers=scoped_headers,
+                timeout=10,
+            )
+            assert got.status_code == 200, got.text
+            assert got.json()["data"].get("node") == local
+
+            denied = httpx.post(
+                f"{api_base_url}/api/v1/sandboxes",
+                json={
+                    "name": f"{name}-x",
+                    "image": "alpine:3.21",
+                    "namespace": test_namespace,
+                    "node_name": "not-a-k7-node",
+                },
+                headers=scoped_headers,
+                timeout=15,
+            )
+            assert denied.status_code == 403, denied.text
+            assert "not-a-k7-node" in denied.json()["error"]["message"]
+        finally:
+            _revoke_test_api_key(scoped_name)
+
+    def test_node_scoped_key_nodes_storage_forbidden(self, api_base_url: str):
+        scoped_name = "integ-scoped-nodes-only"
+        scoped = _generate_test_api_key(name=scoped_name, nodes=[os.uname().nodename])
+        try:
+            scoped_r = httpx.get(
+                f"{api_base_url}/api/v1/nodes/storage",
+                headers={"X-API-Key": scoped},
+                timeout=30,
+            )
+            assert scoped_r.status_code == 403, scoped_r.text
+            assert "cluster-wide node" in scoped_r.json()["error"]["message"]
         finally:
             _revoke_test_api_key(scoped_name)

@@ -12,10 +12,14 @@ from k7.core.docker import (
     CLI_STAGING_DIR,
     DIND_IMAGE,
     DOCKER_HOST_URL,
+    FSFREEZE_STAGED,
+    FSFREEZE_VEHICLE,
     GRAPH_DEVICE_PATH,
-    KATA_FORK_GRAPH_REJECT,
+    KATA_GRAPH_MOUNT,
     KATA_SOCKET_DIR,
     KFD_DOCKER_STORAGE_CLASS,
+    KFD_FORK_REJECT,
+    STAGE_FSFREEZE_CMD,
     VEHICLE_CONTAINER_NAME,
 )
 from k7.core.models import ExecResult, SandboxConfig
@@ -137,9 +141,67 @@ class TestKataDockerSnapshot:
         assert wait.await_count == 2
         names = [c.args[0] for c in wait.await_args_list]
         assert names == ["snap1", "snap1-docker"]
-        assert exec_cmd.await_count == 2
+        cmds = [c.args[1] for c in exec_cmd.await_args_list]
+        freeze_cmd = (
+            f"cp {FSFREEZE_STAGED} {FSFREEZE_VEHICLE} && chmod 755 {FSFREEZE_VEHICLE} && "
+            f"{FSFREEZE_VEHICLE} -f {KATA_GRAPH_MOUNT}"
+        )
+        thaw_cmd = f"{FSFREEZE_VEHICLE} -u {KATA_GRAPH_MOUNT}"
+        assert cmds == ["sync", STAGE_FSFREEZE_CMD, freeze_cmd, thaw_cmd]
         assert exec_cmd.await_args_list[0].kwargs.get("container") in (None, "sandbox")
-        assert exec_cmd.await_args_list[1].kwargs.get("container") == VEHICLE_CONTAINER_NAME
+        assert exec_cmd.await_args_list[1].kwargs.get("container") in (None, "sandbox")
+        assert exec_cmd.await_args_list[2].kwargs.get("container") == VEHICLE_CONTAINER_NAME
+        assert exec_cmd.await_args_list[3].kwargs.get("container") == VEHICLE_CONTAINER_NAME
+
+    async def test_create_snapshot_freeze_failure_is_loud(self, core: K7Core):
+        dep = MagicMock()
+        dep.metadata.annotations = {ANN_K7_DOCKER: "true", ANN_DOCKER_PVC: "sb-docker-lh"}
+        dep.status.ready_replicas = 1
+        mock_apps = AsyncMock()
+        mock_apps.read_namespaced_deployment.return_value = dep
+        _setup(core, apps=mock_apps, v1=AsyncMock())
+        create = AsyncMock(return_value=_ok())
+
+        async def exec_cmd(name, command, **kwargs):
+            if " -f " in command and "k7-fsfreeze" in command:
+                return ExecResult(exit_code=1, stdout="", stderr="EBUSY", duration_ms=0)
+            return _exec_ok()
+
+        with (
+            patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-qemu-longhorn")),
+            patch.object(core, "_create_volume_snapshot", new=create),
+            patch.object(core, "exec_command", new=AsyncMock(side_effect=exec_cmd)),
+        ):
+            result = await core.create_snapshot("sb", "snap1")
+        assert not result.success
+        assert "fsfreeze -f" in result.error
+        create.assert_not_awaited()
+
+    async def test_create_snapshot_thaws_after_snapshot_failure(self, core: K7Core):
+        dep = MagicMock()
+        dep.metadata.annotations = {ANN_K7_DOCKER: "true", ANN_DOCKER_PVC: "sb-docker-lh"}
+        dep.status.ready_replicas = 1
+        mock_apps = AsyncMock()
+        mock_apps.read_namespaced_deployment.return_value = dep
+        _setup(core, apps=mock_apps, v1=AsyncMock())
+        fail = MagicMock()
+        fail.success = False
+        fail.error = "root snap fail"
+        exec_cmd = AsyncMock(return_value=_exec_ok())
+        with (
+            patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-qemu-longhorn")),
+            patch.object(core, "_create_volume_snapshot", new=AsyncMock(return_value=fail)),
+            patch.object(core, "exec_command", new=exec_cmd),
+        ):
+            result = await core.create_snapshot("sb", "snap1")
+        assert not result.success
+        cmds = [c.args[1] for c in exec_cmd.await_args_list]
+        freeze_cmd = (
+            f"cp {FSFREEZE_STAGED} {FSFREEZE_VEHICLE} && chmod 755 {FSFREEZE_VEHICLE} && "
+            f"{FSFREEZE_VEHICLE} -f {KATA_GRAPH_MOUNT}"
+        )
+        thaw_cmd = f"{FSFREEZE_VEHICLE} -u {KATA_GRAPH_MOUNT}"
+        assert cmds == ["sync", STAGE_FSFREEZE_CMD, freeze_cmd, thaw_cmd]
 
     async def test_create_snapshot_skips_sync_when_paused(self, core: K7Core):
         dep = MagicMock()
@@ -274,7 +336,14 @@ class TestKataDockerForkReject:
             result = await core.fork_sandbox("src", "dst")
         assert not result.success
         assert "cannot be cloned" in result.error
-        assert result.error == KATA_FORK_GRAPH_REJECT
+        assert result.error == KFD_FORK_REJECT
+
+    async def test_kfd_plain_fork_rejected(self, core: K7Core):
+        """Non-docker kfd has no PVC either — reject before a confusing 404."""
+        with patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-firecracker-devmapper")):
+            result = await core.fork_sandbox("src", "dst")
+        assert not result.success
+        assert result.error == KFD_FORK_REJECT
 
 
 class TestDindImagePin:

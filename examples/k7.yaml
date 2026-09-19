@@ -1,10 +1,13 @@
 name: demo
 image: alpine:3.20
 namespace: default
+# node_name: k7-node-01  # copy NAME from `k7 nodes list` (Linux hostname); dedicate to lock others out
+backend: k7d
 limits:
-  cpu: "100m"
-  memory: "128Mi"
+  cpu: "1"
+  memory: "1Gi"
 before_script: |
-  # Installing curl. Egress open during before_script, then restricted (empty whitelist) afterwards
+  # Installing curl. Egress is open during before_script, then restricted
+  # (empty whitelist) afterwards. 128Mi is too small for a VM sandbox.
   apk add curl
 egress_whitelist: []

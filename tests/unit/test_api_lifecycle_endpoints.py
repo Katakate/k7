@@ -17,7 +17,7 @@ import pytest
 from k7.api.main import app
 from k7.core.models import OperationResult
 
-TEST_KEY = "k7-test-secret-key-spec10a"
+TEST_KEY = "k7-test-secret-key-lifecycle"
 TEST_KEY_HASH = hashlib.sha256(TEST_KEY.encode()).hexdigest()
 
 

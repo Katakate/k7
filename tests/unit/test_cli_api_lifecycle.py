@@ -70,6 +70,12 @@ class TestApiEnableDisable:
         assert result.exit_code != 0
         assert "failed" in result.output.lower()
 
+    def test_enable_without_kubectl_exits(self):
+        with patch("k7.cli.k7._kubectl_run", return_value=None):
+            result = runner.invoke(app, ["api", "enable"])
+        assert result.exit_code != 0
+        assert "kubectl" in result.output.lower()
+
 
 # ---------------------------------------------------------------------------
 # ``k7 api status``.
@@ -114,6 +120,30 @@ class TestApiStatus:
         assert "not found" in result.output.lower()
         assert "k7 install" in result.output
 
+    def test_without_kubectl_probes_configured_health(self):
+        fake = SimpleNamespace(ok=True, status_code=200)
+        with (
+            patch("k7.cli.k7._kubectl_run", return_value=None),
+            patch("k7.cli.k7._resolve_api_url", return_value="https://10.0.0.1:31007"),
+            patch("k7.cli.k7._resolve_api_ca", return_value="/tmp/ca.crt"),
+            patch("k7.cli.k7.requests.get", return_value=fake) as get,
+        ):
+            result = runner.invoke(app, ["api", "status"])
+        assert result.exit_code == 0, result.output
+        assert "reachable" in result.output.lower()
+        assert "https://10.0.0.1:31007" in result.output
+        get.assert_called_once()
+        assert get.call_args.args[0] == "https://10.0.0.1:31007/health"
+
+    def test_without_kubectl_or_url_exits(self):
+        with (
+            patch("k7.cli.k7._kubectl_run", return_value=None),
+            patch("k7.cli.k7._resolve_api_url", return_value=None),
+        ):
+            result = runner.invoke(app, ["api", "status"])
+        assert result.exit_code != 0
+        assert "kubectl is not installed" in result.output
+
 
 # ---------------------------------------------------------------------------
 # ``k7 api endpoint``.
@@ -131,6 +161,16 @@ class TestApiEndpoint:
         with patch("k7.cli.k7._read_api_endpoint", return_value=None):
             result = runner.invoke(app, ["api", "endpoint"])
         assert result.exit_code != 0
+
+    def test_without_kubectl_prints_configured_url(self, tmp_path):
+        with (
+            patch("k7.cli.k7._ETC_K7_API_ENDPOINT", tmp_path / "missing"),
+            patch("k7.cli.k7.subprocess.run", side_effect=FileNotFoundError("kubectl")),
+            patch("k7.cli.k7._resolve_api_url", return_value="https://10.0.0.1:31007"),
+        ):
+            result = runner.invoke(app, ["api", "endpoint"])
+        assert result.exit_code == 0, result.output
+        assert result.output.strip() == "https://10.0.0.1:31007"
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +241,7 @@ class TestInstallNoApi:
             patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
         ):
             core_cls.return_value.install_node = _capture
-            result = runner.invoke(app, ["install", "--no-api", "host"])
+            result = runner.invoke(app, ["install", "--backend", "kql", "--no-api", "host"])
         assert result.exit_code == 0, result.output
         extra_vars = seen["kwargs"]["extra_vars"]
         assert extra_vars.get("k7_api_enabled") == "false"
@@ -218,7 +258,7 @@ class TestInstallNoApi:
             patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
         ):
             core_cls.return_value.install_node = _capture
-            result = runner.invoke(app, ["install", "host"])
+            result = runner.invoke(app, ["install", "--backend", "kql", "host"])
         assert result.exit_code == 0, result.output
         extra_vars = seen["kwargs"]["extra_vars"]
         assert extra_vars.get("k7_api_enabled") == "true"
@@ -237,7 +277,7 @@ class TestInstallHubble:
             patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
         ):
             core_cls.return_value.install_node = _capture
-            result = runner.invoke(app, ["install", "--hubble", "host"])
+            result = runner.invoke(app, ["install", "--backend", "kql", "--hubble", "host"])
         assert result.exit_code == 0, result.output
         extra_vars = seen["kwargs"]["extra_vars"]
         assert extra_vars.get("k7_hubble_enabled") == "true"
@@ -254,7 +294,7 @@ class TestInstallHubble:
             patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
         ):
             core_cls.return_value.install_node = _capture
-            result = runner.invoke(app, ["install", "host"])
+            result = runner.invoke(app, ["install", "--backend", "kql", "host"])
         assert result.exit_code == 0, result.output
         extra_vars = seen["kwargs"]["extra_vars"]
         assert extra_vars.get("k7_hubble_enabled") == "false"

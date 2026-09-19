@@ -5,11 +5,13 @@ are never touched. The real end-to-end behaviour is covered by
 ``tests/integration/test_k7d.py`` on a k7d-capable node.
 """
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from k7.core.core import (
+    K7_TENANT_LABEL,
     K7D_ANN_FORK_SOURCE_CLUSTER,
     K7D_ANN_FORK_SOURCE_VM,
     K7D_ANN_PAUSED,
@@ -20,10 +22,15 @@ from k7.core.models import OperationResult, SandboxConfig
 from tests.unit.conftest import mock_deployment, mock_pod
 
 
-def _local_node(core: K7Core):
-    """Patch the node resolution so the sandbox appears LOCAL —
-    these tests exercise the direct daemon-socket path, not forwarding."""
-    return patch.object(core, "_k7d_sandbox_node", new=AsyncMock(return_value=core._k7d_local_node()))
+@contextmanager
+def _local_node(core: K7Core, node: str = "k7-node-01", pod: str = "src-sb-abc"):
+    """Sandbox appears LOCAL — direct daemon-socket path, not agent forward."""
+    with (
+        patch.object(core, "_k7d_local_node", return_value=node),
+        patch.object(core, "_k7d_sandbox_node", new=AsyncMock(return_value=node)),
+        patch.object(core, "_k7d_sandbox_placement", new=AsyncMock(return_value=(node, pod))),
+    ):
+        yield
 
 
 def _k7d_deployment(name: str = "src-sb", sidecar: str | None = None):
@@ -100,6 +107,76 @@ class TestK7dCreateSandbox:
         assert not pod_spec.init_containers
         # Deployment carries the backend annotation for later detection.
         assert deployment.metadata.annotations["k7.katakate.org/backend"] == "k7d"
+
+    async def test_node_name_uses_hostname_selector_not_spec_node_name(self, core: K7Core):
+        mock_apps = AsyncMock()
+        mock_v1 = AsyncMock()
+        mock_net = AsyncMock()
+        node = MagicMock()
+        node.spec.taints = []
+        mock_v1.read_node.return_value = node
+        core._apps_v1_client = mock_apps
+        core._core_v1_client = mock_v1
+        core._networking_v1_client = mock_net
+
+        sched_ok = MagicMock()
+        sched_ok.success = True
+        with patch.object(core, "_check_scheduling", new=AsyncMock(return_value=sched_ok)):
+            cfg = SandboxConfig(name="k7d-pin", image="alpine:3.20", backend="k7d", node_name="k7-node-01")
+            result = await core.create_sandbox(cfg)
+
+        assert result.success, result.error
+        pod_spec = mock_apps.create_namespaced_deployment.call_args.kwargs["body"].spec.template.spec
+        assert pod_spec.node_name in (None, "")
+        assert pod_spec.node_selector == {
+            "k7.katakate.org/backend-k7d": "true",
+            "kubernetes.io/hostname": "k7-node-01",
+        }
+        assert not pod_spec.tolerations
+        mock_v1.read_node.assert_awaited_once_with("k7-node-01")
+
+    async def test_dedicated_node_adds_tenant_toleration(self, core: K7Core):
+        mock_apps = AsyncMock()
+        mock_v1 = AsyncMock()
+        mock_net = AsyncMock()
+        taint = MagicMock()
+        taint.key = "k7.katakate.org/tenant"
+        taint.value = "acme"
+        taint.effect = "NoSchedule"
+        node = MagicMock()
+        node.spec.taints = [taint]
+        mock_v1.read_node.return_value = node
+        core._apps_v1_client = mock_apps
+        core._core_v1_client = mock_v1
+        core._networking_v1_client = mock_net
+
+        sched_ok = MagicMock()
+        sched_ok.success = True
+        with patch.object(core, "_check_scheduling", new=AsyncMock(return_value=sched_ok)):
+            cfg = SandboxConfig(name="k7d-ten", image="alpine:3.20", backend="k7d", node_name="k7-node-01")
+            result = await core.create_sandbox(cfg)
+
+        assert result.success, result.error
+        pod_spec = mock_apps.create_namespaced_deployment.call_args.kwargs["body"].spec.template.spec
+        assert pod_spec.tolerations
+        tol = pod_spec.tolerations[0]
+        assert tol.key == "k7.katakate.org/tenant"
+        assert tol.value == "acme"
+        assert tol.effect == "NoSchedule"
+
+    async def test_missing_pin_node_fails_loud(self, core: K7Core):
+        from kubernetes_asyncio.client.exceptions import ApiException
+
+        mock_v1 = AsyncMock()
+        mock_v1.read_node.side_effect = ApiException(status=404)
+        core._apps_v1_client = AsyncMock()
+        core._core_v1_client = mock_v1
+        core._networking_v1_client = AsyncMock()
+        cfg = SandboxConfig(name="k7d-gone", image="alpine:3.20", backend="k7d", node_name="no-such-node")
+        result = await core.create_sandbox(cfg)
+        assert not result.success
+        assert "no-such-node" in (result.error or "")
+        core._apps_v1_client.create_namespaced_deployment.assert_not_called()
 
     async def test_create_k7d_fc_uses_runtime_class_k7_fc(self, core: K7Core):
         mock_apps = AsyncMock()
@@ -481,3 +558,52 @@ class TestK7dRequest:
             pytest.raises(RuntimeError, match="no such VM"),
         ):
             await core._k7d_request({"op": "pause_vm", "vm_id": "vm-9"})
+
+
+class TestDedicateNode:
+    async def test_dedicate_writes_label_and_taint(self, core: K7Core):
+        mock_v1 = AsyncMock()
+        node = MagicMock()
+        node.spec.taints = []
+        mock_v1.read_node.return_value = node
+        core._core_v1_client = mock_v1
+
+        result = await core.dedicate_node("k7-node-01", "acme")
+        assert result.success, result.error
+        body = mock_v1.patch_node.await_args.args[1]
+        assert body["metadata"]["labels"][K7_TENANT_LABEL] == "acme"
+        assert body["spec"]["taints"] == [{"key": K7_TENANT_LABEL, "value": "acme", "effect": "NoSchedule"}]
+
+    async def test_dedicate_missing_node_fails_loud(self, core: K7Core):
+        from kubernetes_asyncio.client.exceptions import ApiException
+
+        mock_v1 = AsyncMock()
+        mock_v1.read_node.side_effect = ApiException(status=404)
+        core._core_v1_client = mock_v1
+        result = await core.dedicate_node("missing", "acme")
+        assert not result.success
+        assert "not found" in (result.error or "")
+        mock_v1.patch_node.assert_not_called()
+
+    async def test_undedicate_drops_label_and_taint(self, core: K7Core):
+        mock_v1 = AsyncMock()
+        other = MagicMock()
+        other.key = "node.kubernetes.io/unreachable"
+        other.value = None
+        other.effect = "NoExecute"
+        ours = MagicMock()
+        ours.key = K7_TENANT_LABEL
+        ours.value = "acme"
+        ours.effect = "NoSchedule"
+        node = MagicMock()
+        node.spec.taints = [other, ours]
+        mock_v1.read_node.return_value = node
+        core._core_v1_client = mock_v1
+
+        result = await core.undedicate_node("k7-node-01")
+        assert result.success, result.error
+        body = mock_v1.patch_node.await_args.args[1]
+        assert body["metadata"]["labels"][K7_TENANT_LABEL] is None
+        assert body["spec"]["taints"] == [
+            {"key": "node.kubernetes.io/unreachable", "value": None, "effect": "NoExecute"}
+        ]

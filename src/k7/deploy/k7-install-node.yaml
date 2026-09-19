@@ -3,7 +3,8 @@
   become: true
   vars:
     target_user: "{{ ansible_user | default('root') }}"
-    k7_backend_default: "kata-firecracker-devmapper"
+    # No implicit backend default — every host must set k7_backends (or inherit
+    # group vars). Use k7_backends=none for a node with no sandbox runtime.
     snapshotter_version: "v8.4.0"
     kata_version: "3.24.0"
     cni_plugins_version: "v1.9.0"
@@ -13,7 +14,7 @@
     # k7d backend: release artifact source. Override
     # `k7d_artifact_local_path` (path on the Ansible controller) to install
     # from a locally built tarball instead of the GitHub release.
-    k7d_version: "0.6.0"
+    k7d_version: "0.7.0"
     k7d_artifact_url: "https://github.com/katakate/k7d/releases/download/v{{ k7d_version }}/k7d-v{{ k7d_version }}-x86_64-linux.tar.gz"
     k7d_artifact_local_path: ""
     # Sparse XFS (reflink=1) loopback image backing /var/lib/k7d/disks —
@@ -71,28 +72,45 @@
     # ──────────────────────────────────────────────────────────────────────
     # Compute per-host backend set + cluster role
     # ──────────────────────────────────────────────────────────────────────
+    - name: Require k7_backends on every host
+      ansible.builtin.fail:
+        msg: >-
+          k7_backends is not set on {{ inventory_hostname }} (empty/omitted is not
+          'none'). Set it on the host or a group vars section ([k7_servers:vars] /
+          [k7_agents:vars]). Allowed: kfd, kql, k7d, k7d-fc, or none (no sandbox
+          runtime on this node).
+      when: k7_backends is not defined or (k7_backends | string | trim | length) == 0
+      tags: ['always']
+
     - name: Compute per-host backend list (raw)
       ansible.builtin.set_fact:
-        k7_backends_raw: >-
-          {{
-            (k7_backends.split(',') | map('trim') | reject('equalto','') | list)
-            if (k7_backends is defined and k7_backends | length > 0)
-            else ([k7_backend] if (k7_backend is defined and k7_backend | length > 0)
-                  else [k7_backend_default])
-          }}
+        k7_backends_raw: "{{ (k7_backends | string).split(',') | map('trim') | reject('equalto', '') | list }}"
+      tags: ['always']
+
+    - name: Reject none mixed with other backends
+      ansible.builtin.fail:
+        msg: >-
+          k7_backends={{ k7_backends }} on {{ inventory_hostname }} mixes 'none'
+          with other backends. Use only none, or a list of runtimes.
+      when:
+        - (k7_backends_raw | map('lower') | list | select('equalto', 'none') | list | length) > 0
+        - (k7_backends_raw | length) > 1
       tags: ['always']
 
     - name: Normalize deprecated backend aliases
       ansible.builtin.set_fact:
         k7_backends_list: >-
           {{
-            k7_backends_raw
-            | map('regex_replace', '^(fd|kfd|firecracker-devmapper)$', 'kata-firecracker-devmapper')
-            | map('regex_replace', '^(ql|kql|qemu-longhorn)$', 'kata-qemu-longhorn')
-            | map('regex_replace', '^k7$', 'k7d')
-            | map('regex_replace', '^k7-fc$', 'k7d-fc')
-            | unique
-            | list
+            [] if (k7_backends_raw | map('lower') | list == ['none'])
+            else (
+              k7_backends_raw
+              | map('regex_replace', '^(fd|kfd|firecracker-devmapper)$', 'kata-firecracker-devmapper')
+              | map('regex_replace', '^(ql|kql|qemu-longhorn)$', 'kata-qemu-longhorn')
+              | map('regex_replace', '^k7$', 'k7d')
+              | map('regex_replace', '^k7-fc$', 'k7d-fc')
+              | unique
+              | list
+            )
           }}
       tags: ['always']
 
@@ -102,12 +120,12 @@
           Deprecated backend name(s) in inventory were remapped:
           {{ k7_backends_raw }} → {{ k7_backends_list }}.
           Prefer kata-firecracker-devmapper (kfd) / kata-qemu-longhorn (kql).
-      when: k7_backends_raw != k7_backends_list
+      when: k7_backends_list | length > 0 and k7_backends_raw != k7_backends_list
       tags: ['always']
 
     - name: Validate backends list
       ansible.builtin.fail:
-        msg: "Unknown backend(s) in k7_backends={{ k7_backends_list }}; allowed: kata-firecracker-devmapper, kata-qemu-longhorn, k7d, k7d-fc"
+        msg: "Unknown backend(s) in k7_backends={{ k7_backends_list }}; allowed: kata-firecracker-devmapper, kata-qemu-longhorn, k7d, k7d-fc, or none"
       when: k7_backends_list | difference(['kata-firecracker-devmapper', 'kata-qemu-longhorn', 'k7d', 'k7d-fc']) | length > 0
       tags: ['always']
 
@@ -2139,7 +2157,7 @@
     - name: Store K7 backend configuration (primary backend = first in list)
       ansible.builtin.copy:
         dest: /etc/k7/backend
-        content: "{{ k7_backends_list[0] }}"
+        content: "{{ k7_backends_list[0] if k7_backends_list | length > 0 else 'none' }}"
         mode: '0644'
       tags: ['k7', 'config']
 

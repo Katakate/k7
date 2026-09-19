@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from kubernetes_asyncio.client.exceptions import ApiException
 
-from k7.core.core import K7Core
-from k7.core.models import OperationResult, SandboxConfig
+from k7.core.core import K7_TENANT_LABEL, K7Core
+from k7.core.models import ExecResult, OperationResult, SandboxConfig
 from tests.unit.conftest import mock_deployment, mock_pod
 
 # ---------------------------------------------------------------------------
@@ -14,7 +14,7 @@ from tests.unit.conftest import mock_deployment, mock_pod
 # ---------------------------------------------------------------------------
 
 
-def _setup_clients(core, apps=None, v1=None, net=None, metrics=None, custom=None):
+def _setup_clients(core, apps=None, v1=None, net=None, metrics=None, custom=None, batch=None, apiext=None):
     """Wire MagicMock clients into a K7Core instance."""
     core._config_loaded = True
     if apps is not None:
@@ -27,6 +27,10 @@ def _setup_clients(core, apps=None, v1=None, net=None, metrics=None, custom=None
         core._metrics_client = metrics
     if custom is not None:
         core._custom_objects_client = custom
+    if batch is not None:
+        core._batch_v1_client = batch
+    if apiext is not None:
+        core._apiextensions_v1_client = apiext
 
 
 # --- _detect_backend ---
@@ -71,6 +75,12 @@ class TestDetectBackend:
 
         with patch("os.path.exists", return_value=False):
             assert await core._detect_backend("missing", "default") == "kata-firecracker-devmapper"
+
+    async def test_none_file_is_not_kfd(self, core: K7Core, tmp_path):
+        backend_file = tmp_path / "backend"
+        backend_file.write_text("none\n")
+        with patch("os.path.exists", return_value=True), patch("builtins.open", return_value=open(backend_file)):
+            assert await core._detect_backend(None) == ""
 
 
 # --- delete_sandbox ---
@@ -542,6 +552,7 @@ class TestForkSandbox:
         mock_custom = AsyncMock()
         mock_custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
         _setup_clients(core, apps=mock_apps, v1=mock_v1, net=mock_net, custom=mock_custom)
+        core._detect_backend = AsyncMock(return_value="kata-qemu-longhorn")
 
         src_dep = MagicMock()
         src_dep.metadata.name = "src"
@@ -569,6 +580,7 @@ class TestForkSandbox:
         mock_apps = AsyncMock()
         mock_apps.read_namespaced_deployment.side_effect = ApiException(status=404)
         _setup_clients(core, apps=mock_apps, v1=AsyncMock())
+        core._detect_backend = AsyncMock(return_value="kata-qemu-longhorn")
 
         result = await core.fork_sandbox("src", "dst")
         assert result.success is False
@@ -578,6 +590,7 @@ class TestForkSandbox:
         mock_v1 = AsyncMock()
         mock_v1.read_namespaced_persistent_volume_claim.side_effect = ApiException(status=404)
         _setup_clients(core, apps=mock_apps, v1=mock_v1)
+        core._detect_backend = AsyncMock(return_value="kata-qemu-longhorn")
 
         result = await core.fork_sandbox("src", "dst")
         assert result.success is False
@@ -978,8 +991,8 @@ class TestReadSandboxEgressWhitelist:
 
 
 class TestK7dAgentForwarding:
-    def _remote_pod(self, node: str = "node-remote"):
-        pod = mock_pod(phase="Running")
+    def _remote_pod(self, node: str = "node-remote", name: str = "sb1-pod"):
+        pod = mock_pod(name=name, phase="Running")
         pod.spec.node_name = node
         return pod
 
@@ -1007,29 +1020,38 @@ class TestK7dAgentForwarding:
         fwd.assert_called_once()
         assert fwd.call_args.args[0] == "node-remote"
         assert fwd.call_args.args[1] == "pause"
+        assert fwd.call_args.args[2]["pod_name"] == "sb1-pod"
+        mock_apps.patch_namespaced_deployment.assert_awaited()
 
-    async def test_fork_forwards_to_remote_agent(self, core: K7Core):
+    async def test_fork_looks_up_on_remote_creates_locally(self, core: K7Core):
+        """k7d fork Kubernetes writes stay on k7-api; agent only looks up the VM."""
         dep = mock_deployment(annotations={"k7.katakate.org/backend": "k7d"})
+        dep.spec.template.metadata.labels = {"app": "sb1"}
+        dep.metadata.labels = {"app": "sb1"}
+        dep.spec.selector.match_labels = {"app": "sb1"}
         mock_apps = AsyncMock()
         mock_apps.read_namespaced_deployment.return_value = dep
         mock_v1 = AsyncMock()
         mock_v1.list_namespaced_pod.return_value = MagicMock(items=[self._remote_pod()])
         _setup_clients(core, apps=mock_apps, v1=mock_v1)
+        vm = {"vm_id": "vm-1-0", "sandbox_id": "cri-src", "cluster_id": "cri-src"}
 
         with (
             patch.dict("os.environ", {"K7_NODE_NAME": "node-local"}),
-            patch.object(
-                core,
-                "_k7d_forward_vm_op",
-                new_callable=AsyncMock,
-                return_value=OperationResult(success=True, message="forwarded"),
-            ) as fwd,
+            patch.object(core, "lookup_k7d_vm", new=AsyncMock(return_value=vm)),
+            patch.object(core, "_wait_for_pod_container_started", new=AsyncMock(return_value="fork-pod")),
+            patch.object(core, "_read_sandbox_egress_whitelist", new=AsyncMock(return_value=[])),
+            patch.object(core, "_read_sandbox_ingress_rules", new=AsyncMock(return_value=([], []))),
+            patch.object(core, "_apply_sandbox_network_policies", new=AsyncMock(return_value=OperationResult(True))),
+            patch.object(core, "_k7d_forward_vm_op", new_callable=AsyncMock) as fwd,
         ):
             result = await core.fork_sandbox("sb1", "sb1-fork")
 
-        assert result.success is True
-        assert fwd.call_args.args[1] == "fork"
-        assert fwd.call_args.args[2]["new_name"] == "sb1-fork"
+        assert result.success, result.error
+        fwd.assert_not_called()
+        mock_apps.create_namespaced_deployment.assert_awaited()
+        new_dep = mock_apps.create_namespaced_deployment.call_args.kwargs["body"]
+        assert new_dep.spec.template.spec.node_name == "node-remote"
 
     async def test_agent_refuses_to_reforward(self, core: K7Core):
         """An agent that resolves a sandbox to yet another node must fail
@@ -1283,10 +1305,9 @@ class TestWaitForJob:
         job.status.succeeded = 1
         job.status.failed = 0
         mock_batch.read_namespaced_job.return_value = job
-        _setup_clients(core)
+        _setup_clients(core, batch=mock_batch)
 
-        with patch("k7.core.core.client.BatchV1Api", return_value=mock_batch):
-            result = await core._wait_for_job("j1", timeout=5)
+        result = await core._wait_for_job("j1", timeout=5)
 
         assert result.success is True
 
@@ -1296,10 +1317,9 @@ class TestWaitForJob:
         job.status.succeeded = 0
         job.status.failed = 1
         mock_batch.read_namespaced_job.return_value = job
-        _setup_clients(core)
+        _setup_clients(core, batch=mock_batch)
 
-        with patch("k7.core.core.client.BatchV1Api", return_value=mock_batch):
-            result = await core._wait_for_job("j1", timeout=5)
+        result = await core._wait_for_job("j1", timeout=5)
 
         assert result.success is False
         assert "failed" in result.error
@@ -1310,12 +1330,9 @@ class TestWaitForJob:
         job_ok.status.succeeded = 1
         job_ok.status.failed = 0
         mock_batch.read_namespaced_job.side_effect = [ApiException(status=404), job_ok]
-        _setup_clients(core)
+        _setup_clients(core, batch=mock_batch)
 
-        with (
-            patch("k7.core.core.client.BatchV1Api", return_value=mock_batch),
-            patch("k7.core.core.asyncio.sleep", new_callable=AsyncMock),
-        ):
+        with patch("k7.core.core.asyncio.sleep", new_callable=AsyncMock):
             result = await core._wait_for_job("j1", timeout=10)
 
         assert result.success is True
@@ -1323,10 +1340,9 @@ class TestWaitForJob:
     async def test_non_404_error(self, core: K7Core):
         mock_batch = AsyncMock()
         mock_batch.read_namespaced_job.side_effect = ApiException(status=500)
-        _setup_clients(core)
+        _setup_clients(core, batch=mock_batch)
 
-        with patch("k7.core.core.client.BatchV1Api", return_value=mock_batch):
-            result = await core._wait_for_job("j1", timeout=5)
+        result = await core._wait_for_job("j1", timeout=5)
 
         assert result.success is False
         assert "wait error" in result.error
@@ -1337,7 +1353,7 @@ class TestWaitForJob:
         job.status.succeeded = 0
         job.status.failed = 0
         mock_batch.read_namespaced_job.return_value = job
-        _setup_clients(core)
+        _setup_clients(core, batch=mock_batch)
 
         elapsed = 0.0
 
@@ -1347,7 +1363,6 @@ class TestWaitForJob:
             return elapsed
 
         with (
-            patch("k7.core.core.client.BatchV1Api", return_value=mock_batch),
             patch("k7.core.core.time.time", side_effect=advancing_time),
             patch("k7.core.core.asyncio.sleep", new_callable=AsyncMock),
         ):
@@ -1493,10 +1508,11 @@ class TestWaitForPodContainerStarted:
 # --- _list_backends_per_node ---
 
 
-def _node(name: str, labels: dict[str, str]):
+def _node(name: str, labels: dict[str, str], taints: list | None = None):
     n = MagicMock()
     n.metadata.name = name
     n.metadata.labels = labels
+    n.spec.taints = taints or []
     return n
 
 
@@ -1532,6 +1548,35 @@ class TestListBackendsPerNode:
 
         result = await core._list_backends_per_node()
         assert result["n"] == []
+
+
+class TestListClusterNodes:
+    async def test_hostname_backends_and_tenant(self, core: K7Core):
+        taint = SimpleNamespace(key=K7_TENANT_LABEL, value="acme", effect="NoSchedule")
+        mock_v1 = AsyncMock()
+        mock_v1.list_node.return_value = SimpleNamespace(
+            items=[
+                _node(
+                    "k7-node-01",
+                    {
+                        "kubernetes.io/hostname": "k7-node-01",
+                        "k7.katakate.org/backend-k7d": "true",
+                        K7_TENANT_LABEL: "acme",
+                    },
+                    taints=[taint],
+                ),
+                _node("k7-node-02", {"kubernetes.io/hostname": "k7-node-02"}),
+            ]
+        )
+        _setup_clients(core, v1=mock_v1)
+        rows = await core.list_cluster_nodes()
+        by_name = {r["name"]: r for r in rows}
+        assert by_name["k7-node-01"]["hostname"] == "k7-node-01"
+        assert by_name["k7-node-01"]["backends"] == ["k7d"]
+        assert by_name["k7-node-01"]["tenant"] == "acme"
+        assert by_name["k7-node-02"]["hostname"] == "k7-node-02"
+        assert by_name["k7-node-02"]["backends"] == []
+        assert by_name["k7-node-02"]["tenant"] == ""
 
 
 # --- _check_scheduling ---
@@ -1633,18 +1678,16 @@ class TestCheckScheduling:
 
 class TestCiliumAvailable:
     async def test_returns_true_when_crd_exists(self, core: K7Core):
-        core._config_loaded = True
         fake_api_ext = AsyncMock()
         fake_api_ext.read_custom_resource_definition.return_value = MagicMock()
-        with patch("k7.core.core.client.ApiextensionsV1Api", return_value=fake_api_ext):
-            assert await core._cilium_available() is True
+        _setup_clients(core, apiext=fake_api_ext)
+        assert await core._cilium_available() is True
 
     async def test_returns_false_when_crd_missing(self, core: K7Core):
-        core._config_loaded = True
         fake_api_ext = AsyncMock()
         fake_api_ext.read_custom_resource_definition.side_effect = ApiException(status=404)
-        with patch("k7.core.core.client.ApiextensionsV1Api", return_value=fake_api_ext):
-            assert await core._cilium_available() is False
+        _setup_clients(core, apiext=fake_api_ext)
+        assert await core._cilium_available() is False
 
 
 class TestApplyCiliumEgressPolicy:
@@ -1711,3 +1754,81 @@ class TestApplyCiliumEgressPolicy:
         result = await core._apply_cilium_egress_policy("sb1", "default", [], ["api.openai.com"])
         assert result.success is False
         assert "CiliumNetworkPolicy" in result.error
+
+
+# --- kubernetes_asyncio ApiClient lifecycle ---
+
+
+class TestApiClientLifecycle:
+    async def test_typed_clients_share_one_api_client(self, core: K7Core):
+        api = MagicMock()
+        api.close = AsyncMock()
+        with (
+            patch("k7.core.core.client.ApiClient", return_value=api) as api_cls,
+            patch("k7.core.core.client.CoreV1Api") as core_cls,
+            patch("k7.core.core.client.AppsV1Api") as apps_cls,
+        ):
+            await core._get_core_v1_client()
+            await core._get_apps_v1_client()
+            api_cls.assert_called_once()
+            core_cls.assert_called_once_with(api)
+            apps_cls.assert_called_once_with(api)
+            await core.aclose()
+        api.close.assert_awaited_once()
+        assert core._api_client is None
+        assert core._core_v1_client is None
+        assert core._apps_v1_client is None
+
+    async def test_aclose_is_idempotent(self, core: K7Core):
+        await core.aclose()
+        await core.aclose()
+
+    async def test_aclose_allows_a_new_session(self, core: K7Core):
+        first = MagicMock()
+        first.close = AsyncMock()
+        second = MagicMock()
+        second.close = AsyncMock()
+        with (
+            patch("k7.core.core.client.ApiClient", side_effect=[first, second]),
+            patch("k7.core.core.client.CoreV1Api"),
+        ):
+            await core._get_core_v1_client()
+            await core.aclose()
+            first.close.assert_awaited_once()
+            await core._get_core_v1_client()
+            await core.aclose()
+            second.close.assert_awaited_once()
+
+
+class TestCreateSnapshotMessage:
+    async def test_named_snapshot_keeps_create_message(self, core: K7Core):
+        """Regression: quiesced success used to drop the VolumeSnapshot name.
+
+        ``k7 snapshot create`` echoes ``result.message``; empty stdout failed
+        ``TestSnapshotCrud`` with ``assert snap in cp.stdout``.
+        """
+        dep = MagicMock()
+        dep.metadata.annotations = {}
+        dep.status.ready_replicas = 1
+        mock_apps = AsyncMock()
+        mock_apps.read_namespaced_deployment.return_value = dep
+        _setup_clients(core, apps=mock_apps)
+
+        with (
+            patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-qemu-longhorn")),
+            patch.object(
+                core,
+                "_create_volume_snapshot",
+                new=AsyncMock(
+                    return_value=OperationResult(success=True, message="Snapshot snap1 created for PVC sb-root-lh")
+                ),
+            ),
+            patch.object(
+                core,
+                "exec_command",
+                new=AsyncMock(return_value=ExecResult(exit_code=0, stdout="", stderr="", duration_ms=0)),
+            ),
+        ):
+            result = await core.create_snapshot("sb", "snap1")
+        assert result.success, result.error
+        assert "snap1" in result.message

@@ -76,7 +76,7 @@ The Tech Stack
 Sandbox backends
 </h3>
 
-`k7 install --backend <kfd|kql|k7d|k7d-fc>` provisions one or more backends per node; `k7 create --backend …` picks one per sandbox. See [docs/BACKENDS.md](docs/BACKENDS.md) for the architecture and [PERFORMANCE.md](PERFORMANCE.md) for the full measurements (Hetzner AX41 node, medians).
+`k7 install --backend <kfd|kql|k7d|k7d-fc>` provisions those backends (required; there is no default). `none` installs the cluster with no sandbox runtime — typical for scheduling-only masters (`k7_backends=none` in inventory). Each sandbox picks one runtime (`k7 create --backend …`). See [docs/BACKENDS.md](docs/BACKENDS.md) for the architecture and [PERFORMANCE.md](PERFORMANCE.md) for the full measurements (Hetzner AX41 node, medians).
 
 | | `kfd` (kata-firecracker-devmapper) | `kql` (kata-qemu-longhorn) | `k7d` | `k7d-fc` |
 |---|---|---|---|---|
@@ -107,7 +107,7 @@ Also available today
 - 🌐 Multi-node clusters (Ansible + Longhorn)
 - 🔍 Cilium CNI with FQDN egress policies (optional Hubble flow observability via <code>k7 install --hubble</code>; off by default, observability only)
 - 📸 Pause / resume / fork / restore and <code>k7 snapshot</code> lifecycle
-- 🐍 Python SDK: <code>pip install k7-sdk</code> (<code>katakate</code> package deprecated)
+- 🐍 Python SDK: <code>pip install k7-sdk==0.4.0</code> (<code>katakate</code> package deprecated)
 
 📋 **See [ROADMAP.md](ROADMAP.md) for upcoming work (GPU passthrough, …).**
 
@@ -127,7 +127,7 @@ We provide a:
 
 - **CLI**: to use on the node(s) directly --> `apt install k7`
 - **API**: deployed automatically by `k7 install` (toggle with `k7 api enable` / `k7 api disable`)
-- **Python SDK**: HTTP client sync/async --> `pip install k7-sdk`
+- **Python SDK**: HTTP client sync/async --> `pip install k7-sdk==0.4.0`
 
 ## Current requirements
 
@@ -147,7 +147,7 @@ We provide a:
     - Azure: Dv3, Ev3, Dv4, Ev4, Dv5, Ev5 (Intel/AMD x86) or Dpdsv5, Dpldsv5, Epsv5 (ARM64).
     - DigitalOcean: Premium Intel and AMD droplets with nested virtualization enabled.
     - Others: in general, hardware virtualization is not exposed on cloud VPS, so you'll likely want a dedicated / bare metal.
-- One raw disk (unformatted, unpartitioned) for the thin-pool that k7 will provision for efficient disk usage of sandboxes.
+- **kfd only:** one raw disk (unformatted, unpartitioned) for the thin-pool. Other backends (`kql`, `k7d`) install without a spare drive. `k7 install` does not imply kfd.
   - Use `./utils/wipe-disk.sh /your/disk` to wipe a disk clean before provisioning. DANGER: destructive - it will remove data/partitions/formatting/SWRAID.
 - Ansible (for installer):
   ```bash
@@ -174,7 +174,7 @@ The **`.deb` / PPA package is Linux-only** (amd64/arm64). On a MacBook:
 - **CLI from source:** `./src/k7/cli/dev.sh` (same commands as `k7`; uses `uv` + `PYTHONPATH=src`)
 - **API client from laptop:** set `K7_API_URL` and `K7_API_KEY`, then `dev.sh create` / `dev.sh list` (no `--core`)
 - **`k7 install`** targets Linux servers with KVM — run on the node or via SSH, not on macOS locally
-- **`pip install k7-sdk`** for Python scripts only
+- **`pip install k7-sdk==0.4.0`** for Python scripts only
 
 Do not install the Ubuntu `.deb` on macOS.
 
@@ -183,21 +183,26 @@ Do not install the Ubuntu `.deb` on macOS.
 
 ### Get your node(s) ready
 
-The Launchpad PPA currently publishes **0.2.2**. For **0.3.1** (HTTPS API,
-`--docker`, k7d 0.6.0, HA `k7d-fc` copy) install the GitHub release `.deb`,
-then clone the matching source — `k7 install` builds `k7-api:local` from
-the current working directory:
+The Launchpad PPA publishes **0.4.0**. Install the CLI, then clone the matching
+source — `k7 install` builds `k7-api:local` from the current working directory:
 
 ```shell
-curl -fsSL -O https://github.com/Katakate/k7/releases/download/v0.3.1/k7_0.3.1_amd64.deb
-sudo apt install ./k7_0.3.1_amd64.deb
-git clone --branch v0.3.1 https://github.com/Katakate/k7.git
+sudo add-apt-repository ppa:katakate.org/k7
+sudo apt update
+sudo apt install k7
+k7 -V   # 0.4.0
+# GitHub .deb is the same package if you prefer not to add the PPA:
+# curl -fsSL -O https://github.com/Katakate/k7/releases/download/v0.4.0/k7_0.4.0_amd64.deb
+# sudo apt install ./k7_0.4.0_amd64.deb
+git clone --branch v0.4.0 https://github.com/Katakate/k7.git
 cd k7
 sudo apt install -y ansible
 curl -fsSL https://get.docker.com | sh
 ```
 
-Then let `k7` get your node ready:
+Then let `k7` get your node ready. **`--backend` is required** (no silent
+default). kfd needs a spare raw disk; kql uses Longhorn on the OS disk; k7d
+is the warm-fork daemon. `none` is control-plane only (no sandbox runtime):
 
 ```console
 $ k7 install --backend kfd,kql,k7d
@@ -215,11 +220,13 @@ Optionally pass `-v` for a verbose output.
 > [tutorials/k7_hetzner_node_setup.md](tutorials/k7_hetzner_node_setup.md)
 > (this file is also in public [Katakate/k7](https://github.com/Katakate/k7)).
 >
-> The playbook pins k7d **0.6.0**. `--docker` needs the guest docker
+> The playbook pins k7d **0.7.0**. `--docker` needs the guest docker
 > service (payload on the node); an older k7d fails loudly with
 > `this k7d has no docker service; upgrade`. Multi-node inventory shapes
 > (2-node server+agent, 3-node `--ha`) are in
-> `src/k7/deploy/inventory.ini.example`.
+> `src/k7/deploy/inventory.ini.example`. Every inventory host must set
+> `k7_backends` (or inherit group vars). Use `k7_backends=none` on
+> `[k7_servers]` when agents run the sandboxes — empty/omitted is an error.
 
 `k7 install` serves `k7-api` on NodePort `31007` over HTTPS. The default
 is a playbook-minted cluster CA (Let's Encrypt cannot issue for a bare
@@ -355,8 +362,11 @@ separate "start" step.
 k7 api status
 k7 api endpoint
 
-# Generate API key
+# Generate API key (optionally pin to a namespace and/or node)
 k7 generate-api-key my-key1
+k7 nodes list   # NAME is the Linux hostname K3s registered; not an inventory label
+k7 generate-api-key tenant-a -n tenant-a --node k7-node-01
+k7 nodes dedicate k7-node-01 --tenant acme
 
 # Temporarily disable / re-enable
 k7 api disable
@@ -373,12 +383,12 @@ After your k7 API is up, usage is very simple.
 
 Install the Python SDK via:
 ```shell
-pip install k7-sdk
+pip install k7-sdk==0.4.0
 ```
 
 Or if you want async support:
 ```shell
-pip install "k7-sdk[async]"
+pip install "k7-sdk[async]==0.4.0"
 ```
 
 The legacy `katakate` PyPI name remains as a one-release shim that re-exports `k7_sdk` with a deprecation warning.

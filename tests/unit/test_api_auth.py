@@ -4,13 +4,15 @@ import hashlib
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 from fastapi import HTTPException
 
-from k7.api.main import app, authorize_namespace, load_api_keys
+from k7.api.main import app, apply_node_scope, authorize_namespace, load_api_keys
+from k7.core.models import OperationResult
 
 TEST_KEY = "k7-test-secret-key-abc123"
 TEST_KEY_HASH = hashlib.sha256(TEST_KEY.encode()).hexdigest()
@@ -21,6 +23,7 @@ def _make_keys_data(
     expires: int | None = None,
     last_used: int | None = None,
     namespaces: list[str] | None = None,
+    nodes: list[str] | None = None,
 ) -> dict:
     entry: dict = {"name": "test-key"}
     if expires is not None:
@@ -29,6 +32,8 @@ def _make_keys_data(
         entry["last_used"] = last_used
     if namespaces is not None:
         entry["namespaces"] = namespaces
+    if nodes is not None:
+        entry["nodes"] = nodes
     return {TEST_KEY_HASH: entry}
 
 
@@ -217,3 +222,119 @@ class TestAuthorizeNamespace:
         assert resp.status_code == 200
         assert resp.json()["data"] == payload
         core_cls.return_value.nodes_storage.assert_awaited_once()
+
+
+# --- apply_node_scope ---
+
+
+class TestApplyNodeScope:
+    def test_unrestricted_key_keeps_caller_pin(self):
+        assert apply_node_scope({"name": "u"}, None) is None
+        assert apply_node_scope({"name": "u", "nodes": []}, "k7-node-01") == "k7-node-01"
+
+    def test_single_node_key_auto_pins(self):
+        assert apply_node_scope({"nodes": ["k7-node-01"]}, None) == "k7-node-01"
+
+    def test_single_node_key_allows_listed_node(self):
+        assert apply_node_scope({"nodes": ["k7-node-01"]}, "k7-node-01") == "k7-node-01"
+
+    def test_scoped_key_denied_other_node(self):
+        with pytest.raises(HTTPException) as exc:
+            apply_node_scope({"nodes": ["k7-node-01"]}, "k7-node-02")
+        assert exc.value.status_code == 403
+        assert "k7-node-02" in str(exc.value.detail)
+
+    def test_multi_node_key_requires_explicit_node(self):
+        with pytest.raises(HTTPException) as exc:
+            apply_node_scope({"nodes": ["k7-node-01", "k7-node-02"]}, None)
+        assert exc.value.status_code == 403
+        assert "explicit allowed node" in str(exc.value.detail)
+
+    def test_multi_node_key_allows_listed_node(self):
+        assert apply_node_scope({"nodes": ["k7-node-01", "k7-node-02"]}, "k7-node-02") == "k7-node-02"
+
+    async def test_single_node_key_create_stamps_node_name(self, _patch_keys_file, keys_file: Path):
+        future_ts = int(time.time()) + 86400
+        data = _make_keys_data(expires=future_ts, nodes=["k7-node-01"])
+        keys_file.write_text(json.dumps(data))
+
+        with patch("k7.api.main.K7Core") as core_cls:
+            core_cls.return_value.create_sandbox = AsyncMock(return_value=OperationResult(success=True))
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    "/api/v1/sandboxes",
+                    headers={"X-API-Key": TEST_KEY},
+                    json={"name": "t", "image": "alpine"},
+                )
+        assert resp.status_code == 201, resp.text
+        cfg = core_cls.return_value.create_sandbox.await_args.args[0]
+        assert cfg.node_name == "k7-node-01"
+
+    async def test_scoped_key_create_other_node_returns_403(self, _patch_keys_file, keys_file: Path):
+        future_ts = int(time.time()) + 86400
+        data = _make_keys_data(expires=future_ts, nodes=["k7-node-01"])
+        keys_file.write_text(json.dumps(data))
+
+        with patch("k7.api.main.K7Core") as core_cls:
+            core_cls.return_value.create_sandbox = AsyncMock(return_value=OperationResult(success=True))
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    "/api/v1/sandboxes",
+                    headers={"X-API-Key": TEST_KEY},
+                    json={"name": "t", "image": "alpine", "node_name": "k7-node-02"},
+                )
+        assert resp.status_code == 403
+        core_cls.return_value.create_sandbox.assert_not_called()
+
+    async def test_node_scoped_key_nodes_storage_returns_403(self, _patch_keys_file, keys_file: Path):
+        future_ts = int(time.time()) + 86400
+        data = _make_keys_data(expires=future_ts, nodes=["k7-node-01"])
+        keys_file.write_text(json.dumps(data))
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/api/v1/nodes/storage",
+                headers={"X-API-Key": TEST_KEY},
+            )
+        assert resp.status_code == 403
+        assert "cluster-wide node" in resp.json()["error"]["message"]
+
+    async def test_restore_stamps_node_name(self, _patch_keys_file, keys_file: Path):
+        future_ts = int(time.time()) + 86400
+        data = _make_keys_data(expires=future_ts, nodes=["k7-node-01"])
+        keys_file.write_text(json.dumps(data))
+
+        with patch("k7.api.main.K7Core") as core_cls:
+            core_cls.return_value.restore_sandbox = AsyncMock(return_value=OperationResult(success=True))
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    "/api/v1/snapshots/snap1/restore",
+                    headers={"X-API-Key": TEST_KEY},
+                    json={"new_sandbox_name": "restored"},
+                )
+        assert resp.status_code == 201, resp.text
+        kwargs = core_cls.return_value.restore_sandbox.await_args.kwargs
+        assert kwargs["node_name"] == "k7-node-01"
+
+    async def test_fork_denied_when_source_on_other_node(self, _patch_keys_file, keys_file: Path):
+        future_ts = int(time.time()) + 86400
+        data = _make_keys_data(expires=future_ts, nodes=["k7-node-01"])
+        keys_file.write_text(json.dumps(data))
+        source = SimpleNamespace(name="src", node="k7-node-02")
+
+        with patch("k7.api.main.K7Core") as core_cls:
+            core_cls.return_value.list_sandboxes = AsyncMock(return_value=[source])
+            core_cls.return_value.fork_sandbox = AsyncMock(return_value=OperationResult(success=True))
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post(
+                    "/api/v1/sandboxes/src/fork",
+                    headers={"X-API-Key": TEST_KEY},
+                    json={"new_name": "forked"},
+                )
+        assert resp.status_code == 403
+        core_cls.return_value.fork_sandbox.assert_not_called()

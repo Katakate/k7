@@ -1,14 +1,27 @@
 ; Example multi-node inventory for `k7 install -i inventory.ini`.
 ;
-; Each host declares which backend(s) it supports via `k7_backends` (comma-separated).
-; A node may support one or both of:
-;   - kata-qemu-longhorn          (uses Kata QEMU + overlayfs + Longhorn for sandbox storage)
-;   - kata-firecracker-devmapper  (uses Kata Firecracker + LVM thin-pool snapshotter)
+; The left-hand name (k7-node-01) MUST match the machine hostname
+; (`hostnamectl` / installimage HOSTNAME). K3s names the Node after that
+; hostname and stamps kubernetes.io/hostname=<name> automatically.
+; This file does not write that label. `k7_backends` tells the playbook
+; which k7.katakate.org/backend-* labels to stamp after the node joins.
+; Tenant isolation is later: `k7 nodes dedicate NAME --tenant ID`.
+; Copy NAME from `k7 nodes list` / `kubectl get nodes` into `--node`.
+;
+; `k7_backends` is required on every host (or inherited from group vars).
+; Empty/omitted is an error, not "no runtimes". Use `none` for a node that
+; must not run sandboxes (typical [k7_servers] in a cluster that has agents).
+; Allowed: kfd, kql, k7d, k7d-fc, none (comma-separated except none alone).
+;
+; A node may list one or more of:
+;   - kata-qemu-longhorn / kql         (Kata QEMU + overlayfs + Longhorn)
+;   - kata-firecracker-devmapper / kfd (Kata Firecracker + LVM thin-pool; spare disk)
+;   - k7d / k7d-fc
 ;
 ; Per-host vars:
 ;   ansible_host           : SSH target IP
 ;   ansible_user           : SSH user (defaults to root)
-;   k7_backends            : comma-separated backend list
+;   k7_backends            : comma-separated backend list, or none
 ;   k7_devmapper_disk      : block device for FD thin-pool (e.g. /dev/nvme1n1)
 ;   longhorn_extra_disk    : extra mount path to register with Longhorn
 ;   kata_thinpool_pv_size  : LVM PV size for the kfd thin-pool (default 100G)
@@ -41,6 +54,10 @@ longhorn_replicas=2
 ; tolerance — for a 2-node cluster, put the second node in [k7_agents].
 ; The first host listed in [k7_servers] is the cluster-init server.
 ;
+; Every [k7_servers] host is a K3s master: root there is cluster-admin
+; (k3s.yaml + join token + etcd). Put tenant sandboxes on [k7_agents]
+; and pin/dedicate those agent names. Do not dedicate the first master.
+;
 ; Do NOT pass --backend alongside -i: per-host `k7_backends` in the
 ; inventory is authoritative (an explicit --backend overrides it).
 ;
@@ -56,16 +73,16 @@ longhorn_replicas=2
 ; 2-node, ALL backends, from the PPA CLI (no --ha — that needs 3+ servers).
 ; After TWO_DISK=1 so each box has a spare raw NVMe:
 ;
-;   # PPA is still 0.2.2; prefer the GitHub 0.3.0 .deb, then:
-;   git clone --branch v0.3.0 https://github.com/Katakate/k7.git && cd k7
+;   # PPA and GitHub .deb are 0.4.0:
+;   git clone --branch v0.4.0 https://github.com/Katakate/k7.git && cd k7
 ;   # run from that checkout so the playbook can build k7-api:local
-;   k7 install -i inventory.ini --k7d-version 0.6.0
+;   k7 install -i inventory.ini --k7d-version 0.7.0
 ;
 ; [k7_servers]
-; k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
+; k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d,k7d-fc
 ;
 ; [k7_agents]
-; k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
+; k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d,k7d-fc
 ;
 ; [k7_cluster:children]
 ; k7_servers
@@ -77,14 +94,38 @@ longhorn_replicas=2
 ; ansible_ssh_common_args=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 ; longhorn_replicas=2
 ;
-; 3-node HA with ALL backends on every node. ONE command:
+; 3 small masters (no sandboxes) + agents. `none` is required on servers —
+; omitting k7_backends is an error, not an implicit empty set.
 ;
-;   k7 install -i inventory.ini --ha --k7d-version 0.6.0
+;   k7 install -i inventory.ini --ha --k7d-version 0.7.0
 ;
 ; [k7_servers]
-; k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
-; k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
-; k7-node-03 ansible_host=203.0.113.12 k7_backends=kfd,kql,k7d
+; k7-node-01 ansible_host=203.0.113.10
+; k7-node-02 ansible_host=203.0.113.11
+; k7-node-03 ansible_host=203.0.113.12
+;
+; [k7_servers:vars]
+; k7_backends=none
+;
+; [k7_agents]
+; k7-node-04 ansible_host=203.0.113.13
+; k7-node-05 ansible_host=203.0.113.14
+;
+; [k7_agents:vars]
+; k7_backends=kql,k7d
+;
+; [k7_cluster:children]
+; k7_servers
+; k7_agents
+;
+; 3-node HA with ALL backends on every node (soak / demo). ONE command:
+;
+;   k7 install -i inventory.ini --ha --k7d-version 0.7.0
+;
+; [k7_servers]
+; k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d,k7d-fc
+; k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d,k7d-fc
+; k7-node-03 ansible_host=203.0.113.12 k7_backends=kfd,kql,k7d,k7d-fc
 ;
 ; [k7_cluster:children]
 ; k7_servers

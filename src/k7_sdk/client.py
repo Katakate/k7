@@ -82,6 +82,7 @@ class Client:
                 "ingress_ports": [8000],
                 "ingress_from": ["sandbox:client-a"],  # default: same-namespace sandboxes
                 # "expose_ports": [8000],  # NodePort outside the cluster; needs the same ingress_ports
+                # "node_name": "k7-node-01",  # pin; a node-scoped API key also stamps/rejects this
             })
         """
         response = self.session.post(f"{self.base_url}/api/v1/sandboxes", json=sandbox_config)

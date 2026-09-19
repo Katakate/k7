@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-19
+
+Per-key node pins, k7d-fc pause/resume/exec, and HA-soak fixes. Playbook
+pins k7d **0.7.0**. GitHub `.deb`, Launchpad PPA, and PyPI `k7-sdk` are
+**0.4.0**.
+
+### Added
+
+- **Optional per-key node placement** for tenant isolation on the
+  shared per-node k7d daemon. `k7 generate-api-key --node <node>`
+  (repeatable) stores `"nodes"` on the key, analogous to `-n` for
+  namespaces. Placement uses the Node's `kubernetes.io/hostname`
+  label, not `spec.nodeName`. `k7 nodes dedicate NODE --tenant ID`
+  writes `k7.katakate.org/tenant` as a label and a NoSchedule taint so
+  other sandboxes cannot share that daemon. `k7 nodes list` shows the
+  K3s Node names (Linux hostname / `kubernetes.io/hostname`) to pass
+  to `--node`; inventory.ini does not write that label — `k7_backends`
+  only stamps backend labels at install. A single-node key auto-pins
+  creates/restores; a multi-node key requires an explicit `node_name`
+  / `k7 create --node`. Forks must already sit on an allowed node.
+  `GET /api/v1/nodes/storage` is 403 for a node-scoped key. Unscoped
+  keys keep unrestricted placement. Root on `[k7_servers]` is still
+  cluster-admin; pins do not contain a host compromise — tenant
+  sandboxes belong on `[k7_agents]`. `k7-agent` has no kube SA token
+  and no `remote-node` ingress, so a dedicated worker breakout is that
+  tenant, not cluster-admin.
+- **k7d-fc resume → exec**: pin Firecracker v1.16.2; pause/resume/exec
+  integration row and filled `PERFORMANCE.md` lifecycle table.
+
+### Fixed
+
+- **`k7 api status` / `k7 api endpoint` from a laptop** no longer crash with
+  `FileNotFoundError: kubectl`. With `k7 config set api.url` they print the
+  configured URL and probe `GET /health`. `k7 api enable`/`disable` still
+  need kubectl on a cluster node and now say so instead of tracebacking.
+- **Kata memory below 256Mi** is rejected at create time instead of waiting
+  300s for `FailedCreatePodSandBox` (docs `k7.yaml` used `128Mi`).
+- **Create success text** after `--expose-port` points at `k7 list`, not a
+  nonexistent `k7 list --name`.
+- **Kata kql `--docker` live fork / snapshot** now `fsfreeze`s
+  `/var/lib/docker` in the docker-vehicle around VolumeSnapshot create
+  (thaw in `finally`). alpine dind has no `fsfreeze`; it is staged from
+  the sandbox image via the shared `/tmp`. `sync` alone left overlay2
+  crash-inconsistent on Longhorn r=3.
+- **`k7 delete` does not wait for k7d VM teardown.** The docker-graph
+  leftover assertion polls up to 60s instead of a 3s sleep.
+- **Loud kfd fork reject**, cluster CA snippet in the SDK/docs path, and
+  `K7Core` aiohttp session close on teardown.
+
+### Changed
+
+- **`k7 install --backend` is required.** There is no default runtime
+  list (kfd needs a spare disk; installing all backends grows attack
+  surface). Inventory hosts must set `k7_backends` (group vars are
+  fine). `none` is the only empty set — scheduling-only masters use
+  `[k7_servers:vars] k7_backends=none`. Empty/omitted is an error, not
+  kfd.
+- Playbook default `k7d_version` is **0.7.0** (was 0.6.0). README,
+  Hetzner tutorial, and inventory examples target k7 **0.4.0** on
+  GitHub, PPA, and PyPI.
+
 ## [0.3.1] — 2026-09-14
 
 HA install and API-path `--docker` fixes for the 0.3.0 line. README

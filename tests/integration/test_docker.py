@@ -145,6 +145,22 @@ def _k7d_docker_disk_names() -> set[str]:
     return {p.name for p in _K7D_DISKS.iterdir() if "docker" in p.name}
 
 
+async def _wait_k7d_docker_disks_gone(before: set[str], timeout: float = 60.0) -> None:
+    """k7 delete returns when K8s objects are gone; k7d unlinks the graph later.
+
+    ``delete_sandbox`` does not wait for VM teardown (API latency must not
+    couple to shim Delete). Poll here; a leftover after ``timeout`` is a leak.
+    """
+    started = time.time()
+    leftover: set[str] = set()
+    while time.time() - started < timeout:
+        leftover = _k7d_docker_disk_names() - before
+        if not leftover:
+            return
+        await asyncio.sleep(1)
+    raise AssertionError(f"leaked k7d docker volume images after {time.time() - started:.1f}s: {leftover}")
+
+
 def _pod_annotations(name: str, namespace: str) -> dict[str, str]:
     result = subprocess.run(
         [
@@ -237,9 +253,7 @@ class TestDockerK7d:
             assert capbnd != "000001ffffffffff", f"sandbox CapBnd is full: {capbnd}"
         finally:
             await k7_core.delete_sandbox(name, namespace=test_namespace)
-            await asyncio.sleep(3)
-            leftover = _k7d_docker_disk_names() - before_disks
-            assert not leftover, f"leaked k7d docker volume images: {leftover}"
+            await _wait_k7d_docker_disks_gone(before_disks)
 
     async def test_docker_build_and_compose(self, k7_core: K7Core, test_namespace: str):
         """docker build + compose of a one-service fixture."""
@@ -582,7 +596,10 @@ class TestDockerKQL(_DockerKataMixin):
             await _sh(k7_core, source, test_namespace, "docker pull alpine:3.21")
             fork = await k7_core.fork_sandbox(source, fork_name, namespace=test_namespace)
             assert fork.success, fork.error
-            _wait_all_containers_ready(fork_name, test_namespace, timeout=240)
+            # Same 600s bound as test_qemu.test_fork_clones_data: on HA
+            # longhorn_replicas=3 the cloned volumes hydrate before first
+            # attach ("not ready for workloads"). 240s is a false timeout.
+            _wait_all_containers_ready(fork_name, test_namespace, timeout=600)
             await _wait_docker_ready(k7_core, fork_name, test_namespace)
             has = await _sh(
                 k7_core, fork_name, test_namespace, "docker image inspect alpine:3.21 >/dev/null && echo yes"

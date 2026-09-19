@@ -7,6 +7,7 @@ ingress no matter how locked down its source was.
 
 import asyncio
 import ipaddress
+import os
 import subprocess
 import time
 
@@ -19,6 +20,7 @@ from k7.core.models import OperationResult, SandboxConfig
 pytestmark = pytest.mark.integration
 
 _K3S = "/usr/local/bin/k3s"
+_LOCAL_NODE = os.uname().nodename
 
 
 def _cilium_crd_present() -> bool:
@@ -449,6 +451,10 @@ class TestSandboxExpose:
             ingress_ports=[8000],
             ingress_from=sources,
             expose_ports=[8000],
+            # Pin to the suite node. ``externalTrafficPolicy: Local`` only
+            # answers on the pod's node; in-cluster curl of another node's
+            # NodePort is intercepted by Cilium socket-LB and times out.
+            node_name=_LOCAL_NODE,
         )
         result = await k7_core.create_sandbox(cfg)
         assert result.success, f"create {name} failed: {result.error}"
@@ -458,6 +464,7 @@ class TestSandboxExpose:
         return endpoints[0]["url"]
 
     async def test_expose_is_reachable_and_cleaned_up(self, k7_core: K7Core, test_namespace: str):
+        """NodePort answers on the suite node; Local + Cilium is not Cluster."""
         name = "integ-exp-open"
         try:
             url = await self._exposed(k7_core, test_namespace, name, ["cidr:0.0.0.0/0"])

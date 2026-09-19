@@ -324,9 +324,37 @@ fork is the k8s adopt path (not the ~5 ms VMM CoW floor); alpine
 create→Ready / fork→exec on the same node this run were **2.15 s /
 2.54 s** (k7d) and **2.14 s / 2.45 s** (k7d-fc), n=1.
 
-k7-fc CRI exec after pause/resume hung (readiness probe timeout,
-`guest_cid=0` retained) — see CHALLENGES #17. Do not quote a
-resume→exec number for k7d-fc from this cut.
+### k7d vs k7d-fc lifecycle — 2026-09-14
+
+Same 3-node HA cluster (k7-node-01 as the bench host: Hetzner AX41,
+Ryzen 5 3600, 64 GiB, NVMe, Ubuntu 24.04, kernel 6.8.0-138, k3s
+v1.36.4), k7d 0.6.0 built from the Firecracker jail-integrity branch
+(not the public GitHub tarball of the same version string), Firecracker v1.16.2,
+`alpine:3.20`, 3 reps interleaved, median. `resume → exec` is
+`resume_sandbox()` until an `echo` exec answers; `pause` is the API
+call until the VM is frozen.
+
+```bash
+K7_BENCH_BACKENDS=k7d,k7d-fc K7_BENCH_REPS=3 \
+  uv run pytest -m bench tests/integration/bench_backend_lifecycle.py -v -s
+```
+
+| Operation | k7d | k7d-fc |
+|-----------|-----|--------|
+| create → Ready | 2.39 s | 2.38 s |
+| exec round-trip (median of 10) | 0.37 s | 0.37 s |
+| fork call | 2.73 s | 2.66 s |
+| fork → Ready + exec answers | 3.23 s | 3.15 s |
+| pause effective | 0.35 s | 0.35 s |
+| **resume → exec answers** | **0.67 s** (0.62–0.76) | **0.70 s** (0.69–0.72) |
+| delete | 0.70 s | 0.66 s |
+
+The earlier caveat on this section — k7-fc CRI exec after pause/resume
+hung, do not quote a resume→exec number — is gone: the hang was
+Firecracker v1.16.0/v1.16.1 gating vsock RX after a bare resume
+(upstream #6100, fixed in v1.16.2), plus a shim exec bridge that left
+kubelet's probe parked (k7d CHALLENGES #240 / #241; CHALLENGES #17
+here).
 
 ## k7d `--docker` (first-class guest service)
 

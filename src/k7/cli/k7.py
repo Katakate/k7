@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import requests
 import typer
 from click.core import ParameterSource
 from rich.console import Console, Group
@@ -31,12 +32,30 @@ from rich.table import Table
 from rich.text import Text
 
 from k7 import __version__ as K7_VERSION
-from k7.cli._client import CliContext, handle_api_call
+from k7.cli._client import CliContext, _resolve_api_ca, _resolve_api_url, handle_api_call, verify_ssl_for_url
 from k7.cli._config import config_app
-from k7.core.core import K7Core
+from k7.core.core import K7Core, aclose_k7_core
 from k7.core.docker import parse_docker_disk
 from k7.core.models import SandboxConfig, SandboxConfigOverrides
 from k7.core.sidecar import SIDECAR_REGISTRY
+
+
+def _core_run(core: K7Core, coro):
+    """Run one K7Core coroutine and close its kube ApiClient.
+
+    Typer is sync and uses ``asyncio.run``, which tears down the loop when
+    the coroutine returns. kubernetes_asyncio binds aiohttp to that loop;
+    without ``aclose`` the interpreter logs ``Event loop is closed``.
+    """
+
+    async def _run():
+        try:
+            return await coro
+        finally:
+            await aclose_k7_core(core)
+
+    return asyncio.run(_run())
+
 
 app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]})
 app.add_typer(config_app, name="config")
@@ -139,6 +158,19 @@ BACKEND_ALIASES = {
     "k7": "k7d",
     "k7-fc": "k7d-fc",
 }
+# Install-time empty set. Not a RuntimeClass — omit/blank is an error, not none.
+BACKEND_NONE = "none"
+INSTALL_BACKEND_REQUIRED = (
+    "Specify --backend (required; there is no default).\n"
+    "  kfd     Firecracker + jailer; needs a spare raw disk\n"
+    "  kql     Kata QEMU + Longhorn on the OS disk\n"
+    "  k7d     warm-fork microVM daemon (shared per node)\n"
+    "  k7d-fc  same daemon, Firecracker under the jailer\n"
+    "  none    no sandbox runtime on this node (control-plane only)\n"
+    "Example: k7 install --backend kfd,kql,k7d\n"
+    "Inventory (-i): every host needs k7_backends=… or k7_backends=none "
+    "(group vars are fine). Empty/omitted is not none."
+)
 # Deprecated short + pre-rename full names. Still accepted; emit a warning.
 BACKEND_DEPRECATED_ALIASES = {
     "fd": "kata-firecracker-devmapper",
@@ -177,12 +209,21 @@ def _parse_backends(value: str) -> list[str]:
 
     Used by `k7 install` where multiple backends can be installed on a node.
     Preserves first-seen order; raises typer.BadParameter on unknown entries.
+    ``none`` is the empty set (no sandbox runtime); it cannot mix with others.
     """
     if value is None:
         raise typer.BadParameter("Backend value cannot be empty.")
     raw = [p for p in (s.strip() for s in value.split(",")) if p]
     if not raw:
         raise typer.BadParameter("Backend value cannot be empty.")
+    lowered = [p.lower() for p in raw]
+    if BACKEND_NONE in lowered:
+        if lowered != [BACKEND_NONE]:
+            raise typer.BadParameter(
+                f"'{BACKEND_NONE}' cannot be combined with other backends. "
+                "Use only none, or a list of runtimes (kfd, kql, k7d, k7d-fc)."
+            )
+        return []
     seen: builtins.list[str] = []
     for entry in raw:
         normalized = _normalize_backend(entry)
@@ -196,6 +237,44 @@ def _kubectl_cmd() -> list[str]:
     return ["k3s", "kubectl"] if shutil.which("k3s") else ["kubectl"]
 
 
+def _kubectl_run(kubectl: list[str], args: list[str]) -> subprocess.CompletedProcess[str] | None:
+    """Run kubectl. ``None`` when the binary is missing (laptop / API-only host)."""
+    try:
+        return subprocess.run(kubectl + args, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+
+
+def _api_status_via_https() -> None:
+    """Laptop path: probe ``GET /health`` on the configured API URL.
+
+    ``k7 api status`` historically shelled out to kubectl, which crashes with
+    ``FileNotFoundError`` on a machine that only has the .deb CLI. Fail loud
+    if nothing is configured; otherwise print reachability + the URL.
+    """
+    url = _resolve_api_url(None)
+    if not url:
+        typer.echo("❌ kubectl is not installed, and no API URL is configured.")
+        typer.echo("On a cluster node, `k7 api status` uses kubectl.")
+        typer.echo("From a laptop, after `k7 config set api.url` / `api.ca` / `api.key`:")
+        typer.echo("    curl --cacert ./k7-ca.crt https://<node-ip>:31007/health")
+        raise typer.Exit(1)
+    ca = _resolve_api_ca(None)
+    verify = verify_ssl_for_url(url, ca)
+    try:
+        resp = requests.get(f"{url.rstrip('/')}/health", timeout=10, verify=verify)
+    except requests.RequestException as e:
+        typer.echo(f"❌ Could not reach K7 API at {url}: {e}", err=True)
+        raise typer.Exit(1) from e
+    if resp.ok:
+        typer.echo("✅ K7 API is reachable")
+        typer.echo(f"🌐 API endpoint: {url}")
+        typer.echo("\n📝 Replica counts and pod placement need kubectl on a cluster node.")
+        return
+    typer.echo(f"❌ K7 API at {url} returned HTTP {resp.status_code}", err=True)
+    raise typer.Exit(1)
+
+
 def _build_default_inventory(
     hosts: list[str] | None,
     role: str,
@@ -206,13 +285,12 @@ def _build_default_inventory(
     """Build a minimal multi-group inventory when the user did not provide one.
 
     Single-host shortcut: no `hosts` argument → localhost server with the
-    user-supplied backends. `backends` may contain one or both of
-    `kata-firecracker-devmapper` and `kata-qemu-longhorn`; the playbook will install
-    each backend's prerequisites only when listed.
+    user-supplied backends (``--backend`` is required; ``none`` →
+    ``k7_backends=none``).
     """
     server_lines: builtins.list[str] = []
     agent_lines: builtins.list[str] = []
-    backends_csv = ",".join(backends)
+    backends_csv = ",".join(backends) if backends else BACKEND_NONE
     has_devmapper = "kata-firecracker-devmapper" in backends
     has_longhorn = "kata-qemu-longhorn" in backends
 
@@ -294,20 +372,23 @@ def _read_api_endpoint(kubectl: list[str]) -> str | None:
                 return written
         except OSError:
             pass
-    port_result = subprocess.run(
-        kubectl
-        + [
-            "get",
-            "svc",
-            "k7-api",
-            "-n",
-            "kube-system",
-            "-o",
-            "jsonpath={.spec.ports[0].nodePort},{.spec.ports[0].targetPort}",
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        port_result = subprocess.run(
+            kubectl
+            + [
+                "get",
+                "svc",
+                "k7-api",
+                "-n",
+                "kube-system",
+                "-o",
+                "jsonpath={.spec.ports[0].nodePort},{.spec.ports[0].targetPort}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return _resolve_api_url(None)
     if port_result.returncode != 0 or not port_result.stdout.strip():
         return None
     node_port, _, target_port = port_result.stdout.strip().partition(",")
@@ -365,22 +446,21 @@ def install(
         "--disk",
         help="Block device to use for LVM thin-pool (e.g., /dev/nvme2n1)",
     ),
-    backend: str = typer.Option(
-        "kata-firecracker-devmapper,kata-qemu-longhorn",
+    backend: str | None = typer.Option(
+        None,
         "--backend",
         "-b",
         help=(
-            "Comma-separated sandbox backends to install on this node. "
-            "Choices: kata-firecracker-devmapper (kfd), kata-qemu-longhorn (kql), k7d, k7d-fc (alias k7-fc). "
-            "Default installs the two Kata backends; add k7d / k7d-fc explicitly for the "
-            "warm-fork microVM runtime (k7d-fc is Firecracker under the jailer)."
+            "Comma-separated sandbox backends to install. Required when not using "
+            "-i inventory (every inventory host must set k7_backends). "
+            "Choices: kfd, kql, k7d, k7d-fc, none. No default — omit is an error. "
+            "none means no sandbox runtime (scheduling-only node)."
         ),
-        show_default=True,
     ),
     k7d_version: str | None = typer.Option(
         None,
         "--k7d-version",
-        help="k7d release version to install (k7d backend only; default from playbook: 0.6.0)",
+        help="k7d release version to install (k7d backend only; default from playbook: 0.7.0)",
     ),
     k7d_artifact: str | None = typer.Option(
         None,
@@ -481,15 +561,17 @@ def install(
 ):
     """Install K7 on target hosts using Ansible.
 
-    Single-node (default): `k7 install` provisions localhost with **both**
-    Kata backends (kata-firecracker-devmapper + kata-qemu-longhorn). Pass
-    `--backend kfd,kql,k7d` to also install the k7d warm-fork runtime
-    (downloads `Katakate/k7d` v0.6.0 unless `--k7d-version` / `--k7d-artifact`
-    override it). `--backend k7d-fc` (alias `k7-fc`) adds RuntimeClass
-    `k7-fc` and the pinned Firecracker+jailer next to that daemon.
+    Single-node: `k7 install --backend kfd,kql,k7d` (``--backend`` is required;
+    there is no default). ``none`` installs K3s with no sandbox runtime.
+    Pass ``k7d`` / ``k7d-fc`` for the warm-fork daemon (downloads
+    `Katakate/k7d` v0.7.0 unless `--k7d-version` / `--k7d-artifact` override
+    it). `--backend k7d-fc` (alias `k7-fc`) adds RuntimeClass `k7-fc` and
+    the pinned Firecracker+jailer next to that daemon.
 
     Multi-node: `k7 install -i inventory.ini` reads roles, backends, and disks
-    from the Ansible inventory. See `inventory.ini.example` for the layout.
+    from the Ansible inventory. Every host must set ``k7_backends`` (or inherit
+    it from group vars); use ``k7_backends=none`` for scheduling-only masters.
+    Empty/omitted is not none. See `inventory.ini.example`.
     Dual-NVMe boxes need the OS on one disk and a raw spare for kfd — see
     `tutorials/k7_hetzner_node_setup.md` (`TWO_DISK=1`).
     """
@@ -565,11 +647,16 @@ def install(
         with open(playbook) as f:
             playbook_content = f.read()
 
-    backends_list = _parse_backends(backend)
+    inventory_file = inventory if inventory and os.path.exists(inventory) else None
+    backend_explicit = ctx.get_parameter_source("backend") == ParameterSource.COMMANDLINE
+    if not backend_explicit and not inventory_file:
+        typer.echo(INSTALL_BACKEND_REQUIRED, err=True)
+        raise typer.Exit(1)
+    backends_list = _parse_backends(backend) if backend_explicit and backend is not None else []
 
     inventory_content = None
-    if inventory and os.path.exists(inventory):
-        with open(inventory) as f:
+    if inventory_file:
+        with open(inventory_file) as f:
             inventory_content = f.read()
     else:
         inventory_content = _build_default_inventory(
@@ -641,7 +728,7 @@ def install(
         # to min(3, node count). When the user supplied an inventory we can't
         # know the node count up-front, so we let the playbook compute its own
         # default (min(3, len(k7_cluster))) and only forward an explicit value.
-        inventory_user_supplied = bool(inventory)
+        inventory_user_supplied = bool(inventory_file)
         node_count = len(hosts) if hosts else 1
         if replicas is not None:
             effective_replicas: int | None = replicas
@@ -666,11 +753,9 @@ def install(
             # `k7_disk` is the legacy name; the playbook prefers `k7_devmapper_disk`
             # but still falls back to `k7_disk` for backward compat.
             "k7_disk": disk,
-            # `k7_backends` (plural, comma-separated) is authoritative; the
-            # playbook accepts a single `k7_backend` only as a back-compat
-            # fallback when neither inventory `k7_backends` nor extra-var
-            # `k7_backends` is set.
-            "k7_backends": ",".join(backends_list),
+            # `k7_backends` is required on every host. Empty extra-var would
+            # look like "omitted" in Ansible — send the `none` sentinel.
+            "k7_backends": ",".join(backends_list) if backends_list else BACKEND_NONE,
             "longhorn_replicas": effective_replicas,
             "longhorn_data_path": longhorn_data_path,
             "longhorn_extra_disk": longhorn_extra_disk,
@@ -860,6 +945,11 @@ def create(
         "--docker-disk",
         help="Docker graph disk size for --docker (e.g. 20Gi, 40Gi). Default 20Gi on all backends.",
     ),
+    node: str | None = typer.Option(
+        None,
+        "--node",
+        help="Pin to this Kubernetes node name (`kubectl get nodes` / `k7 nodes list`). Joins via kubernetes.io/hostname (kubelet-stamped). YAML field: node_name.",
+    ),
 ):
     """Create a new sandbox from YAML config or CLI arguments."""
     # Three explicit egress modes. --egress-open → open
@@ -1008,6 +1098,9 @@ def create(
         others = ", ".join(sorted(k for k in SIDECAR_REGISTRY if k != "docker"))
         hint = others if others else "no non-docker sidecar types (--sidecar docker is --docker)"
         raise typer.BadParameter(f"Unknown sidecar type '{sandbox_config.sidecar}'. Available: {hint}")
+
+    if node:
+        sandbox_config.node_name = node
 
     core = K7Core()
     progress = Progress(
@@ -1417,12 +1510,12 @@ def create(
     if cli_ctx.use_core:
         group = RichGroup(status_text, details_text, progress)
         with RichLive(group, refresh_per_second=8, transient=False) as live:
-            result = asyncio.run(core.create_sandbox(sandbox_config, progress_callback=on_progress))
+            result = _core_run(core, core.create_sandbox(sandbox_config, progress_callback=on_progress))
         if not result.success:
             typer.echo(f"❌ Failed to create sandbox: {result.error}", err=True)
             raise typer.Exit(1)
         endpoints = (result.data or {}).get("endpoints") or []
-        sandboxes_for_ready = asyncio.run(core.list_sandboxes(sandbox_config.namespace))
+        sandboxes_for_ready = _core_run(core, core.list_sandboxes(sandbox_config.namespace))
         target_ready = any(s.name == sandbox_config.name and s.ready == "True" for s in sandboxes_for_ready)
     else:
         # The API doesn't stream progress yet (a separate spec). Print a
@@ -1436,7 +1529,7 @@ def create(
         if sandbox_config.expose_ports:
             # The SDK's create() returns a proxy, so the API path cannot show a
             # resolved URL here. Point at the NodePorts instead of guessing one.
-            typer.echo(f"🌐 Exposed ports: see the NodePorts in k7 list --name {sandbox_config.name}")
+            typer.echo(f"🌐 Exposed ports: see the NodePorts column in `k7 list` (sandbox {sandbox_config.name})")
     for endpoint in endpoints:
         typer.echo(f"🌐 Port {endpoint['port']} exposed at {endpoint['url']}")
     if target_ready:
@@ -1475,7 +1568,7 @@ def list(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        sandboxes = [s.to_dict() for s in asyncio.run(core.list_sandboxes(namespace))]
+        sandboxes = [s.to_dict() for s in _core_run(core, core.list_sandboxes(namespace))]
     else:
         sandboxes = handle_api_call(lambda: cli_ctx.client().list(namespace=namespace))
 
@@ -1555,7 +1648,7 @@ def delete(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        result = asyncio.run(core.delete_sandbox(name, namespace))
+        result = _core_run(core, core.delete_sandbox(name, namespace))
         if not result.success:
             typer.echo(f"❌ Failed to delete sandbox: {result.error}", err=True)
             raise typer.Exit(1)
@@ -1581,7 +1674,7 @@ def delete_all(
     # goes through the same routing as `k7 list` so off-cluster runs work.
     if cli_ctx.use_core:
         core = K7Core()
-        sandboxes = [s.to_dict() for s in asyncio.run(core.list_sandboxes(namespace))]
+        sandboxes = [s.to_dict() for s in _core_run(core, core.list_sandboxes(namespace))]
     else:
         sandboxes = handle_api_call(lambda: cli_ctx.client().list(namespace=namespace))
 
@@ -1600,7 +1693,7 @@ def delete_all(
 
     if cli_ctx.use_core:
         core = K7Core()
-        result = asyncio.run(core.delete_all_sandboxes(namespace))
+        result = _core_run(core, core.delete_all_sandboxes(namespace))
         if result.success:
             typer.echo(f"✅ {result.message}")
             return
@@ -1711,7 +1804,7 @@ def exec(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        result = asyncio.run(core.exec_command(name, joined, namespace=namespace))
+        result = _core_run(core, core.exec_command(name, joined, namespace=namespace))
         data = result.to_dict()
     else:
         data = handle_api_call(lambda: cli_ctx.client().exec(name, joined, namespace=namespace))
@@ -1742,7 +1835,7 @@ def top(
         table.add_column("CPU Usage (cores)")
         table.add_column("Memory Usage (MiB)")
 
-        metrics_list = asyncio.run(core.get_sandbox_metrics(namespace))
+        metrics_list = _core_run(core, core.get_sandbox_metrics(namespace))
 
         for metric in metrics_list:
             sb_name = metric["name"]
@@ -1809,6 +1902,17 @@ def top(
             time.sleep(refresh_interval)
 
 
+def _dedupe_keep_order(values: builtins.list[str] | None) -> builtins.list[str]:
+    """Preserve first-seen order; drop empties and duplicates."""
+    seen: set[str] = set()
+    out: builtins.list[str] = []
+    for v in values or []:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 @app.command()
 def generate_api_key(
     name: str,
@@ -1818,6 +1922,11 @@ def generate_api_key(
         "--namespace",
         "-n",
         help="Restrict key to this namespace (repeatable). Omit for unrestricted access.",
+    ),
+    node: builtins.list[str] | None = typer.Option(
+        None,
+        "--node",
+        help="Restrict key to this Kubernetes node name (repeatable; copy from `k7 nodes list`). Placement uses kubernetes.io/hostname (kubelet-stamped, not inventory). Omit for unrestricted placement.",
     ),
 ):
     """Generate a new API key."""
@@ -1836,16 +1945,12 @@ def generate_api_key(
         "expires": expiry_timestamp,
         "last_used": None,
     }
-    if namespace:
-        # Preserve order, drop empties/duplicates.
-        seen: set[str] = set()
-        scoped: builtins.list[str] = []
-        for ns in namespace:
-            if ns and ns not in seen:
-                seen.add(ns)
-                scoped.append(ns)
-        if scoped:
-            entry["namespaces"] = scoped
+    scoped_ns = _dedupe_keep_order(namespace)
+    if scoped_ns:
+        entry["namespaces"] = scoped_ns
+    scoped_nodes = _dedupe_keep_order(node)
+    if scoped_nodes:
+        entry["nodes"] = scoped_nodes
     api_keys[key_hash] = entry
 
     _write_api_keys(api_keys)
@@ -1857,6 +1962,10 @@ def generate_api_key(
         typer.echo(f"Namespaces: {', '.join(entry['namespaces'])}")
     else:
         typer.echo("Namespaces: * (unrestricted)")
+    if entry.get("nodes"):
+        typer.echo(f"Nodes: {', '.join(entry['nodes'])}")
+    else:
+        typer.echo("Nodes: * (unrestricted)")
     typer.echo("Keep this key secure - it won't be shown again!")
 
 
@@ -1877,6 +1986,7 @@ def list_api_keys():
     table.add_column("Expires", style="yellow")
     table.add_column("Last Used", style="green")
     table.add_column("Namespaces", style="magenta")
+    table.add_column("Nodes", style="magenta")
 
     for _key_hash, key_data in api_keys.items():
         created = datetime.fromtimestamp(key_data["created"]).strftime("%Y-%m-%d %H:%M")
@@ -1886,8 +1996,10 @@ def list_api_keys():
             last_used = datetime.fromtimestamp(key_data["last_used"]).strftime("%Y-%m-%d %H:%M")
         namespaces = key_data.get("namespaces") or []
         ns_col = "*" if not namespaces else ", ".join(namespaces)
+        nodes = key_data.get("nodes") or []
+        node_col = "*" if not nodes else ", ".join(nodes)
 
-        table.add_row(key_data["name"], created, expires, last_used, ns_col)
+        table.add_row(key_data["name"], created, expires, last_used, ns_col, node_col)
 
     console.print(table)
 
@@ -1967,7 +2079,7 @@ def pause(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        result = asyncio.run(core.pause_sandbox(name=name, namespace=namespace, snapshot_name=snapshot_name))
+        result = _core_run(core, core.pause_sandbox(name=name, namespace=namespace, snapshot_name=snapshot_name))
         if not result.success:
             typer.echo(f"❌ {result.error}", err=True)
             raise typer.Exit(1)
@@ -1987,7 +2099,7 @@ def resume(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        result = asyncio.run(core.resume_sandbox(name=name, namespace=namespace))
+        result = _core_run(core, core.resume_sandbox(name=name, namespace=namespace))
         if not result.success:
             typer.echo(f"❌ {result.error}", err=True)
             raise typer.Exit(1)
@@ -2061,14 +2173,15 @@ def restore(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        result = asyncio.run(
+        result = _core_run(
+            core,
             core.restore_sandbox(
                 snapshot_name=snapshot_name,
                 new_sandbox_name=new_sandbox_name,
                 namespace=namespace,
                 overrides=overrides,
                 keep_snapshot=keep_snapshot,
-            )
+            ),
         )
         if not result.success:
             typer.echo(f"❌ {result.error}", err=True)
@@ -2106,13 +2219,14 @@ def fork(
         typer.echo(f"Forked {source} -> {new_name}")
         return
     core = K7Core()
-    result = asyncio.run(
+    result = _core_run(
+        core,
         core.fork_sandbox(
             source_name=source,
             new_name=new_name,
             namespace=namespace,
             snapshot_name=snapshot,
-        )
+        ),
     )
     if result.success:
         typer.echo(result.message)
@@ -2225,11 +2339,10 @@ def _api_scale_deployment(replicas: int) -> None:
     failure mode this is meant to eliminate.
     """
     kubectl = _kubectl_cmd()
-    result = subprocess.run(
-        kubectl + ["scale", "deployment", "k7-api", "-n", "kube-system", f"--replicas={replicas}"],
-        capture_output=True,
-        text=True,
-    )
+    result = _kubectl_run(kubectl, ["scale", "deployment", "k7-api", "-n", "kube-system", f"--replicas={replicas}"])
+    if result is None:
+        typer.echo("❌ `k7 api enable`/`disable` need kubectl on a cluster node.", err=True)
+        raise typer.Exit(1)
     if result.returncode != 0:
         typer.echo(f"❌ Failed to scale k7-api to {replicas}: {result.stderr.strip()}", err=True)
         raise typer.Exit(1)
@@ -2239,9 +2352,9 @@ def _api_scale_deployment(replicas: int) -> None:
 def api_status_cmd():
     """Show API server readiness, endpoint, and key-management hints."""
     kubectl = _kubectl_cmd()
-    result = subprocess.run(
-        kubectl
-        + [
+    result = _kubectl_run(
+        kubectl,
+        [
             "get",
             "deployment",
             "k7-api",
@@ -2250,9 +2363,10 @@ def api_status_cmd():
             "-o",
             "jsonpath={.status.readyReplicas}/{.spec.replicas}",
         ],
-        capture_output=True,
-        text=True,
     )
+    if result is None:
+        _api_status_via_https()
+        return
     if result.returncode != 0:
         typer.echo("❌ K7 API deployment not found in K3s")
         typer.echo("Run `k7 install` to deploy it, or `k7 install --no-api` if that's deliberate.")
@@ -2284,7 +2398,10 @@ def api_status_cmd():
 
     typer.echo("\n📝 SDK usage example:")
     typer.echo("    from k7_sdk import Client")
-    typer.echo("    k7 = Client(endpoint='<endpoint>', api_key='<key>')")
+    typer.echo("    k7 = Client(")
+    typer.echo("        endpoint='<endpoint>', api_key='<key>',")
+    typer.echo("        verify_ssl='./k7-ca.crt',  # cluster CA; on the node use /etc/k7/tls/ca.crt")
+    typer.echo("    )")
     typer.echo("    sb = k7.create({'name': 'test', 'image': 'alpine:3.21'})")
     typer.echo("\n🔐 Manage API keys:")
     typer.echo("    k7 generate-api-key <name>")
@@ -2437,10 +2554,46 @@ def _deprecated_get_api_endpoint():
 
 
 nodes_app = typer.Typer(
-    help="Query cluster nodes (storage pools, …).",
+    help="Query and dedicate cluster nodes (storage pools, tenant isolation).",
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(nodes_app, name="nodes")
+
+
+def _print_nodes_list_table(rows: builtins.list[dict]) -> None:
+    """Render ``list_cluster_nodes()`` as NAME / HOSTNAME / BACKENDS / TENANT."""
+    if not rows:
+        typer.echo("No nodes found.")
+        return
+    table = Table(title="K7 Nodes")
+    table.add_column("NAME", style="cyan")
+    table.add_column("HOSTNAME")
+    table.add_column("BACKENDS")
+    table.add_column("TENANT")
+    for n in rows:
+        backends = ",".join(n.get("backends") or []) or "-"
+        table.add_row(n.get("name") or "-", n.get("hostname") or "-", backends, n.get("tenant") or "-")
+    Console().print(table)
+
+
+@nodes_app.command("list")
+def nodes_list(
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
+):
+    """Show cluster node names, hostname labels, backends, and tenant dedication.
+
+    NAME is what ``--node`` and ``k7 nodes dedicate`` take. It is the K3s
+    Node name (machine hostname), not something you label by hand.
+    HOSTNAME is ``kubernetes.io/hostname`` (kubelet). BACKENDS come from
+    ``k7 install --backend`` / inventory ``k7_backends`` (``none`` means
+    no sandbox runtime). TENANT comes from ``k7 nodes dedicate``.
+    """
+    core = K7Core()
+    rows = _core_run(core, core.list_cluster_nodes())
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2, default=str))
+        return
+    _print_nodes_list_table(rows)
 
 
 def _print_nodes_storage_table(data: dict) -> None:
@@ -2483,13 +2636,46 @@ def nodes_storage(
     """Show per-node kfd thin-pool and k7d disks-pool utilization."""
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
-        data = asyncio.run(K7Core().nodes_storage())
+        core = K7Core()
+        data = _core_run(core, core.nodes_storage())
     else:
         data = handle_api_call(lambda: cli_ctx.client().nodes_storage())
     if as_json:
         typer.echo(json.dumps(data, indent=2, default=str))
         return
     _print_nodes_storage_table(data)
+
+
+@nodes_app.command("dedicate")
+def nodes_dedicate(
+    node: str = typer.Argument(..., help="Kubernetes node name (metadata.name / hostname)"),
+    tenant: str = typer.Option(..., "--tenant", help="Tenant id written as k7.katakate.org/tenant"),
+):
+    """Label and taint a node so only that tenant's sandboxes can land there.
+
+    The label is the join key; the NoSchedule taint is the exclusive lock.
+    Must run with cluster access (on a node, or kubeconfig). Does not go
+    through k7-api.
+    """
+    core = K7Core()
+    result = _core_run(core, core.dedicate_node(node, tenant))
+    if not result.success:
+        typer.echo(f"❌ {result.error}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"✅ {result.message}")
+
+
+@nodes_app.command("undedicate")
+def nodes_undedicate(
+    node: str = typer.Argument(..., help="Kubernetes node name (metadata.name / hostname)"),
+):
+    """Remove the k7 tenant label and taint from a node."""
+    core = K7Core()
+    result = _core_run(core, core.undedicate_node(node))
+    if not result.success:
+        typer.echo(f"❌ {result.error}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"✅ {result.message}")
 
 
 # ``k7 snapshot …`` sub-app for VolumeSnapshot CRUD + GC.
@@ -2566,13 +2752,14 @@ def snapshot_list(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        snap_objs = asyncio.run(
+        snap_objs = _core_run(
+            core,
             core.list_snapshots(
                 namespace=namespace,
                 all_namespaces=all_namespaces,
                 sandbox=sandbox,
                 kind=kind,
-            )
+            ),
         )
         snaps = [s.to_dict() for s in snap_objs]
     else:
@@ -2597,7 +2784,7 @@ def snapshot_inspect(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        snap = asyncio.run(core.get_snapshot(name, namespace=namespace))
+        snap = _core_run(core, core.get_snapshot(name, namespace=namespace))
         if snap is None:
             typer.echo(f"❌ Snapshot {name} not found in namespace {namespace}", err=True)
             raise typer.Exit(1)
@@ -2621,7 +2808,7 @@ def snapshot_create(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        result = asyncio.run(core.create_snapshot(sandbox_name, snapshot_name, namespace=namespace))
+        result = _core_run(core, core.create_snapshot(sandbox_name, snapshot_name, namespace=namespace))
         if not result.success:
             typer.echo(f"❌ {result.error}", err=True)
             raise typer.Exit(1)
@@ -2650,7 +2837,7 @@ def snapshot_delete(
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
-        result = asyncio.run(core.delete_snapshot(name, namespace=namespace))
+        result = _core_run(core, core.delete_snapshot(name, namespace=namespace))
         if not result.success:
             typer.echo(f"❌ {result.error}", err=True)
             raise typer.Exit(1)
@@ -2688,13 +2875,14 @@ def snapshot_gc(
         else:
             td = timedelta(seconds=int(keep_fork_for))
         core = K7Core()
-        result = asyncio.run(
+        result = _core_run(
+            core,
             core.gc_snapshots(
                 namespace=namespace,
                 all_namespaces=all_namespaces,
                 keep_fork_for=td,
                 dry_run=dry_run,
-            )
+            ),
         )
         if not result.success:
             typer.echo(f"❌ {result.error}", err=True)

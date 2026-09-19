@@ -47,6 +47,18 @@ class TestMemoryLimitToMib:
             core._memory_limit_to_mib(None)  # type: ignore[arg-type]
 
 
+class TestKataHypervisorMemoryMib:
+    def test_256mi_ok(self, core: K7Core):
+        assert core._kata_hypervisor_memory_mib("256Mi") == 256
+
+    def test_1gi_ok(self, core: K7Core):
+        assert core._kata_hypervisor_memory_mib("1Gi") == 1024
+
+    def test_128mi_rejected(self, core: K7Core):
+        with pytest.raises(ValueError, match="below Kata's minimum 256Mi"):
+            core._kata_hypervisor_memory_mib("128Mi")
+
+
 # --- _parse_resource_value ---
 
 

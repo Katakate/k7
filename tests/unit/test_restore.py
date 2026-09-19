@@ -33,7 +33,7 @@ from k7.core.models import (
 )
 from k7_sdk.client import Client, SandboxProxy
 
-TEST_KEY = "k7-test-secret-key-spec10f"
+TEST_KEY = "k7-test-secret-key-restore"
 TEST_KEY_HASH = hashlib.sha256(TEST_KEY.encode()).hexdigest()
 
 

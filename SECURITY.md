@@ -51,11 +51,26 @@ Do **not** open a public issue for security-sensitive reports.
 - The control plane API uses API keys with hashed storage and expiry
   (file-backed by default at `/etc/k7/api_keys.json` — rotate and protect
   that file). Keys may optionally be scoped to one or more namespaces
-  (`k7 generate-api-key -n <ns>`); absent/empty scope keeps the historical
-  unrestricted behaviour (backward compatible). Scoped keys are enforced
-  on every namespace-bearing and cluster-scoped control-plane route —
-  they cannot list across all namespaces, touch namespaces outside their
-  list, or read cluster-wide topology (e.g. ``GET /api/v1/nodes/storage``).
+  (`k7 generate-api-key -n <ns>`); they may also be scoped to one or more
+  Kubernetes nodes (`k7 generate-api-key --node <node>`). Absent/empty
+  scope keeps the historical unrestricted behaviour (backward compatible).
+  Scoped keys are enforced on every namespace-bearing and cluster-scoped
+  control-plane route — they cannot list across all namespaces, touch
+  namespaces outside their list, or read cluster-wide topology (e.g.
+  ``GET /api/v1/nodes/storage``). A **node-scoped** key may only
+  create/restore/fork sandboxes onto its listed nodes (a single-node
+  scope auto-pins; several nodes require an explicit ``node_name``).
+  Namespace scope is the control-plane tenancy boundary; node scope is
+  the placement boundary (API-key `--node` is a Kubernetes node name
+  from `k7 nodes list` / `kubectl get nodes` — the Linux hostname K3s
+  registered — joined via the kubelet-stamped `kubernetes.io/hostname`
+  label; inventory.ini does not write that label). Together they
+  keep a tenant off another tenant's k7d daemon **only if that node is
+  also dedicated** (`k7 nodes dedicate NODE --tenant ID` writes
+  `k7.katakate.org/tenant` as a label and a NoSchedule taint). Without
+  the taint, an unscoped key can still land on the same node. Unscoped
+  keys still have full cross-namespace control-plane access and
+  unrestricted placement.
 - **The control-plane API is on a public NodePort (`31007`) on a public
   node, over HTTPS by default**. A Caddy sidecar terminates TLS; the API
   container and its probes stay HTTP on `:8000`. The default cert is a
@@ -117,6 +132,21 @@ Do **not** open a public issue for security-sensitive reports.
   the node and the API server.
 - **Multi-node** clusters are supported (Ansible inventory; Longhorn for
   the QEMU/`kql` path). Cilium FQDN egress applies cluster-wide.
+- **Root on a K3s server is full cluster control.** Nodes in
+  `[k7_servers]` (including the 3-node `--ha` example, where every
+  host is a server) have `/etc/rancher/k3s/k3s.yaml` as **cluster-admin**
+  (playbook `--write-kubeconfig-mode 644`), the join token, and etcd.
+  The first master also has `k7-api` and `/etc/k7/api_keys.json`. Node
+  pins and `k7 nodes dedicate` do **not** contain that: they stop two
+  tenants sharing a k7d daemon, they do not survive a VM escape onto
+  a master. Put tenant sandboxes on `[k7_agents]`; do not dedicate a
+  tenant onto a server running `k7-api`. Root on an **agent** is not
+  the admin kubeconfig. `k7-agent` has no ServiceAccount token and
+  ingress from `remote-node` is denied, so that breakout owns **that
+  node's** k7d (that tenant, if dedicated) — not other agents and not
+  the Kubernetes API. Per-node isolation is the blast radius for a
+  worker compromise; it is not useless. The shared agent token remains
+  on every node as defence-in-depth after the CNP.
 
 See also the docs: security model, networking, and backends comparison.
 
@@ -131,11 +161,24 @@ See also the docs: security model, networking, and backends comparison.
 - API key storage is local file-backed; treat the API host as trusted.
   Namespace scoping is an opt-in tenancy boundary on top of that model —
   unscoped keys still have full cross-namespace control-plane access.
+  Node scoping is the matching opt-in **placement** boundary: without
+  `--node` on the key, two namespaces can still share a node's k7d
+  daemon. Pair `-n` and `--node`, and run `k7 nodes dedicate` on that
+  node, for tenant isolation on k7d. The dedicate step is a label +
+  taint (`k7.katakate.org/tenant`); a hostname pin alone does not keep
+  other sandboxes off the node. Neither contains a host compromise:
+  root on `[k7_servers]` is cluster-admin.
 - Young project; no independent security audit yet.
 - The `k7d` backend has a different isolation trade-off for CoW sibling
   forks — see k7d's `SECURITY.md`.
 - Prefer a dedicated RBAC-restricted kubeconfig for the API rather than
   cluster-admin credentials in production.
+- **Host compromise is cluster-wide on servers.** `--node` / `dedicate`
+  isolate k7d placement, not a root shell on `[k7_servers]`. The HA
+  inventory example makes every node a server. Tenant boxes belong in
+  `[k7_agents]`. `k7-agent` has no ServiceAccount token and no
+  `remote-node` ingress, so root on an agent is that node (that tenant
+  if dedicated), not k7-api RBAC on the rest of the cluster.
 
 ## Responsible Disclosure
 

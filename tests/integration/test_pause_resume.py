@@ -10,6 +10,7 @@ We invoke ``k7`` via ``src/k7/cli/dev.sh`` so we don't depend on a packaged
 binary being installed on the node.
 """
 
+import asyncio
 import subprocess
 import time
 from pathlib import Path
@@ -106,7 +107,7 @@ def k7_core() -> K7Core:
 @pytest.fixture()
 def ql_sandbox(k7_core: K7Core, test_namespace: str):
     """Provision a fresh kata-qemu-longhorn sandbox; yield its name; tear down."""
-    name = f"pause-spec10c-{uuid4().hex[:6]}"
+    name = f"pause-qemu-{uuid4().hex[:6]}"
     import asyncio
 
     cfg = SandboxConfig(
@@ -223,6 +224,55 @@ class TestPauseSnapshotBugRegression:
         new = after - before
         sandbox_snaps = [s for s in new if ql_sandbox in s]
         assert sandbox_snaps == [], f"unexpected snapshot(s) created for {ql_sandbox}: {sandbox_snaps}"
+
+
+def _runtimeclass_present(name: str) -> bool:
+    out = subprocess.run([_K3S, "kubectl", "get", "runtimeclass", name], capture_output=True, text=True, check=False)
+    return out.returncode == 0
+
+
+class TestPauseResumeExecAnswers:
+    """``pause`` → ``resume`` → ``exec_command("echo hi")`` answers, on the
+    daemon-socket backends.
+
+    CHALLENGES #17: on ``k7d-fc`` the exec after resume hung — kubelet's
+    probe timed out and ``_wait_exec`` never returned. Root cause was
+    in Firecracker's vsock device (k7d CHALLENGES, jail-integrity fix); the k7d
+    tarball this pins carries the fix. ``k7d`` is the control.
+    """
+
+    _EXEC_BUDGET_S = 15.0
+
+    @pytest.mark.parametrize(("backend", "runtime_class"), [("k7d", "k7"), ("k7d-fc", "k7-fc")])
+    async def test_pause_resume_exec_answers(
+        self, k7_core: K7Core, test_namespace: str, backend: str, runtime_class: str
+    ):
+        if not _runtimeclass_present(runtime_class):
+            pytest.skip(f"RuntimeClass {runtime_class} not registered")
+        name = f"pause-exec-{backend}-{uuid4().hex[:6]}"
+        cfg = SandboxConfig(name=name, image="alpine:3.20", namespace=test_namespace, backend=backend)
+        result = await k7_core.create_sandbox(cfg)
+        assert result.success, f"{backend}: create failed: {result.error}"
+        try:
+            _wait_pod_ready(name, test_namespace)
+            before = await k7_core.exec_command(name, "echo hi", namespace=test_namespace)
+            assert "hi" in (before.stdout or ""), f"{backend}: exec before pause: {before!r}"
+
+            paused = await k7_core.pause_sandbox(name, namespace=test_namespace)
+            assert paused.success, f"{backend}: pause failed: {paused.error}"
+            await asyncio.sleep(3)
+
+            resumed = await k7_core.resume_sandbox(name, namespace=test_namespace)
+            assert resumed.success, f"{backend}: resume failed: {resumed.error}"
+            t0 = time.monotonic()
+            # ``exec_command`` has no deadline of its own; the #17 symptom
+            # was a hang, so a regression must fail here, not park pytest.
+            after = await asyncio.wait_for(k7_core.exec_command(name, "echo hi", namespace=test_namespace), timeout=60)
+            elapsed = time.monotonic() - t0
+            assert "hi" in (after.stdout or ""), f"{backend}: exec after resume: {after!r}"
+            assert elapsed < self._EXEC_BUDGET_S, f"{backend}: resume → exec took {elapsed:.2f}s"
+        finally:
+            await k7_core.delete_sandbox(name, namespace=test_namespace)
 
 
 class TestRemovedPauseFlags:

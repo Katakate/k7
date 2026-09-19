@@ -9,6 +9,7 @@ import typer
 
 from k7.cli.k7 import (
     _build_default_inventory,
+    _core_run,
     _kubectl_cmd,
     _normalize_backend,
     _parse_backends,
@@ -159,6 +160,13 @@ class TestReadApiEndpoint:
             result = _read_api_endpoint(["kubectl"])
             assert result == "https://10.0.0.1:31007"
 
+    def test_falls_back_to_configured_url_when_kubectl_missing(self):
+        with (
+            patch("k7.cli.k7.subprocess.run", side_effect=FileNotFoundError("kubectl")),
+            patch("k7.cli.k7._resolve_api_url", return_value="https://10.0.0.1:31007"),
+        ):
+            assert _read_api_endpoint(["kubectl"]) == "https://10.0.0.1:31007"
+
 
 # --- _build_default_inventory ---
 
@@ -178,8 +186,17 @@ class TestBuildDefaultInventory:
         assert "[k7_agents]" in inv
         assert "[k7_cluster:children]" in inv
 
-    def test_localhost_both_backends_default(self):
-        # `k7 install` with no flags installs both backends by default.
+    def test_localhost_none_backend(self):
+        inv = _build_default_inventory(
+            hosts=None,
+            role="server",
+            backends=[],
+            disk=None,
+            longhorn_extra_disk=None,
+        )
+        assert "k7_backends=none" in inv
+
+    def test_localhost_both_kata_backends(self):
         inv = _build_default_inventory(
             hosts=None,
             role="server",
@@ -290,3 +307,39 @@ class TestParseBackends:
             _parse_backends("")
         with pytest.raises(typer.BadParameter, match="cannot be empty"):
             _parse_backends(" , , ")
+
+    def test_none_is_empty_set(self):
+        assert _parse_backends("none") == []
+        assert _parse_backends("None") == []
+
+    def test_none_cannot_mix(self):
+        with pytest.raises(typer.BadParameter, match="cannot be combined"):
+            _parse_backends("none,kql")
+        with pytest.raises(typer.BadParameter, match="cannot be combined"):
+            _parse_backends("kfd,none")
+
+
+class TestCoreRun:
+    def test_closes_real_k7core(self):
+        from k7.core.core import K7Core
+
+        core = K7Core()
+        closed: list[bool] = []
+
+        async def aclose():
+            closed.append(True)
+
+        async def work():
+            return "ok"
+
+        core.aclose = aclose  # type: ignore[method-assign]
+        assert _core_run(core, work()) == "ok"
+        assert closed == [True]
+
+    def test_skips_aclose_on_mocks(self):
+        fake = MagicMock()
+
+        async def work():
+            return 7
+
+        assert _core_run(fake, work()) == 7

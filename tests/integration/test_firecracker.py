@@ -66,11 +66,13 @@ def _wait_for_pod_running(name: str, namespace: str, timeout: int = 120) -> None
 
 
 def _get_live_firecracker_pids() -> list[str]:
-    """Return PIDs of firecracker processes whose root fs is still live.
+    """Return PIDs of live jailed Firecracker VMs.
 
-    Scans /proc directly instead of relying on pgrep.  Skips stale
-    orphan processes whose chroot has been cleaned up (readlink shows
-    ``(deleted)``).
+    Kata's binary is ``firecracker-v1.16.1``; Linux truncates ``comm`` to
+    15 characters (``firecracker-v1.``). Match by prefix, not equality.
+    The jailer pivot-roots in a private mount ns, so ``/proc/<pid>/root``
+    reads as ``/`` — skip ``(deleted)`` orphans and require ``vmlinux`` +
+    ``rootfs`` in the jail.
     """
     pids = []
     for entry in os.listdir("/proc"):
@@ -78,10 +80,13 @@ def _get_live_firecracker_pids() -> list[str]:
             continue
         try:
             with open(f"/proc/{entry}/comm") as f:
-                if f.read().strip() != "firecracker":
-                    continue
-            root_link = os.readlink(f"/proc/{entry}/root")
-            if "(deleted)" in root_link:
+                comm = f.read().strip()
+            if comm != "firecracker" and not comm.startswith("firecracker-"):
+                continue
+            if "(deleted)" in os.readlink(f"/proc/{entry}/root"):
+                continue
+            fc_root = f"/proc/{entry}/root"
+            if not os.path.isfile(f"{fc_root}/vmlinux") or not os.path.isfile(f"{fc_root}/rootfs"):
                 continue
             pids.append(entry)
         except (OSError, PermissionError):
@@ -215,8 +220,9 @@ class TestFirecrackerBackend:
                     f"Firecracker PID {pid} can see /boot — host root filesystem is exposed. Jailer not active."
                 )
 
-                assert os.path.isfile(f"{fc_root}/firecracker"), (
-                    f"Firecracker PID {pid} chroot missing firecracker binary"
+                fc_bins = [e for e in os.listdir(fc_root) if e.startswith("firecracker")]
+                assert fc_bins, (
+                    f"Firecracker PID {pid} chroot missing firecracker* binary; entries={sorted(os.listdir(fc_root))}"
                 )
                 assert os.path.isfile(f"{fc_root}/vmlinux"), f"Firecracker PID {pid} chroot missing vmlinux kernel"
                 assert os.path.isfile(f"{fc_root}/rootfs"), f"Firecracker PID {pid} chroot missing rootfs image"

@@ -3,6 +3,7 @@ import json
 import os
 import secrets
 import time
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from .. import __version__
-from ..core.core import K7Core
+from ..core.core import K7Core, aclose_k7_core
 from ..core.models import SandboxConfig
 
 app = FastAPI(title="K7 Sandbox API", version=__version__)
@@ -142,6 +143,34 @@ def authorize_namespace(
         )
 
 
+def apply_node_scope(key_data: dict, node_name: str | None) -> str | None:
+    """Enforce optional per-key node placement and return the pin.
+
+    Absent/empty ``nodes`` on the key ⇒ unrestricted (backward compatible).
+    A caller-supplied ``node_name`` is kept for operator/test pinning.
+    Scoped keys may only place sandboxes on listed nodes; a single-node
+    scope auto-pins when ``node_name`` is omitted; a multi-node scope
+    requires an explicit allowed node (fail loud, never silently pick).
+    """
+    allowed = [n for n in (key_data.get("nodes") or []) if n]
+    requested = node_name.strip() if isinstance(node_name, str) and node_name.strip() else None
+    if not allowed:
+        return requested
+    if requested is None:
+        if len(allowed) == 1:
+            return allowed[0]
+        raise HTTPException(
+            status_code=403,
+            detail="API key is node-scoped; pass an explicit allowed node",
+        )
+    if requested not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"API key is not authorized for node '{requested}'",
+        )
+    return requested
+
+
 def success_response(
     data: Any, status_code: int = status.HTTP_200_OK, headers: dict[str, str] | None = None
 ) -> JSONResponse:
@@ -150,6 +179,15 @@ def success_response(
 
 def error_response(code: str, message: str, status_code: int) -> JSONResponse:
     return JSONResponse(content={"error": {"code": code, "message": message}}, status_code=status_code)
+
+
+async def get_k7_core() -> AsyncIterator[K7Core]:
+    """Per-request K7Core; close the kube aiohttp session when the handler ends."""
+    core = K7Core()
+    try:
+        yield core
+    finally:
+        await aclose_k7_core(core)
 
 
 @app.exception_handler(HTTPException)
@@ -188,12 +226,12 @@ async def health():
 
 
 @app.post("/api/v1/sandboxes")
-async def create_sandbox(config: dict, key_data: dict = Depends(verify_api_key)):
+async def create_sandbox(config: dict, key_data: dict = Depends(verify_api_key), core: K7Core = Depends(get_k7_core)):
     """Create a new sandbox."""
     try:
         sandbox_config = SandboxConfig.from_dict(config)
         authorize_namespace(key_data, sandbox_config.namespace)
-        core = K7Core()
+        sandbox_config.node_name = apply_node_scope(key_data, sandbox_config.node_name)
         result = await core.create_sandbox(sandbox_config)
 
         if result.success:
@@ -216,19 +254,26 @@ async def create_sandbox(config: dict, key_data: dict = Depends(verify_api_key))
 
 
 @app.get("/api/v1/sandboxes")
-async def list_sandboxes(namespace: str | None = None, key_data: dict = Depends(verify_api_key)):
+async def list_sandboxes(
+    namespace: str | None = None,
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """List all sandboxes."""
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     sandboxes = await core.list_sandboxes(namespace)
     return success_response([sandbox.to_dict() for sandbox in sandboxes])
 
 
 @app.get("/api/v1/sandboxes/{name}")
-async def get_sandbox(name: str, namespace: str = "default", key_data: dict = Depends(verify_api_key)):
+async def get_sandbox(
+    name: str,
+    namespace: str = "default",
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Get a single sandbox by name."""
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     items = await core.list_sandboxes(namespace)
     for s in items:
         if s.name == name:
@@ -237,10 +282,14 @@ async def get_sandbox(name: str, namespace: str = "default", key_data: dict = De
 
 
 @app.delete("/api/v1/sandboxes/{name}")
-async def delete_sandbox(name: str, namespace: str = "default", key_data: dict = Depends(verify_api_key)):
+async def delete_sandbox(
+    name: str,
+    namespace: str = "default",
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Delete a sandbox."""
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     result = await core.delete_sandbox(name, namespace)
 
     if result.success:
@@ -250,10 +299,13 @@ async def delete_sandbox(name: str, namespace: str = "default", key_data: dict =
 
 
 @app.delete("/api/v1/sandboxes")
-async def delete_all_sandboxes(namespace: str = "default", key_data: dict = Depends(verify_api_key)):
+async def delete_all_sandboxes(
+    namespace: str = "default",
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Delete all sandboxes in a namespace."""
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     result = await core.delete_all_sandboxes(namespace)
 
     if result.success:
@@ -263,7 +315,12 @@ async def delete_all_sandboxes(namespace: str = "default", key_data: dict = Depe
 
 
 @app.post("/api/v1/sandboxes/{name}/pause")
-async def pause_sandbox(name: str, body: dict | None = None, key_data: dict = Depends(verify_api_key)):
+async def pause_sandbox(
+    name: str,
+    body: dict | None = None,
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Pause a sandbox (scale to 0) and optionally take a Longhorn VolumeSnapshot.
 
     Body keys (all optional):
@@ -273,7 +330,6 @@ async def pause_sandbox(name: str, body: dict | None = None, key_data: dict = De
     body = body or {}
     namespace = body.get("namespace", "default")
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     result = await core.pause_sandbox(
         name=name,
         namespace=namespace,
@@ -285,12 +341,16 @@ async def pause_sandbox(name: str, body: dict | None = None, key_data: dict = De
 
 
 @app.post("/api/v1/sandboxes/{name}/resume")
-async def resume_sandbox(name: str, body: dict | None = None, key_data: dict = Depends(verify_api_key)):
+async def resume_sandbox(
+    name: str,
+    body: dict | None = None,
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Resume a paused sandbox (scale back to 1)."""
     body = body or {}
     namespace = body.get("namespace", "default")
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     result = await core.resume_sandbox(name=name, namespace=namespace)
     if result.success:
         return success_response({"message": result.message})
@@ -298,7 +358,12 @@ async def resume_sandbox(name: str, body: dict | None = None, key_data: dict = D
 
 
 @app.post("/api/v1/sandboxes/{name}/fork")
-async def fork_sandbox(name: str, body: dict, key_data: dict = Depends(verify_api_key)):
+async def fork_sandbox(
+    name: str,
+    body: dict,
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Fork a kata-qemu-longhorn sandbox into a new name with a cloned root disk.
 
     Required body key: new_name. Optional: namespace, snapshot.
@@ -310,7 +375,17 @@ async def fork_sandbox(name: str, body: dict, key_data: dict = Depends(verify_ap
     namespace = body.get("namespace", "default")
     authorize_namespace(key_data, namespace)
     snapshot = body.get("snapshot")
-    core = K7Core()
+    if key_data.get("nodes"):
+        items = await core.list_sandboxes(namespace)
+        source = next((s for s in items if s.name == name), None)
+        if source is None:
+            raise HTTPException(status_code=404, detail=f"Sandbox {name} not found in namespace {namespace}")
+        if not source.node:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Sandbox {name} is not scheduled to a node yet",
+            )
+        apply_node_scope(key_data, source.node)
     result = await core.fork_sandbox(
         source_name=name,
         new_name=new_name,
@@ -342,10 +417,10 @@ async def get_sandbox_logs(
     tail: int = 200,
     since: int = 0,
     key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
 ):
     """Read pod logs (snapshot; no streaming yet)."""
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     result = await core.get_logs(
         sandbox_name=name,
         namespace=namespace,
@@ -367,6 +442,7 @@ async def exec_command(
     command_data: dict,
     namespace: str = "default",
     key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
 ):
     """Execute a command in a sandbox."""
     authorize_namespace(key_data, namespace)
@@ -374,15 +450,13 @@ async def exec_command(
     if not command:
         raise HTTPException(status_code=400, detail="Command is required")
 
-    core = K7Core()
     result = await core.exec_command(name, command, namespace)
     return success_response(result.to_dict())
 
 
 @app.post("/api/v1/install", dependencies=[Depends(verify_api_key)])
-async def install_node(install_data: dict):
+async def install_node(install_data: dict, core: K7Core = Depends(get_k7_core)):
     """Install K7 on target hosts."""
-    core = K7Core()
     result = core.install_node(
         install_data.get("playbook"),
         install_data.get("inventory"),
@@ -396,24 +470,31 @@ async def install_node(install_data: dict):
 
 
 @app.get("/api/v1/nodes/storage")
-async def get_nodes_storage(key_data: dict = Depends(verify_api_key)):
+async def get_nodes_storage(key_data: dict = Depends(verify_api_key), core: K7Core = Depends(get_k7_core)):
     """Per-node storage-pool utilization (kfd thin-pool + k7d disks pool),
     aggregated from the k7-agent DaemonSet. A node whose agent
     is unreachable gets an ``{"error": ...}`` entry — never omitted.
 
-    Cluster-scoped (all-namespaces): a namespace-scoped key is 403.
-    Fail loud — do not silently narrow the per-node map.
+    Cluster-scoped (all-namespaces): a namespace-scoped or node-scoped
+    key is 403. Fail loud — do not silently narrow the per-node map.
     """
     authorize_namespace(key_data, None, all_namespaces=True)
-    core = K7Core()
+    if key_data.get("nodes"):
+        raise HTTPException(
+            status_code=403,
+            detail="API key is not authorized for cluster-wide node operations",
+        )
     return success_response(await core.nodes_storage())
 
 
 @app.get("/api/v1/sandboxes/metrics")
-async def get_sandbox_metrics(namespace: str | None = None, key_data: dict = Depends(verify_api_key)):
+async def get_sandbox_metrics(
+    namespace: str | None = None,
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Get resource usage metrics for sandboxes."""
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     metrics = await core.get_sandbox_metrics(namespace)
     return success_response(metrics)
 
@@ -443,10 +524,10 @@ async def list_snapshots(
     sandbox: str | None = None,
     kind: str | None = None,
     key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
 ):
     """List VolumeSnapshots, optionally filtered by namespace / sandbox / kind."""
     authorize_namespace(key_data, None if all_namespaces else namespace, all_namespaces=all_namespaces)
-    core = K7Core()
     snaps = await core.list_snapshots(
         namespace=namespace,
         all_namespaces=all_namespaces,
@@ -457,10 +538,14 @@ async def list_snapshots(
 
 
 @app.get("/api/v1/snapshots/{name}")
-async def get_snapshot(name: str, namespace: str = "default", key_data: dict = Depends(verify_api_key)):
+async def get_snapshot(
+    name: str,
+    namespace: str = "default",
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Inspect a single VolumeSnapshot by name."""
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     snap = await core.get_snapshot(name, namespace=namespace)
     if snap is None:
         raise HTTPException(status_code=404, detail=f"Snapshot {name} not found in namespace {namespace}")
@@ -468,7 +553,12 @@ async def get_snapshot(name: str, namespace: str = "default", key_data: dict = D
 
 
 @app.post("/api/v1/sandboxes/{name}/snapshot")
-async def create_snapshot(name: str, body: dict, key_data: dict = Depends(verify_api_key)):
+async def create_snapshot(
+    name: str,
+    body: dict,
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Snapshot a running sandbox's root PVC without pausing it (kind=named).
 
     Body keys: ``snapshot_name`` (required), ``namespace`` (default ``"default"``).
@@ -478,7 +568,6 @@ async def create_snapshot(name: str, body: dict, key_data: dict = Depends(verify
         raise HTTPException(status_code=400, detail="snapshot_name is required")
     namespace = body.get("namespace", "default")
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     result = await core.create_snapshot(sandbox_name=name, snapshot_name=snapshot_name, namespace=namespace)
     if result.success:
         resource = {"name": snapshot_name, "namespace": namespace, "source_sandbox": name}
@@ -491,10 +580,14 @@ async def create_snapshot(name: str, body: dict, key_data: dict = Depends(verify
 
 
 @app.delete("/api/v1/snapshots/{name}")
-async def delete_snapshot(name: str, namespace: str = "default", key_data: dict = Depends(verify_api_key)):
+async def delete_snapshot(
+    name: str,
+    namespace: str = "default",
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Delete a VolumeSnapshot by name."""
     authorize_namespace(key_data, namespace)
-    core = K7Core()
     result = await core.delete_snapshot(name, namespace=namespace)
     if result.success:
         return success_response({"message": result.message})
@@ -504,7 +597,12 @@ async def delete_snapshot(name: str, namespace: str = "default", key_data: dict 
 
 
 @app.post("/api/v1/snapshots/{name}/restore")
-async def restore_snapshot(name: str, body: dict, key_data: dict = Depends(verify_api_key)):
+async def restore_snapshot(
+    name: str,
+    body: dict,
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Boot a brand-new sandbox from a standalone VolumeSnapshot.
 
     Body keys:
@@ -512,7 +610,8 @@ async def restore_snapshot(name: str, body: dict, key_data: dict = Depends(verif
       ``namespace`` (default ``"default"``),
       ``overrides`` (optional dict: image, backend, root_disk_size, sidecar,
       limits, entrypoint, cmd, before_script),
-      ``keep_snapshot`` (default ``true``).
+      ``keep_snapshot`` (default ``true``),
+      ``node_name`` (optional pin; a node-scoped key stamps or rejects this).
     """
     body = body or {}
     new_name = body.get("new_sandbox_name")
@@ -520,6 +619,7 @@ async def restore_snapshot(name: str, body: dict, key_data: dict = Depends(verif
         raise HTTPException(status_code=400, detail="new_sandbox_name is required")
     namespace = body.get("namespace", "default")
     authorize_namespace(key_data, namespace)
+    pinned_node = apply_node_scope(key_data, body.get("node_name"))
     keep_snapshot = bool(body.get("keep_snapshot", True))
 
     overrides_dict = body.get("overrides") or {}
@@ -532,13 +632,13 @@ async def restore_snapshot(name: str, body: dict, key_data: dict = Depends(verif
 
     overrides = SandboxConfigOverrides(**filtered) if filtered else None
 
-    core = K7Core()
     result = await core.restore_sandbox(
         snapshot_name=name,
         new_sandbox_name=new_name,
         namespace=namespace,
         overrides=overrides,
         keep_snapshot=keep_snapshot,
+        node_name=pinned_node,
     )
     if result.success:
         resource = {
@@ -559,7 +659,11 @@ async def restore_snapshot(name: str, body: dict, key_data: dict = Depends(verif
 
 
 @app.post("/api/v1/snapshots/gc")
-async def gc_snapshots(body: dict | None = None, key_data: dict = Depends(verify_api_key)):
+async def gc_snapshots(
+    body: dict | None = None,
+    key_data: dict = Depends(verify_api_key),
+    core: K7Core = Depends(get_k7_core),
+):
     """Sweep stale ``kind=fork`` snapshots older than ``keep_fork_for``.
 
     Body (all optional):
@@ -573,7 +677,6 @@ async def gc_snapshots(body: dict | None = None, key_data: dict = Depends(verify
     namespace = body.get("namespace", "default")
     authorize_namespace(key_data, None if all_namespaces else namespace, all_namespaces=all_namespaces)
     keep_for = _parse_keep_fork_for(body.get("keep_fork_for"))
-    core = K7Core()
     result = await core.gc_snapshots(
         namespace=namespace,
         all_namespaces=all_namespaces,

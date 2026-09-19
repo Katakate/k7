@@ -524,7 +524,25 @@ timed out after 5s`. Create→Ready and exec *before* pause had worked
 docker-perf failure. Lifecycle was aborted; do not quote k7d-fc
 resume→exec from that run.
 
-**Reference:** CHALLENGES #15; k7d #232.
+**Fixed (lifecycle resume), spec 42a:** not #15. Two bugs, one per
+layer. (1) Firecracker v1.16.0/v1.16.1's vsock device armed its
+`TRANSPORT_RESET` RX gate on every `PATCH /vm Resumed` with no reset
+event for the guest to ack, so after a bare pause → resume no
+host→guest packet — no `CONNECT` reply — was ever delivered; upstream
+fixed it as #6100 in v1.16.2, and k7d's `guest/fc/pins.env` plus the
+vendored `src/k7/deploy/k7d-fc/pins.env` now pin v1.16.2. k7d's
+`resume_vm` also dials the resumed FC guest and fails loud if it does
+not answer. (2) The shim's exec bridge never opened containerd's
+stdout/stderr FIFOs on its failure path, so a probe exec that could
+not reach the paused guest left kubelet's prober parked in `ExecSync`
+for its 2-minute gRPC deadline — the pod stayed Ready through a whole
+pause on `k7d` *and* `k7d-fc`. `tests/integration/test_pause_resume.py::TestPauseResumeExecAnswers`
+covers pause → resume → `exec_command("echo hi")` on both; the
+`PERFORMANCE.md` k7d vs k7d-fc lifecycle table has the resume→exec
+number. Root cause and timings: k7d CHALLENGES #240 (vsock gate) and
+#241 (FIFOs).
+
+**Reference:** CHALLENGES #15; k7d #232, #240, #241; Firecracker #6100.
 
 **Time lost:** ~15 min on the OutOfcpu wait; lifecycle resume hung until
 the pytest process was killed (~8 min).
@@ -589,3 +607,141 @@ hostPath); `K7D_DOCKER_PAYLOAD_DOCKERD` in `src/k7/core/docker.py`.
 
 **Time lost:** ~30 min diagnosing why the live cluster had dockerd but the
 API refused `--docker`.
+
+---
+
+## 20. Laptop `k7 api status` crashed; docs `k7.yaml` 128Mi never went Ready
+
+**Symptom:** After `apt install k7` (PPA 0.3.1) on a laptop with
+`k7 config set api.url` / `api.ca` / `api.key`, `k7 list` and
+`k7 nodes storage` worked, but the Quickstart's next commands
+`k7 api status` and `k7 api endpoint` raised `FileNotFoundError: kubectl`.
+The same Quickstart's `examples/k7.yaml` (`cpu: 100m`, `memory: 128Mi`,
+`before_script: apk add curl`, default backend kfd) timed out with
+"Timed out waiting for sandbox container to start".
+
+**Root cause:** `k7 api status` / `endpoint` always shelled out to
+`kubectl` (or `k3s kubectl`) without checking the binary exists. A laptop
+that only has the .deb has no kubeconfig and no kubectl. Separately, the
+docs `k7.yaml` set `memory: 128Mi`, which Kata stamps as
+`io.katacontainers.config.hypervisor.default_memory: 128`. The Firecracker
+shim refuses anything below **256Mi**, so the pod stays `ContainerCreating`
+(`FailedCreatePodSandBox`) until create times out. `before_script` never
+runs.
+
+**Fix:** missing kubectl falls back to `GET /health` on the configured API
+URL (status) / prints that URL (endpoint). Create rejects Kata memory
+below 256Mi immediately. Docs + `examples/k7.yaml` use `backend: k7d`
+and `cpu: "1"` / `memory: "1Gi"`. PPA is 0.3.1, not 0.2.2.
+
+**Reference:** `src/k7/cli/k7.py` (`_kubectl_run`, `_api_status_via_https`);
+`examples/k7.yaml`.
+
+**Time lost:** ~20 min reproducing on a 3-node HA soak after a public 0.3.1
+release; the install itself was one command and succeeded.
+
+---
+
+## 21. `--expose-port` NodePort is dead until Ready; `k7 exec -- sh -c` self-nests
+
+**Symptom:** Docs `k7 create --expose-port 8000 --before-script 'nohup python3 -m http.server 8000 &'` printed a NodePort, but curling it from a laptop timed out. Cilium showed the Service in **maintenance**. `k7 exec NAME -- sh -c 'echo hi > /tmp/x'` failed with Nuitka/PyInstaller-style "tried to call itself with '-c'". `k7 restore --latest` and `k7 delete-all -y` do not exist.
+
+**Root cause:** `externalTrafficPolicy: Local` plus Cilium keeps a NodePort in maintenance while endpoints are `notReadyAddresses`. k7d/kfd pid 1 is `sleep 365d`; a bare `&` in `before_script` is killed when the script exits, so the Ready probe never sees the http server (and a missing `touch` of the done file has the same effect). `k7 exec` already wraps the joined argv in `sh -c`, so a nested `sh -c` is the CLI binary eating `-c`. Restore takes two positionals; `delete-all` confirms interactively with no `-y`.
+
+**Fix:** Docs: trailing `sleep 1` after nohup so before_script can finish and Ready can fire; curl the **pod's** node, not an arbitrary master. Exec: one quoted string, no extra `sh -c`. Restore/delete-all examples match the CLI. Create success text points at `k7 list`, not `k7 list --name`.
+
+**Reference:** `src/k7/cli/k7.py` exec/create; docs `k7/guides/cli.mdx`.
+
+**Time lost:** ~40 min on the public 0.3.1 HA soak (expose looked like a CNI bug until Ready flipped).
+
+---
+
+## 22. k7d docker graph image is a teardown race, not a leak (spec 39a)
+
+**Symptom:** `TestDockerK7d` / `TestDockerK7dFc` failed after `k7 delete` + 3s with `leaked k7d docker volume images: {scratch-vm-…-docker.img}`. Hours later, same k7d PID, the files were gone.
+
+**Root cause:** `k7 delete` returns when Kubernetes objects are gone. The VM's `ScratchDisk::drop` unlinks the graph image asynchronously when the containerd shim `Delete` lands. On a busy 3-node HA box that is more than 3s.
+
+**Fix:** bounded poll (~60s) in the test. `delete_sandbox` does **not** wait for the k7d VM — coupling API latency to shim teardown would stall every delete.
+
+**Reference:** `tests/integration/test_docker.py` `_wait_k7d_docker_disks_gone`; `K7Core.delete_sandbox`.
+
+**Time lost:** the soak already established this; the 3s sleep was the only defect.
+
+---
+
+## 23. Firecracker jailer test missed `firecracker-v1.` (spec 39a)
+
+**Symptom:** `test_jailer_active` asserted "No firecracker processes found on the host" while a jailed kfd VM was running.
+
+**Root cause:** Linux truncates `comm` to 15 characters. The pinned binary is `firecracker-v1.16.1`, so `comm` is `firecracker-v1.`. The helper compared `== "firecracker"`. The chroot binary is also versioned (`firecracker-v1.16.1`, not `/firecracker`). The jail itself is correct: `/etc/passwd`, `/etc/shadow`, `/usr`, `/boot` absent; `vmlinux` + `rootfs` present. `readlink /proc/<pid>/root` is `/` because the jailer pivot-roots in a private mount ns.
+
+**Fix:** match `comm` by prefix `firecracker-`, require `fcConfig.json` / `--config-file` on the cmdline, skip `(deleted)` orphans, require `vmlinux`+`rootfs`, glob `firecracker*` in the chroot. Host-FS-unreachable asserts stay.
+
+**Reference:** `tests/integration/test_firecracker.py` `_get_live_firecracker_pids`.
+
+**Time lost:** ~20 min of `/proc` on the soak node.
+
+---
+
+## 24. Expose tests timed out because the pod was on another node (spec 39a)
+
+**Symptom:** `TestSandboxExpose` curled `http://<other-node>:<nodeport>` from the first master and timed out. Off-cluster, the pod's node answered HTTP 200 and the other nodes refused connect.
+
+**Root cause:** `externalTrafficPolicy: Local` is required (without it, `cidr:` rules see SNAT). Cilium socket-LB intercepts in-cluster-node origin to a NodePort on a different node. The tests did not pin `node_name`.
+
+**Fix:** pin expose sandboxes to `os.uname().nodename`. Do not switch the Service to `Cluster`.
+
+**Reference:** `tests/integration/test_sandbox_ingress.py` `TestSandboxExpose._exposed`.
+
+**Time lost:** ~15 min confirming Local vs Cilium vs a wrong-node curl.
+
+---
+
+## 25. kql live `--docker` fork never went Ready: overlay2 was crash-inconsistent (spec 39a)
+
+**Symptom:** `TestDockerKQL.test_fork_clones_both_pvcs` — both VolumeSnapshots ready, both child PVCs Bound, child never Ready in 240s.
+
+**Root cause (live, spec 39a):** the child stuck in `Init:0/2` with `FailedAttachVolume: volume is not ready for workloads`. Kubernetes Bound is not Longhorn-ready-to-attach; HA r=3 clone hydration takes longer than 240s. The qemu fork test already waits 600s for this. `sync` is also not enough for a busy overlay2 once the guest *does* start.
+
+**Fix:** wait 600s for the child (same bound as `test_qemu.test_fork_clones_data`). Plus `fsfreeze` the graph: alpine `docker:27.5.1-dind` has no `fsfreeze`, so stage it from the ubuntu sandbox via the shared `/tmp` emptyDir, copy into the vehicle rootfs, freeze around VolumeSnapshot create, thaw in `finally`.
+
+**Reference:** `K7Core._create_kata_snapshots_quiesced`.
+
+**Time lost:** soak diagnosis; freeze is the product answer rather than refusing live forks.
+
+---
+
+## 26. Partner-facing 0.3.1 traps: kfd fork 404, SDK snippet missing CA, `k7 logs` empty
+
+**Symptom:** Following docs.katakate.org / the k7 README on a 3-node HA PPA 0.3.1 cluster:
+
+- `k7 fork` of a kfd sandbox printed `Source root PVC <name>-root-lh not found; cannot fork storage` instead of "kfd cannot fork".
+- `k7 api status` printed `Client(endpoint=..., api_key=...)` with no `verify_ssl`; that fails against the playbook-minted cluster CA.
+- `k7 logs demo --tail 20` printed nothing (exit 0) after only `k7 exec`.
+- `python3 -m venv` on the node failed (`ensurepip is not available`).
+- `k7 resume` of a kql sandbox returned immediately while the pod was still `Pending`.
+
+**Root cause:** `fork_sandbox` treated missing kfd PVCs as a generic storage 404. The status command's help snippet never grew `verify_ssl` when HTTPS-by-default landed. `k7 logs` is a CRI container snapshot; exec goes through the agent. Ubuntu 24.04 cloud images omit `python3-venv`. HA Longhorn attach is slower than `resume()` returning.
+
+**Fix:** reject every kfd fork up front (`KFD_FORK_REJECT`). Print `verify_ssl='./k7-ca.crt'` in `k7 api status`. Docs: wait-until-Ready after kql resume, empty logs are success, SDK is a client install (`apt install python3-venv` on the node).
+
+**Reference:** none.
+
+**Time lost:** ~30 min walking the quickstart on the HA cluster.
+
+---
+
+## 27. `k7 --core` leaked kubernetes_asyncio/aiohttp sessions (`Event loop is closed`)
+
+**Symptom:** `TestSnapshotCrud.test_create_list_inspect_delete_round_trip` failed with `assert snap in cp.stdout` and `cp.stdout == '\n'`. Interpreter also logged `Unclosed client session` / `Event loop is closed` after `k7 --core snapshot create`.
+
+**Root cause:** Each `CoreV1Api()` / `AppsV1Api()` / `CustomObjectsApi()` constructed its own `ApiClient` (aiohttp session) bound to the `asyncio.run` loop. Typer handlers never called `close()`, so loop teardown raced the session destructor. Separately, `_create_kata_snapshots_quiesced` dropped the successful `OperationResult.message` from `_create_volume_snapshot`, so the CLI echoed a blank line even when the snapshot existed.
+
+**Fix:** One shared `ApiClient` per `K7Core`, `async def aclose()`, CLI `_core_run` / API `get_k7_core` / snapshot-gc always close. Quiesced snapshot success now keeps the create message (`Snapshot <name> created for PVC …`).
+
+**Reference:** kubernetes_asyncio `ApiClient.close` → `rest_client.close()` (aiohttp).
+
+**Time lost:** caught on the HA integration run after the partner walkthrough.
+
+

@@ -34,8 +34,9 @@ class SandboxConfig:
     container_non_root: bool = False
     cap_drop: list[str] | None = None  # default behavior handled in core: drop ALL
     cap_add: list[str] | None = None
-    # Optional explicit node placement (sets pod's node_name). Used by tests
-    # that need to inspect host-side state for a sandbox they just created.
+    # Optional node pin. Applied as nodeSelector kubernetes.io/hostname
+    # (the label every Node already has) — not spec.nodeName. A tenant
+    # taint on that node is the exclusive lock; see k7 nodes dedicate.
     node_name: str | None = None
     # Ingress is denied by default and opt-in per sandbox.
     # ``ingress_ports`` are TCP ports to open; ``None``/``[]`` denies everything.

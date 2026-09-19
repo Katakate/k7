@@ -22,6 +22,8 @@ _CLUSTERROLE = (Path(__file__).resolve().parents[2] / "src/k7/deploy/manifests/k
 
 
 def _install(args: list[str]):
+    if "--backend" not in args and "-b" not in args:
+        args = ["--backend", "kql", *args]
     with patch("k7.cli.k7.K7Core") as core_cls:
         install = MagicMock(return_value=OperationResult(success=True, message="ok"))
         core_cls.return_value.install_node = install

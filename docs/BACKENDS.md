@@ -5,6 +5,10 @@ hardware-isolated microVM. *How* that VM is built, stored, snapshotted, and
 forked is the backend's job. Four backends exist today; a node can install
 any combination (`k7 install --backend kfd,kql,k7d,k7d-fc`) and each sandbox picks
 one (`k7 create --backend …`, annotation `k7.katakate.org/backend`).
+`--backend` / inventory `k7_backends` is **required** — there is no default
+list. `none` means no sandbox runtime on that node (scheduling-only
+master: `[k7_servers:vars] k7_backends=none`). Empty/omitted is an error,
+not kfd.
 
 | | `kfd` — kata-firecracker-devmapper | `kql` — kata-qemu-longhorn | `k7d` | `k7d-fc` |
 |---|---|---|---|---|
@@ -58,7 +62,7 @@ CLI.
   You lose virtiofs/hostPath and time-warp. See k7d
   `SECURITY.md` "Firecracker profile" and `docs/backends.md`. Kata's
   Firecracker (`kfd`) is a different binary (`/opt/kata/bin`, older pin);
-  k7d-fc installs upstream v1.16.1 at `/usr/local/bin`.
+  k7d-fc installs upstream v1.16.2 at `/usr/local/bin`.
 
 ## The k7d backend
 
@@ -76,7 +80,7 @@ The Ansible playbook:
    clone writable volume images with `FICLONE` reflinks);
 3. downloads the k7d release tarball (`k7d_artifact_url`, default the
    public `Katakate/k7d` GitHub release for `k7d_version`, currently
-   **0.6.0**) and runs the bundled `install.sh`, which installs `k7d` +
+   **0.7.0**) and runs the bundled `install.sh`, which installs `k7d` +
    `containerd-shim-k7-v1` into `/usr/local/bin`, guest kernel/initramfs
    into `/usr/local/share/k7d`, and starts `k7d.service` (control socket
    `/run/k7d/k7d.sock`). Override with `k7 install --k7d-version <ver>`
@@ -171,19 +175,33 @@ node**:
 - A VM op on a sandbox co-located with the k7-api pod runs directly (the
   deployment mounts both sockets and ships `crictl`).
 - A VM op on a sandbox on any OTHER node is forwarded to the k7-agent pod
-  on that node (`POST /agent/v1/vm/{pause,resume,fork,lookup}` on the pod
-  IP). Forwarding authenticates with the shared token the install playbook
+  on that node (`POST /agent/v1/vm/{pause,resume,lookup}` on the pod
+  IP). The agent does **not** create Deployments or patch nodes
+  (no ServiceAccount token). Fork Kubernetes writes stay on `k7-api`.
+  Forwarding authenticates with the token the install playbook
   writes to `/etc/k7/agent_token` (root, 0600) on every node; a
-  CiliumNetworkPolicy limits pod-originated agent ingress to the k7-api
-  pod. No Ready agent on the node / missing token → loud error, never a
-  silent no-op.
-- **CLI on a node** also works for any sandbox: local sandboxes talk to the
-  local daemon, remote ones are forwarded the same way (root can read the
-  token).
-- A fork still **lands on the source's node** — the agent proxies to the
-  node-local daemon; the cross-node fork *data path* is future k7d work
-  (daemon side, not built yet). When it lands, only the forwarding target
-  changes.
+  CiliumNetworkPolicy allows agent ingress from the k7-api pod and
+  local `host` only (`remote-node` denied). No Ready agent / missing
+  token → loud error, never a silent no-op.
+- **CLI on a node** talks to the local daemon for local sandboxes.
+  Remote VM ops go through `k7-api` (default CLI path). `k7 --core`
+  cannot host-forward to another node's agent.
+- A fork still **lands on the source's node** (`spec.nodeName` on the
+  fork Deployment). k7-api creates that Deployment after an agent
+  lookup; CoW is node-local on that k7d daemon. Cross-node fork *data
+  path* is future k7d work (daemon side, not built yet).
+
+k7d is one daemon per node. Namespace scoping on API keys does not stop
+two tenants sharing that daemon. Pin a tenant with
+`k7 generate-api-key tenant-a -n tenant-a --node <node>` so creates
+cannot *choose* another node. `<node>` is the Kubernetes Node name
+(`k7 nodes list` / `kubectl get nodes`) — the Linux hostname K3s
+registered. The pin is a `nodeSelector` on `kubernetes.io/hostname`
+(kubelet stamps that label; `inventory.ini` does not). Inventory
+`k7_backends` only stamps `k7.katakate.org/backend-*` at install.
+To keep **other** sandboxes off that node, also run
+`k7 nodes dedicate <node> --tenant <id>` (label + NoSchedule taint
+`k7.katakate.org/tenant`). See `SECURITY.md`.
 
 kql pause/resume/fork have none of these constraints (they are pure
 Kubernetes/Longhorn operations) and work through the API for any node.

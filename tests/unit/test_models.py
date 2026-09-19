@@ -32,6 +32,7 @@ class TestSandboxConfigFromDict:
             "container_non_root": True,
             "cap_drop": ["ALL"],
             "cap_add": ["NET_ADMIN"],
+            "node_name": "k7-node-01",
         }
         cfg = SandboxConfig.from_dict(data)
         assert cfg.backend == "kata-qemu-longhorn"
@@ -39,6 +40,7 @@ class TestSandboxConfigFromDict:
         assert cfg.limits == {"cpu": "2", "memory": "4Gi"}
         assert cfg.pod_non_root is True
         assert cfg.cap_add == ["NET_ADMIN"]
+        assert cfg.node_name == "k7-node-01"
 
     def test_ignores_unknown_keys(self):
         cfg = SandboxConfig.from_dict({"name": "x", "image": "img", "unknown_field": 42, "another": "val"})
