@@ -1,10 +1,14 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 RUN apt-get update && apt-get install -y python3 python3-pip python3-venv gcc patchelf
 
 WORKDIR /app
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
-RUN pip install --no-cache-dir nuitka typer click kubernetes kubernetes_asyncio httpx python-dotenv pyyaml rich requests
+# Pinned to uv.lock (nuitka/kubernetes are build-only): an unpinned typer 0.27
+# broke `k7 install --backend` detection in the shipped binary.
+RUN pip install --no-cache-dir nuitka==4.2.2 typer==0.24.1 click==8.3.2 kubernetes==37.0.0 \
+    kubernetes_asyncio==35.0.1 httpx==0.28.1 python-dotenv==1.2.2 pyyaml==6.0.3 rich==14.3.3 requests==2.34.2 \
+    prometheus_client==0.26.0
 
 # Copy source packages into build context (src layout). The CLI imports
 # k7_sdk (its API client since the SDK rename) — without it the onefile
@@ -12,9 +16,13 @@ RUN pip install --no-cache-dir nuitka typer click kubernetes kubernetes_asyncio 
 COPY src/k7/ /app/k7/
 COPY src/k7_sdk/ /app/k7_sdk/
 
-# Build the binary with deploy assets embedded
+# Build the binary with deploy assets embedded. --include-data-dir skips
+# .py files, so scripts the playbook copies from k7_deploy_dir are listed.
+# self-execution is on by default and exits 2 on any standalone -c in argv
+# (k7 exec NAME -- sh -c '...', ls -c) before the CLI starts.
 RUN python3 -m nuitka \
     --standalone --onefile \
+    --no-deployment-flag=self-execution \
     --include-module=yaml \
     --include-module=rich \
     --include-module=typer \
@@ -25,5 +33,9 @@ RUN python3 -m nuitka \
     --include-module=dotenv \
     --include-package=k7_sdk \
     --include-package=requests \
+    --include-package=prometheus_client \
     --include-data-dir=k7=k7 \
+    --include-data-files=k7/deploy/k7_api_tls.py=k7/deploy/k7_api_tls.py \
+    --include-data-files=k7/deploy/k7_api_keys.py=k7/deploy/k7_api_keys.py \
+    --include-data-files=k7/deploy/k7_metrics_policy.py=k7/deploy/k7_metrics_policy.py \
     k7/cli/k7.py

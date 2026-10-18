@@ -1,0 +1,28 @@
+# Remote install only (`k7 install --api-remote-install`): before labelling
+# nodes into the pool, k7-api checks that this DaemonSet runs the image it was
+# deployed with. Read-only, one object. Its records (ConfigMaps), node labels,
+# pods and logs are already in the k7-api ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k7-api-remote-install
+  namespace: k7-system
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["k7-node-installer"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k7-api-remote-install
+  namespace: k7-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k7-api-remote-install
+subjects:
+  - kind: ServiceAccount
+    name: k7-api
+    namespace: kube-system

@@ -1,0 +1,122 @@
+# PR / main CI: lint, typecheck, unit tests, shellcheck. Integration tests
+# need a KVM bare-metal node and run outside CI; this workflow never SSHes
+# anywhere. Every action is pinned by commit SHA (version in the comment).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.12.23"
+  UV_PYTHON: "3.10.11"
+  UV_LOCKED: "1"
+  SHELLCHECK_VERSION: "v0.11.0"
+  SHELLCHECK_SHA256: "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+  # tests/unit/test_helm_chart.py renders deploy/helm/k7 with exactly this helm.
+  HELM_VERSION: "v3.16.4"
+  HELM_SHA256: "fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179"
+  # tests/unit/test_alert_rules_and_dashboards.py: the Prometheus that
+  # kube-prometheus-stack 92.3.0 runs (k7 install --monitoring).
+  PROMTOOL_VERSION: "3.15.0"
+  PROMTOOL_SHA256: "2a542df32eac02ee17b9d844fb2aa1de00dafa5476579ba8a3ba862e9d572ea0"
+
+jobs:
+  python:
+    name: lint, typecheck, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # typer forces Rich terminal output under GITHUB_ACTIONS; the CLI tests
+      # assert on plain error text.
+      TERM: dumb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install pinned helm
+        run: |
+          curl -fsSLo /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -
+          tar -xzf /tmp/helm.tgz -C /tmp
+          sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+      - name: Install pinned promtool
+        run: |
+          tarball="prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz"
+          curl -fsSLo "/tmp/$tarball" "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/$tarball"
+          echo "${PROMTOOL_SHA256}  /tmp/$tarball" | sha256sum -c -
+          tar -xzf "/tmp/$tarball" -C /tmp
+          sudo install -m 0755 "/tmp/prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+      - run: make lint
+      - run: make typecheck
+      - run: make test
+
+  shellcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned shellcheck
+        run: |
+          tarball="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSLo "/tmp/$tarball" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/$tarball"
+          echo "${SHELLCHECK_SHA256}  /tmp/$tarball" | sha256sum -c -
+          tar -xJf "/tmp/$tarball" -C /tmp
+          sudo install -m 0755 "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+      - run: make lint-shell
+
+  # Noisy on the current playbook, so not a required check yet.
+  ansible-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: read # paths-filter lists PR files via the API
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: changes
+        with:
+          filters: |
+            deploy:
+              - 'src/k7/deploy/**'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        if: steps.changes.outputs.deploy == 'true'
+        with:
+          version: ${{ env.UV_VERSION }}
+      - if: steps.changes.outputs.deploy == 'true'
+        run: make lint-ansible
+
+  # Non-blocking until one clean release; then drop continue-on-error.
+  trivy-fs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          version: v0.70.0
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"

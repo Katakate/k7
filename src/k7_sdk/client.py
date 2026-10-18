@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import requests
 
 try:
@@ -53,17 +56,95 @@ class SandboxProxy:
         return self._client.logs(self.name, namespace=self.namespace, container=container, tail=tail, since=since)
 
 
+TokenProvider = Callable[[], str]
+
+
+def _auth_headers(api_key: str | None, token_provider: TokenProvider | None) -> dict[str, str]:
+    """Exactly one credential: a K7 API key, or a callable returning an OIDC
+    bearer token (called per request, e.g. a GitHub Actions or projected
+    ServiceAccount token reader)."""
+    if (api_key is None) == (token_provider is None):
+        raise ValueError("pass exactly one of api_key or token_provider")
+    return {"X-API-Key": api_key} if api_key is not None else {}
+
+
 class Client:
     """K7 Python SDK Client."""
 
-    def __init__(self, endpoint: str, api_key: str, verify_ssl: bool | str = True):
+    def __init__(
+        self,
+        endpoint: str,
+        api_key: str | None = None,
+        verify_ssl: bool | str = True,
+        token_provider: TokenProvider | None = None,
+    ):
         self.base_url = endpoint.rstrip("/")
         self.api_key = api_key
         if self.base_url.startswith("https://") and verify_ssl is False:
             raise ValueError("verify_ssl=False is not allowed for https:// endpoints")
         self.session = requests.Session()
-        self.session.headers.update({"X-API-Key": api_key})
+        self.session.headers.update(_auth_headers(api_key, token_provider))
+        if token_provider is not None:
+            provider = token_provider
+
+            def _bearer(r: requests.PreparedRequest) -> requests.PreparedRequest:
+                r.headers["Authorization"] = f"Bearer {provider()}"
+                return r
+
+            self.session.auth = _bearer
         self.session.verify = verify_ssl
+
+    def _call(self, method: str, path: str, **kwargs) -> Any:
+        response = self.session.request(method, f"{self.base_url}{path}", **kwargs)
+        response.raise_for_status()
+        return self._unwrap(response)
+
+    def whoami(self) -> dict:
+        return self._call("GET", "/api/v1/auth/whoami")
+
+    def usage(self, start: float, end: float, tenant: str | None = None, group_by: str | None = None) -> dict:
+        """Showback over ``[start, end]`` (unix seconds) from the cluster's Prometheus."""
+        params = {"from": start, "to": end, "tenant": tenant, "group_by": group_by}
+        return self._call("GET", "/api/v1/usage", params={k: v for k, v in params.items() if v is not None}, timeout=60)
+
+    def create_api_key(
+        self,
+        name: str,
+        *,
+        role: str,
+        expires_days: int,
+        tenant: str | None = None,
+        namespaces: list[str] | None = None,
+        nodes: list[str] | None = None,
+    ) -> dict:
+        """Admin: mint a key; the response carries the one-time ``token``."""
+        body = {
+            "name": name,
+            "role": role,
+            "tenant": tenant,
+            "expires_days": expires_days,
+            "namespaces": namespaces or [],
+            "nodes": nodes or [],
+        }
+        return self._call("POST", "/api/v1/keys", json=body)
+
+    def list_api_keys(self) -> list[dict]:
+        return self._call("GET", "/api/v1/keys")
+
+    def revoke_api_key(self, name: str) -> dict:
+        return self._call("DELETE", f"/api/v1/keys/{name}")
+
+    def dedicate_node(self, node: str, tenant: str) -> dict:
+        return self._call("POST", f"/api/v1/nodes/{node}/dedicate", json={"tenant": tenant})
+
+    def undedicate_node(self, node: str) -> dict:
+        return self._call("POST", f"/api/v1/nodes/{node}/undedicate")
+
+    def get_role_bindings(self) -> dict:
+        return self._call("GET", "/api/v1/role-bindings")
+
+    def put_role_bindings(self, bindings: list[dict], deny_subjects: list[str]) -> dict:
+        return self._call("PUT", "/api/v1/role-bindings", json={"bindings": bindings, "deny_subjects": deny_subjects})
 
     def _unwrap(self, response) -> dict:
         data = response.json()
@@ -112,17 +193,18 @@ class Client:
         response.raise_for_status()
         return self._unwrap(response)
 
-    def install(
-        self,
-        playbook: str | None = None,
-        inventory: str | None = None,
-        verbose: bool = False,
-    ) -> dict:
-        """Install K7 on target hosts."""
-        response = self.session.post(
-            f"{self.base_url}/api/v1/install",
-            json={"playbook": playbook, "inventory": inventory, "verbose": verbose},
-        )
+    def install(self, nodes: list[str]) -> dict:
+        """Prepare existing cluster nodes with the k7-node-installer (admin key; the
+        cluster must be installed with ``--api-remote-install``). Returns
+        ``{operation, nodes, status}``; poll :meth:`install_status`."""
+        response = self.session.post(f"{self.base_url}/api/v1/install", json={"nodes": nodes})
+        response.raise_for_status()
+        return self._unwrap(response)
+
+    def install_status(self, operation: str) -> dict:
+        """``{operation, state, nodes: [{node, state, ...}], image, created_at}``;
+        ``state`` is running, succeeded or failed."""
+        response = self.session.get(f"{self.base_url}/api/v1/install/{operation}")
         response.raise_for_status()
         return self._unwrap(response)
 
@@ -339,20 +421,27 @@ class AsyncClient:
     def __init__(
         self,
         endpoint: str,
-        api_key: str,
+        api_key: str | None = None,
         verify_ssl: bool | str = True,
         timeout: float = 30.0,
+        token_provider: TokenProvider | None = None,
     ):
         if httpx is None:
             raise RuntimeError("httpx is required for AsyncClient. Install with `pip install httpx`.")
         self.base_url = endpoint.rstrip("/")
         if self.base_url.startswith("https://") and verify_ssl is False:
             raise ValueError("verify_ssl=False is not allowed for https:// endpoints")
+        headers = _auth_headers(api_key, token_provider)
+        hooks: dict = {}
+        if token_provider is not None:
+            provider = token_provider
+
+            async def _bearer(request) -> None:
+                request.headers["Authorization"] = f"Bearer {provider()}"
+
+            hooks = {"request": [_bearer]}
         self._client = httpx.AsyncClient(
-            base_url=self.base_url,
-            headers={"X-API-Key": api_key},
-            verify=verify_ssl,
-            timeout=timeout,
+            base_url=self.base_url, headers=headers, verify=verify_ssl, timeout=timeout, event_hooks=hooks
         )
 
     async def create(self, sandbox_config: dict) -> dict:

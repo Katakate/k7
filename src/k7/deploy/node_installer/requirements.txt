@@ -1,0 +1,11 @@
+# ansible-core and its full dependency closure, pinned (same versions as uv.lock,
+# except ansible-core: 2.17 is EOL without a fix for CVE-2026-11332).
+ansible-core==2.18.19
+cffi==2.0.0
+cryptography==50.0.0
+jinja2==3.1.6
+markupsafe==3.0.3
+packaging==26.0
+pycparser==3.0
+pyyaml==6.0.3
+resolvelib==1.0.1

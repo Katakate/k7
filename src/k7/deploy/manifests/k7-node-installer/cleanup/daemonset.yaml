@@ -1,0 +1,63 @@
+# Uninstall (kata-deploy's cleanup-DaemonSet pattern): delete the
+# k7-node-installer DaemonSet first, then apply this. Each pod refuses while a
+# K7 sandbox runs on its node (args: ["cleanup", "--force"] deletes them),
+# removes the labels, the containerd runtime handlers and the k7 units, then
+# sleeps. Disks stay unless the ConfigMap sets wipeDisks=true. The Helm chart
+# runs this as its pre-delete hook. Not applied by `-f` on the
+# parent directory (non-recursive). Released as k7-node-cleanup.yaml with the
+# image digest filled in.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k7-node-cleanup
+  namespace: k7-system
+  labels:
+    app: k7-node-cleanup
+spec:
+  selector:
+    matchLabels:
+      app: k7-node-cleanup
+  template:
+    metadata:
+      labels:
+        app: k7-node-cleanup
+    spec:
+      serviceAccountName: k7-node-cleanup
+      hostPID: true
+      priorityClassName: system-node-critical
+      nodeSelector:
+        k7.katakate.org/node-pool: "true"
+      tolerations: []
+      containers:
+        - name: cleanup
+          image: __K7_NODE_INSTALLER_IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["cleanup"]
+          env:
+            - name: K7_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K7_INSTALLER_CONFIG
+              value: /etc/k7-node-installer/config.json
+          securityContext:
+            privileged: true
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/k7-node-installer-ready"]
+            periodSeconds: 10
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+            - name: config
+              mountPath: /etc/k7-node-installer
+              readOnly: true
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        - name: config
+          configMap:
+            name: k7-node-installer

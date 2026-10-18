@@ -8,9 +8,9 @@ from k7.core.models import ExecResult, OperationResult, SandboxConfig, SandboxIn
 
 class TestSandboxConfigFromDict:
     def test_minimal_fields(self):
-        cfg = SandboxConfig.from_dict({"name": "test", "image": "alpine:latest"})
+        cfg = SandboxConfig.from_dict({"name": "test", "image": "alpine:3.20"})
         assert cfg.name == "test"
-        assert cfg.image == "alpine:latest"
+        assert cfg.image == "alpine:3.20"
         assert cfg.namespace == "default"
         assert cfg.limits == {}
 
@@ -58,7 +58,7 @@ class TestSandboxConfigFromDict:
 
 class TestSandboxConfigFromYaml:
     def test_round_trip_via_file(self, tmp_path: Path):
-        data = {"name": "yaml-test", "image": "alpine:latest", "namespace": "ci"}
+        data = {"name": "yaml-test", "image": "alpine:3.20", "namespace": "ci"}
         yaml_file = tmp_path / "sandbox.yaml"
         yaml_file.write_text(yaml.dump(data))
 

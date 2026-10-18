@@ -1,6 +1,9 @@
 include LICENSE
 include README.md
 recursive-include src/k7/deploy/manifests *.yaml
+recursive-include src/k7/deploy/roles *.yml *.j2
+include src/k7/deploy/k7-node-cleanup.yaml
+recursive-include src/k7/deploy/node_installer Dockerfile *.txt *.sh
 
 # Exclude common junk
 global-exclude __pycache__ *.py[cod] *.so *.dylib *.dll .DS_Store .idea .vscode

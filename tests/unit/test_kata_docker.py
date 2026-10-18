@@ -2,9 +2,10 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from kubernetes_asyncio.client.exceptions import ApiException
 
-from k7.core.core import K7Core
+from k7.core.core import KFD_FORK_REJECT, K7Core
 from k7.core.docker import (
     ANN_DOCKER_PVC,
     ANN_K7_DOCKER,
@@ -14,15 +15,16 @@ from k7.core.docker import (
     DOCKER_HOST_URL,
     FSFREEZE_STAGED,
     FSFREEZE_VEHICLE,
+    FSFREEZE_VEHICLE_DIR,
     GRAPH_DEVICE_PATH,
     KATA_GRAPH_MOUNT,
     KATA_SOCKET_DIR,
     KFD_DOCKER_STORAGE_CLASS,
-    KFD_FORK_REJECT,
     STAGE_FSFREEZE_CMD,
     VEHICLE_CONTAINER_NAME,
 )
-from k7.core.models import ExecResult, SandboxConfig
+from k7.core.models import ExecResult, OperationResult, SandboxConfig
+from k7.core.tenancy import AdmissionError
 
 
 def _setup(core, apps=None, v1=None, net=None):
@@ -143,7 +145,7 @@ class TestKataDockerSnapshot:
         assert names == ["snap1", "snap1-docker"]
         cmds = [c.args[1] for c in exec_cmd.await_args_list]
         freeze_cmd = (
-            f"cp {FSFREEZE_STAGED} {FSFREEZE_VEHICLE} && chmod 755 {FSFREEZE_VEHICLE} && "
+            f"rm -rf {FSFREEZE_VEHICLE_DIR} && mkdir -p /usr/local/lib && cp -a {FSFREEZE_STAGED} {FSFREEZE_VEHICLE_DIR} && "
             f"{FSFREEZE_VEHICLE} -f {KATA_GRAPH_MOUNT}"
         )
         thaw_cmd = f"{FSFREEZE_VEHICLE} -u {KATA_GRAPH_MOUNT}"
@@ -152,6 +154,29 @@ class TestKataDockerSnapshot:
         assert exec_cmd.await_args_list[1].kwargs.get("container") in (None, "sandbox")
         assert exec_cmd.await_args_list[2].kwargs.get("container") == VEHICLE_CONTAINER_NAME
         assert exec_cmd.await_args_list[3].kwargs.get("container") == VEHICLE_CONTAINER_NAME
+
+    @pytest.mark.parametrize("not_ready", ["snap1", "snap1-docker"])
+    async def test_create_snapshot_fails_on_the_first_unready_snapshot(self, core: K7Core, not_ready):
+        dep = MagicMock()
+        dep.metadata.annotations = {ANN_K7_DOCKER: "true", ANN_DOCKER_PVC: "sb-docker-lh"}
+        dep.status.ready_replicas = 0
+        mock_apps = AsyncMock()
+        mock_apps.read_namespaced_deployment.return_value = dep
+        _setup(core, apps=mock_apps, v1=AsyncMock())
+        waited: list[str] = []
+
+        async def wait(name, namespace):
+            waited.append(name)
+            return OperationResult(success=name != not_ready, error=f"{name} not ready")
+
+        with (
+            patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-qemu-longhorn")),
+            patch.object(core, "_create_volume_snapshot", new=AsyncMock(return_value=_ok())),
+            patch.object(core, "_wait_for_snapshot_ready", new=wait),
+        ):
+            result = await core.create_snapshot("sb", "snap1")
+        assert not result.success and result.error == f"{not_ready} not ready"
+        assert waited == (["snap1"] if not_ready == "snap1" else ["snap1", "snap1-docker"])
 
     async def test_create_snapshot_freeze_failure_is_loud(self, core: K7Core):
         dep = MagicMock()
@@ -197,7 +222,7 @@ class TestKataDockerSnapshot:
         assert not result.success
         cmds = [c.args[1] for c in exec_cmd.await_args_list]
         freeze_cmd = (
-            f"cp {FSFREEZE_STAGED} {FSFREEZE_VEHICLE} && chmod 755 {FSFREEZE_VEHICLE} && "
+            f"rm -rf {FSFREEZE_VEHICLE_DIR} && mkdir -p /usr/local/lib && cp -a {FSFREEZE_STAGED} {FSFREEZE_VEHICLE_DIR} && "
             f"{FSFREEZE_VEHICLE} -f {KATA_GRAPH_MOUNT}"
         )
         thaw_cmd = f"{FSFREEZE_VEHICLE} -u {KATA_GRAPH_MOUNT}"
@@ -289,6 +314,37 @@ class TestKataDockerRestore:
         assert result.success, result.error
         assert [c["snapshot_name"] for c in clones] == ["snap1"]
 
+    async def test_restore_over_quota_deletes_its_cloned_pvcs(self, core: K7Core):
+        """A restore is a create; a quota refusal propagates and leaks no PVC."""
+        snap_info = MagicMock()
+        snap_info.ready_to_use = True
+        custom = AsyncMock()
+        custom.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "annotations": {
+                    "k7.io/source-image": "ubuntu:24.04",
+                    "k7.io/source-backend": "kata-qemu-longhorn",
+                    "k7.io/source-docker": "true",
+                    "k7.io/source-docker-disk": "20Gi",
+                }
+            }
+        }
+        apps = AsyncMock()
+        apps.read_namespaced_deployment.side_effect = ApiException(status=404)
+        v1 = AsyncMock()
+        _setup(core, apps=apps, v1=v1)
+        core._custom_objects_client = custom
+        refusal = AdmissionError(403, "QuotaExceeded", "tenant acme disk quota exceeded")
+        with (
+            patch.object(core, "get_snapshot", new=AsyncMock(return_value=snap_info)),
+            patch.object(core, "_create_pvc_from_snapshot", new=AsyncMock(return_value=_ok())),
+            patch.object(core, "create_sandbox", new=AsyncMock(side_effect=refusal)),
+            pytest.raises(AdmissionError),
+        ):
+            await core.restore_sandbox("snap1", "dst")
+        deleted = [c.kwargs["name"] for c in v1.delete_namespaced_persistent_volume_claim.await_args_list]
+        assert deleted == ["dst-root-lh", "dst-docker-lh"]
+
     async def test_kfd_ephemeral_block_not_privileged_sandbox(self, core: K7Core):
         result, mock_apps = await _create_kata_docker(core, "kata-firecracker-devmapper")
         assert result.success, result.error
@@ -340,10 +396,21 @@ class TestKataDockerForkReject:
 
     async def test_kfd_plain_fork_rejected(self, core: K7Core):
         """Non-docker kfd has no PVC either — reject before a confusing 404."""
+        _setup(core, apps=AsyncMock(), v1=AsyncMock())
         with patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-firecracker-devmapper")):
             result = await core.fork_sandbox("src", "dst")
         assert not result.success
         assert result.error == KFD_FORK_REJECT
+
+    async def test_missing_source_is_not_found_not_kfd_reject(self, core: K7Core):
+        """The node-default fallback must not turn a missing source into KFD_FORK_REJECT."""
+        mock_apps = AsyncMock()
+        mock_apps.read_namespaced_deployment.side_effect = ApiException(status=404)
+        _setup(core, apps=mock_apps, v1=AsyncMock())
+        with patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-firecracker-devmapper")):
+            result = await core.fork_sandbox("gone", "dst")
+        assert not result.success
+        assert "not found" in result.error
 
 
 class TestDindImagePin:

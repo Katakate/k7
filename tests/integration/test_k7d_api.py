@@ -1,10 +1,10 @@
 """k7d VM ops through the centralized HTTP API.
 
-The k7-api pod handles sandboxes co-located with it directly (hostPath
-sockets + crictl). For a sandbox on any OTHER node, core forwards the VM
-op to the k7-agent DaemonSet pod on that node — so
-pause/resume/fork work through the API for any node. The agent requires
-the shared token from /etc/k7/agent_token and rejects everything else.
+The k7-api pod has no host mounts (``K7_K7D_REMOTE_ONLY=1``): core
+forwards every VM op to the k7-agent DaemonSet pod on the sandbox's node,
+including the API pod's own node — so pause/resume/fork work through the
+API for any node. The agent requires
+the shared token (Secret k7-agent-token) and rejects everything else.
 
 Runs on the first master (like all API integration tests: the key store
 and NodePort are local).
@@ -13,17 +13,27 @@ and NodePort are local).
 import json
 import subprocess
 import time
+from collections.abc import Iterator
+from uuid import uuid4
 
 import pytest
 
-from .test_api import _api_pod_ready, _generate_test_api_key, _get_api_base_url, _tls_verify, httpx
+from .cluster import KUBECTL, agent_token, system_ns
+from .test_api import (
+    _api_pod_ready,
+    _generate_test_api_key,
+    _get_api_base_url,
+    _revoke_test_api_key,
+    _tls_verify,
+    httpx,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.k7d]
 
 
 def _kubectl_json(*args: str) -> dict:
     result = subprocess.run(
-        ["k3s", "kubectl", *args, "-o", "json"],
+        [*KUBECTL, *args, "-o", "json"],
         capture_output=True,
         text=True,
         check=True,
@@ -43,7 +53,7 @@ def _ready_node_names() -> list[str]:
 def _k7d_runtimeclass_present() -> bool:
     try:
         result = subprocess.run(
-            ["k3s", "kubectl", "get", "runtimeclass", "k7"],
+            [*KUBECTL, "get", "runtimeclass", "k7"],
             capture_output=True,
             text=True,
         )
@@ -74,8 +84,12 @@ def api_base_url() -> str:
 
 
 @pytest.fixture(scope="module")
-def api_key() -> str:
-    return _generate_test_api_key()
+def api_key() -> Iterator[str]:
+    name = f"integ-k7d-api-{uuid4().hex[:8]}"
+    try:
+        yield _generate_test_api_key(name=name)
+    finally:
+        _revoke_test_api_key(name)
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +100,7 @@ def api_headers(api_key: str) -> dict[str, str]:
 @pytest.fixture(scope="module")
 def api_node() -> str:
     """The Kubernetes node hosting the k7-api pod (the first master)."""
-    pods = _kubectl_json("get", "pods", "-n", "kube-system", "-l", "app=k7-api")
+    pods = _kubectl_json("get", "pods", "-n", system_ns(), "-l", "app=k7-api")
     nodes = [p["spec"]["nodeName"] for p in pods["items"] if p["status"]["phase"] == "Running"]
     assert nodes, "no Running k7-api pod found"
     return nodes[0]
@@ -245,7 +259,7 @@ def _local_agent_pod_ip(api_node: str) -> str:
     host→local-pod traffic is allowed by Cilium, so token auth is what's
     being exercised)."""
     pods = _kubectl_json(
-        "get", "pods", "-n", "kube-system", "-l", "app=k7-agent", "--field-selector", "status.phase=Running"
+        "get", "pods", "-n", system_ns(), "-l", "app=k7-agent", "--field-selector", "status.phase=Running"
     )
     ips = [
         p["status"]["podIP"] for p in pods["items"] if p["spec"]["nodeName"] == api_node and p["status"].get("podIP")
@@ -266,10 +280,9 @@ class TestK7Agent:
         assert r.status_code == 401, f"expected 401 with wrong token, got {r.status_code}: {r.text}"
 
     def test_agent_accepts_shared_token_storage(self, api_node: str):
-        """With the real token from /etc/k7/agent_token, the storage endpoint
+        """With the real token from Secret k7-agent-token, the storage endpoint
         reports both node-local pools."""
-        with open("/etc/k7/agent_token") as f:
-            token = f.read().strip()
+        token = agent_token()
         base = f"http://{_local_agent_pod_ip(api_node)}:8000"
         r = httpx.get(f"{base}/agent/v1/storage", headers={"X-K7-Agent-Token": token}, timeout=30)
         assert r.status_code == 200, f"storage query failed: {r.text}"

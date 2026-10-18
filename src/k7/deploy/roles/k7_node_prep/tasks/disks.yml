@@ -1,0 +1,258 @@
+---
+# ──── BEGIN: spare-disk check (FD backend only) ────
+- name: Detect root disk device
+  ansible.builtin.set_fact:
+    root_disk: "{{ (ansible_mounts | selectattr('mount', 'equalto', '/') | first).device
+                  | regex_replace('p?[0-9]+$', '') }}"
+  when: k7_has_devmapper
+  tags: ['lvm']
+
+- name: Use provided disk override (k7_disk_source=device:<path>)
+  ansible.builtin.set_fact:
+    requested_disk: "{{ k7_disk_source_effective | regex_replace('^device:', '') if k7_disk_source_effective is match('device:') else '' }}"
+  when: k7_has_devmapper
+  tags: ['lvm']
+
+- name: Normalize requested disk path
+  ansible.builtin.set_fact:
+    requested_disk_basename: "{{ requested_disk | regex_replace('^/dev/', '') }}"
+    requested_disk_path: "/dev/{{ requested_disk | regex_replace('^/dev/', '') }}"
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+  tags: ['lvm']
+
+- name: Validate requested disk exists and is a block device
+  ansible.builtin.stat:
+    path: "{{ requested_disk_path }}"
+  register: requested_disk_stat
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+  tags: ['lvm']
+
+- name: Fail if requested disk not present or not a block device
+  ansible.builtin.fail:
+    msg: "Specified k7_disk '{{ requested_disk_path }}' does not exist or is not a block device"
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+    - (not requested_disk_stat.stat.exists or not requested_disk_stat.stat.isblk)
+  tags: ['lvm']
+
+- name: Ensure requested disk is a whole disk (not a partition)
+  ansible.builtin.command: lsblk -dn -o TYPE "{{ requested_disk_path }}"
+  register: lsblk_type
+  changed_when: false
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+  tags: ['lvm']
+
+- name: Fail if requested disk is not a whole disk
+  ansible.builtin.fail:
+    msg: "Specified k7_disk '{{ requested_disk_path }}' is not a whole disk (TYPE={{ lsblk_type.stdout | trim }})"
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+    - (lsblk_type.stdout is not defined or (lsblk_type.stdout | trim) != 'disk')
+  tags: ['lvm']
+
+- name: Pull ansible facts for requested disk
+  ansible.builtin.set_fact:
+    requested_disk_facts: "{{ ansible_devices.get(requested_disk_basename) | default(None) }}"
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+  tags: ['lvm']
+
+- name: Fail if requested disk not found in ansible_devices
+  ansible.builtin.fail:
+    msg: "Device '{{ requested_disk_path }}' not visible in ansible_devices facts"
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+    - (requested_disk_facts is not defined or requested_disk_facts is none)
+  tags: ['lvm']
+
+- name: Fail if requested disk has partitions
+  ansible.builtin.fail:
+    msg: "Device '{{ requested_disk_path }}' has partitions; wipe it with utils/wipe-disk.sh or choose another disk"
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+    - (requested_disk_facts.partitions is defined and (requested_disk_facts.partitions | length) > 0)
+  tags: ['lvm']
+
+- name: Fail if requested disk appears to be the root disk
+  ansible.builtin.fail:
+    msg: "Device '{{ requested_disk_path }}' appears to be the root disk; choose a different disk"
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+    - (requested_disk_basename == (root_disk | basename))
+  tags: ['lvm']
+
+- name: Use requested disk as kata_block
+  ansible.builtin.set_fact:
+    kata_block: "{{ requested_disk_path }}"
+  when:
+    - k7_has_devmapper
+    - requested_disk != ''
+  tags: ['lvm']
+
+- name: Find an empty secondary disk (skip loop, mapper, CD-ROM, zram, etc.)
+  ansible.builtin.set_fact:
+    kata_block: >-
+      {{
+        ansible_devices
+        | dict2items
+        | selectattr('value.partitions', 'equalto', {})
+        | selectattr('value.removable', 'equalto', '0')
+        | selectattr('value.size', 'defined')
+        | rejectattr('value.size', 'equalto', '0 bytes')
+        | selectattr('value.host', 'defined')
+        | rejectattr('value.host', 'equalto', '')
+        | rejectattr('key', 'match', root_disk | basename)
+        | rejectattr('key', 'search', '^(dm-|mapper/|loop|sr|zram|zd)[0-9]+$')
+        | map(attribute='key')
+        | map('regex_replace', '^', '/dev/')
+        | first | default('')
+      }}
+  when:
+    - k7_has_devmapper
+    - requested_disk == ''
+  tags: ['lvm']
+
+- name: Show selected disk for LVM thin-pool
+  ansible.builtin.debug:
+    msg: "Using disk for K7 LVM thin-pool: {{ kata_block }} {{ '(user-specified)' if requested_disk != '' else '(auto-detected)' }}"
+  when: k7_has_devmapper
+  tags: ['lvm']
+
+- name: Fail if no spare block device is available
+  ansible.builtin.fail:
+    msg: |
+      No empty secondary disk found.
+      K7 expects a dedicated data drive for the LVM thin-pool.
+      Attach an extra NVMe/SSD (e.g. /dev/nvme2n1) and re-run the playbook.
+  when:
+    - k7_has_devmapper
+    - requested_disk == ''
+    - kata_block == ''
+  tags: ['lvm']
+# ──── END spare-disk check ────
+
+- name: Ensure kata-vg exists
+  ansible.builtin.command: vgdisplay kata-vg
+  register: vgcheck
+  failed_when: false
+  changed_when: false
+  when: k7_has_devmapper
+  tags: ['lvm']
+
+- name: Create physical volume (pvcreate with label)
+  ansible.builtin.command: >
+    pvcreate -y --setphysicalvolumesize {{ kata_thinpool_pv_size }}
+    --metadatasize 4M --dataalignment 1M {{ kata_block }}
+  when:
+    - k7_has_devmapper
+    - vgcheck.rc != 0
+  tags: ['lvm']
+
+- name: Create VG if missing
+  ansible.builtin.command: vgcreate kata-vg {{ kata_block }}
+  when:
+    - k7_has_devmapper
+    - vgcheck.rc != 0
+  tags: ['lvm']
+
+- name: Add k7 tag to PV
+  ansible.builtin.command: pvchange --addtag k7 {{ kata_block }}
+  when:
+    - k7_has_devmapper
+    - vgcheck.rc != 0
+  tags: ['lvm']
+
+- name: Ensure thin pool LV exists
+  ansible.builtin.command: >
+    lvcreate -T kata-vg/thin-pool
+             -l 95%FREE
+             --poolmetadatasize 1G
+             --chunksize 512K
+             --yes
+  args:
+    creates: /dev/kata-vg/thin-pool
+  when: k7_has_devmapper
+  tags: ['lvm']
+
+- name: Create devmapper VG subdir
+  ansible.builtin.file:
+    path: "{{ k7_containerd_root }}/io.containerd.snapshotter.v1.devmapper/kata-vg"
+    state: directory
+    mode: '0755'
+  when: k7_has_devmapper
+  tags: ['devmapper', 'lvm']
+
+- name: Enable LVM thin-pool autoextend service
+  ansible.builtin.copy:
+    dest: /etc/lvm/profile/kata-thin.profile
+    mode: '0644'
+    content: |
+      activation {
+          thin_pool_autoextend_threshold=80
+          thin_pool_autoextend_percent=20
+      }
+  when: k7_has_devmapper
+  tags: ['lvm']
+
+- name: Attach profile to thin pool
+  ansible.builtin.command: lvchange --metadataprofile kata-thin kata-vg/thin-pool
+  when: k7_has_devmapper
+  changed_when: true
+  tags: ['lvm']
+
+# The unprivileged k7-agent has no /dev and no lvm2; the host writes the
+# thin-pool `lvs` report it serves (stale >90 s → agent 500s).
+- name: Install kfd storage report service and timer
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    mode: '0644'
+    content: "{{ item.content }}"
+  loop:
+    - name: k7-storage-report.service
+      content: |
+        [Unit]
+        Description=Write the kfd thin-pool lvs report to /run/k7/storage.json
+
+        [Service]
+        Type=oneshot
+        RuntimeDirectory=k7
+        RuntimeDirectoryPreserve=yes
+        ExecStart=/bin/sh -ec 'lvs --reportformat json --units b --nosuffix -o +lv_metadata_size kata-vg > /run/k7/storage.json.tmp'
+        ExecStart=/bin/mv /run/k7/storage.json.tmp /run/k7/storage.json
+    - name: k7-storage-report.timer
+      content: |
+        [Unit]
+        Description=Refresh /run/k7/storage.json every 30s
+
+        [Timer]
+        OnActiveSec=0
+        OnUnitActiveSec=30s
+        AccuracySec=1s
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  when: k7_has_devmapper
+  tags: ['lvm', 'storage-report']
+
+- name: Enable and start kfd storage report timer
+  ansible.builtin.systemd:
+    name: k7-storage-report.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: k7_has_devmapper
+  tags: ['lvm', 'storage-report']

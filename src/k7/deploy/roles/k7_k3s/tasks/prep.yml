@@ -1,0 +1,45 @@
+---
+- name: Require k7_distro=k3s for the K3s role
+  ansible.builtin.fail:
+    msg: "The k7_k3s role installs K3s; k7_distro={{ k7_distro }} brings its own Kubernetes."
+  when: k7_distro != 'k3s'
+  tags: ['always']
+
+- name: Validate the pinned K3s version
+  ansible.builtin.fail:
+    msg: "k3s_version={{ k3s_version | default('<unset>') }}; expected v1.X.Y+k3sZ (e.g. v1.36.4+k3s1)."
+  when: k3s_version is not defined or k3s_version is not match('^v1\.\d+\.\d+\+k3s\d+$')
+  tags: ['always']
+
+# k7_cluster drives cilium-cli and helm through this kubeconfig.
+- name: Expose the K3s kubeconfig to the cluster role
+  ansible.builtin.set_fact:
+    k7_kubeconfig: /etc/rancher/k3s/k3s.yaml
+  tags: ['always']
+
+- name: Remove previously rendered containerd config
+  ansible.builtin.file:
+    path: /var/lib/rancher/k3s/agent/etc/containerd/config.toml
+    state: absent
+  tags: ['k3s']
+
+- name: Check whether k3s is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_bin_stat
+  tags: ['cni']
+
+# First install only. On a re-run the running Cilium agent has
+# /etc/cni/net.d bind-mounted; deleting the directory leaves its mount
+# on a dead inode, every CNI-config write fails, the agent reports
+# unhealthy until the liveness probe kills it 5 minutes later, and
+# "Wait for Cilium to report ready" (also 5 minutes) races it and loses.
+- name: Wipe CNI conf dirs before first k3s start
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/cni/net.d
+    - /var/lib/rancher/k3s/agent/etc/cni/net.d
+  when: not k3s_bin_stat.stat.exists
+  tags: ['cni']

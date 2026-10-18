@@ -1,0 +1,90 @@
+# RBAC cannot scope `patch nodes` to the caller's own node; the
+# ValidatingAdmissionPolicy in admission-policy.yaml does (SECURITY.md).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k7-node-installer
+  namespace: k7-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k7-node-cleanup
+  namespace: k7-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k7-node-installer
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+---
+# Cleanup also lists (and with --force deletes) the K7 sandbox pods on its node;
+# admission-policy.yaml limits the delete to that node's sandbox pods.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k7-node-cleanup
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k7-node-installer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k7-node-installer
+subjects:
+  - kind: ServiceAccount
+    name: k7-node-installer
+    namespace: k7-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k7-node-cleanup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k7-node-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: k7-node-cleanup
+    namespace: k7-system
+---
+# Node events live in `default`, next to the kubelet's.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k7-node-installer-events
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k7-node-installer-events
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k7-node-installer-events
+subjects:
+  - kind: ServiceAccount
+    name: k7-node-installer
+    namespace: k7-system
+  - kind: ServiceAccount
+    name: k7-node-cleanup
+    namespace: k7-system

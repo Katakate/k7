@@ -7,12 +7,12 @@ import time
 
 import pytest
 
-from k7.core.core import K7Core
+from k7.core.core import KFD_SNAPSHOT_REJECT, K7Core
 from k7.core.models import SandboxConfig
 
-pytestmark = [pytest.mark.integration, pytest.mark.firecracker]
+from .cluster import KUBECTL
 
-_K3S = "/usr/local/bin/k3s"
+pytestmark = [pytest.mark.integration, pytest.mark.firecracker]
 
 
 def _local_node_name() -> str:
@@ -25,7 +25,7 @@ def _local_node_name() -> str:
     short = socket.gethostname().split(".", 1)[0]
     try:
         result = subprocess.run(
-            [_K3S, "kubectl", "get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"],
+            [*KUBECTL, "get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"],
             capture_output=True,
             text=True,
             check=True,
@@ -45,8 +45,7 @@ def _wait_for_pod_running(name: str, namespace: str, timeout: int = 120) -> None
     while time.time() < deadline:
         result = subprocess.run(
             [
-                _K3S,
-                "kubectl",
+                *KUBECTL,
                 "get",
                 "pods",
                 "-n",
@@ -112,6 +111,26 @@ class TestFirecrackerBackend:
             assert runtime_class == "kata", f"expected kata, got {runtime_class}"
         finally:
             await k7_core.delete_sandbox("integ-fc", namespace=test_namespace)
+
+    async def test_kfd_snapshot_rejected_loudly(self, k7_core: K7Core, test_namespace: str):
+        """snapshot create / pause --snapshot refuse kfd up front: no VolumeSnapshot, still running."""
+        name = "integ-fc-nosnap"
+        cfg = SandboxConfig(
+            name=name, image="alpine:3.20", namespace=test_namespace, backend="kata-firecracker-devmapper"
+        )
+        result = await k7_core.create_sandbox(cfg)
+        assert result.success, f"create failed: {result.error}"
+        try:
+            snap = await k7_core.create_snapshot(name, "kfd-snap", namespace=test_namespace)
+            assert not snap.success and snap.error == KFD_SNAPSHOT_REJECT, snap.error
+            paused = await k7_core.pause_sandbox(name, namespace=test_namespace, snapshot_name="kfd-snap")
+            assert not paused.success and paused.error == KFD_SNAPSHOT_REJECT, paused.error
+            snaps = await k7_core.list_snapshots(namespace=test_namespace)
+            assert not [s for s in snaps if s.name == "kfd-snap"], snaps
+            dep = await (await k7_core._get_apps_v1_client()).read_namespaced_deployment(name, test_namespace)
+            assert dep.spec.replicas == 1, "rejected pause --snapshot must not scale the sandbox down"
+        finally:
+            await k7_core.delete_sandbox(name, namespace=test_namespace)
 
     async def test_guest_seccomp_enforced(self, k7_core: K7Core, test_namespace: str):
         """RuntimeDefault must actually be applied inside the Firecracker guest."""

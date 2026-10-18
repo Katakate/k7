@@ -1,0 +1,49 @@
+# `k7 install --monitoring`: what the Prometheus Operator scrapes. Same
+# objects as the chart's observability.serviceMonitor (unit-tested).
+apiVersion: v1
+kind: Service
+metadata:
+  name: k7-api-metrics
+  namespace: kube-system
+  labels:
+    app: k7-api
+    k7.katakate.org/metrics: "true"
+spec:
+  clusterIP: None
+  selector:
+    app: k7-api
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: k7-api
+  namespace: kube-system
+spec:
+  jobLabel: app
+  selector:
+    matchLabels:
+      k7.katakate.org/metrics: "true"
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: k7-agent
+  namespace: kube-system
+spec:
+  jobLabel: app
+  selector:
+    matchLabels:
+      app: k7-agent
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

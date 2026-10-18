@@ -1,0 +1,4 @@
+---
+- name: Load xt_mark
+  ansible.builtin.command: modprobe xt_mark
+  changed_when: false

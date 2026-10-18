@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "k7"
-version = "0.4.0"
+version = "0.5.0"
 description = "Self-hosted VM sandboxes for untrusted and AI code (CLI, API, SDK)"
 readme = "README.md"
 requires-python = ">=3.10.11"
@@ -12,7 +12,9 @@ dependencies = [
     "fastapi>=0.135.3",
     "httpx>=0.28.1",
     "kubernetes-asyncio>=31.1.0",
+    "prometheus-client>=0.26.0",
     "pydantic>=2.12.5",
+    "pyjwt[crypto]>=2.15.1",
     "python-dotenv>=1.2.2",
     "python-multipart>=0.0.26",
     "pyyaml>=6.0.3",
@@ -24,10 +26,13 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/k7", "src/k7_sdk", "src/katakate"]
+# Written by the release workflow; gitignored so a tag never carries a digest.
+artifacts = ["src/k7/deploy/images.lock.yaml"]
 
 [dependency-groups]
 dev = [
     "ansible-lint>=26.4.0",
+    "cel-python>=0.5.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=0.25.0",
     "pytest-cov>=7.1.0",
@@ -42,7 +47,7 @@ target-version = "py310"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "T20"]
 ignore = [
     "E501",   # line length handled by formatter
     "B008",   # function call in defaults — standard typer/fastapi pattern
@@ -50,6 +55,11 @@ ignore = [
     "SIM105", # contextlib.suppress — existing try/except/pass patterns are intentional
     "SIM108", # ternary — readability preference
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Core and the API log through k7.logging; the CLI, deploy
+# helpers and tests print.
+"!src/k7/{core,api}/**" = ["T20"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["k7", "k7_sdk", "katakate"]
@@ -62,8 +72,10 @@ markers = [
     "firecracker: tests specific to kata-firecracker-devmapper backend",
     "qemu: tests specific to kata-qemu-longhorn backend",
     "k7d: tests specific to the k7d backend",
+    "egress_matrix: egress x backend x fork traffic matrix",
     "multinode: tests requiring a multi-node k7 cluster (>=2 Ready nodes)",
     "bench: Docker benchmark module; opt-in only (-m bench), not run by default",
+    "destructive: reinstalls, upgrades or uninstalls the stack; skipped unless K7_DESTRUCTIVE=1 (-m destructive)",
 ]
 addopts = [
     "--strict-markers",

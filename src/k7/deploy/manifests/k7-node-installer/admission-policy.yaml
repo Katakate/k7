@@ -1,0 +1,92 @@
+# Restricts the installer/cleanup ServiceAccounts to the node their pod runs
+# on (the bound token's node-name, Kubernetes >= 1.32) and to k7.katakate.org/
+# labels. Defense in depth only: the installer is root on that node anyway.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: k7-node-installer-own-node
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: k7-node-installer-service-accounts
+      expression: >-
+        request.userInfo.username in [
+          'system:serviceaccount:k7-system:k7-node-installer',
+          'system:serviceaccount:k7-system:k7-node-cleanup']
+  validations:
+    - expression: >-
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/node-name' in request.userInfo.extra &&
+        request.userInfo.extra['authentication.kubernetes.io/node-name'][0] == object.metadata.name
+      message: k7-node-installer may only patch the node its pod runs on
+    - expression: object.spec == oldObject.spec
+      message: k7-node-installer may not change the node spec
+    - expression: >-
+        object.metadata.labels.all(k, k.startsWith('k7.katakate.org/') ||
+          (k in oldObject.metadata.labels && oldObject.metadata.labels[k] == object.metadata.labels[k])) &&
+        oldObject.metadata.labels.all(k, k.startsWith('k7.katakate.org/') || k in object.metadata.labels)
+      message: k7-node-installer may only change k7.katakate.org/ labels
+    - expression: >-
+        has(object.metadata.annotations) == has(oldObject.metadata.annotations) &&
+        (!has(object.metadata.annotations) || object.metadata.annotations == oldObject.metadata.annotations)
+      message: k7-node-installer may not change node annotations
+    - expression: >-
+        has(object.metadata.finalizers) == has(oldObject.metadata.finalizers) &&
+        (!has(object.metadata.finalizers) || object.metadata.finalizers == oldObject.metadata.finalizers)
+      message: k7-node-installer may not change node finalizers
+    - expression: >-
+        has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences) &&
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences)
+      message: k7-node-installer may not change node ownerReferences
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: k7-node-installer-own-node
+spec:
+  policyName: k7-node-installer-own-node
+  validationActions: [Deny]
+---
+# RBAC cannot scope `delete pods` to a node either: the cleanup ServiceAccount
+# may delete only K7 sandbox pods (entrypoint.SANDBOX_RUNTIME_CLASSES) on the
+# node in its bound token. Its `list pods` stays cluster-wide (SECURITY.md).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: k7-node-cleanup-own-node-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: k7-node-cleanup-service-account
+      expression: request.userInfo.username == 'system:serviceaccount:k7-system:k7-node-cleanup'
+  validations:
+    - expression: >-
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/node-name' in request.userInfo.extra &&
+        has(oldObject.spec.nodeName) &&
+        request.userInfo.extra['authentication.kubernetes.io/node-name'][0] == oldObject.spec.nodeName
+      message: k7-node-cleanup may only delete pods on the node its pod runs on
+    - expression: >-
+        has(oldObject.spec.runtimeClassName) &&
+        oldObject.spec.runtimeClassName in ['k7', 'k7-fc', 'kata', 'kata-qemu']
+      message: k7-node-cleanup may only delete K7 sandbox pods
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: k7-node-cleanup-own-node-pods
+spec:
+  policyName: k7-node-cleanup-own-node-pods
+  validationActions: [Deny]

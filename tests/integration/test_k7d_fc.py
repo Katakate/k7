@@ -19,6 +19,8 @@ import pytest
 from k7.core.core import K7D_FC_VIRTIOFS_REFUSED, K7Core
 from k7.core.models import SandboxConfig
 
+from .cluster import KUBECTL
+
 pytestmark = [pytest.mark.integration, pytest.mark.k7d]
 
 _LOCAL_NODE = os.uname().nodename
@@ -26,7 +28,7 @@ _LOCAL_NODE = os.uname().nodename
 
 def _runtimeclass_present(name: str) -> bool:
     result = subprocess.run(
-        ["k3s", "kubectl", "get", "runtimeclass", name],
+        [*KUBECTL, "get", "runtimeclass", name],
         capture_output=True,
         text=True,
         check=False,
@@ -50,8 +52,7 @@ def _wait_pod_ready(sandbox_name: str, namespace: str, timeout: int = 300) -> No
     while time.time() < deadline:
         result = subprocess.run(
             [
-                "k3s",
-                "kubectl",
+                *KUBECTL,
                 "get",
                 "pods",
                 "-n",
@@ -84,8 +85,7 @@ def _wait_pod_ready(sandbox_name: str, namespace: str, timeout: int = 300) -> No
 def _pod_runtime_class(sandbox_name: str, namespace: str) -> str:
     result = subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "get",
             "pods",
             "-n",
@@ -192,7 +192,7 @@ class TestK7dFcLifecycle:
         assert not result.success
         assert result.error == K7D_FC_VIRTIOFS_REFUSED
         listed = subprocess.run(
-            ["k3s", "kubectl", "get", "deploy", "test-k7d-fc-hostpath", "-n", test_namespace],
+            [*KUBECTL, "get", "deploy", "test-k7d-fc-hostpath", "-n", test_namespace],
             capture_output=True,
             text=True,
             check=False,

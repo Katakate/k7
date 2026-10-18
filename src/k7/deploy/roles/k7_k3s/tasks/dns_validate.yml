@@ -1,0 +1,35 @@
+---
+# k7_dns_upstreams: optional upstream resolvers for CoreDNS (dns.yml). A YAML
+# list in the inventory, or comma-separated (INI, `k7 install --dns-upstream`).
+# Unset or empty keeps the host's resolvers.
+- name: Normalise k7_dns_upstreams
+  ansible.builtin.set_fact:
+    k7_dns_upstreams_list: >-
+      {{ ((k7_dns_upstreams | default('', true)).split(',')
+          if (k7_dns_upstreams | default('', true)) is string else k7_dns_upstreams)
+         | map('string') | map('trim') | reject('equalto', '') | list }}
+  tags: ['always']
+
+- name: Fail if k7_dns_upstreams has more than 3 resolvers
+  ansible.builtin.assert:
+    that: k7_dns_upstreams_list | length <= 3
+    fail_msg: >-
+      k7_dns_upstreams has {{ k7_dns_upstreams_list | length }} entries ({{ k7_dns_upstreams_list | join(', ') }}).
+      The kubelet hands CoreDNS at most 3 nameservers and drops the rest without failing.
+    quiet: true
+  tags: ['always']
+
+- name: Fail on a k7_dns_upstreams entry that is not an IPv4 resolver
+  ansible.builtin.assert:
+    that:
+      - item is match(k7_ipv4_re)
+      - item is not match('^(0|127)\.')
+    fail_msg: >-
+      k7_dns_upstreams entry '{{ item }}' is not a usable IPv4 resolver address.
+      IPv6 is refused: the pod network is IPv4-only (cluster-cidr 10.42.0.0/16), so
+      CoreDNS could not reach it. 0.x and 127.x would point CoreDNS back at itself.
+    quiet: true
+  loop: "{{ k7_dns_upstreams_list }}"
+  vars:
+    k7_ipv4_re: '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+  tags: ['always']

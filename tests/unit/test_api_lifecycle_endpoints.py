@@ -14,7 +14,9 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from k7.api.keystore import FileKeyStore
 from k7.api.main import app
+from k7.core.core import KFD_SNAPSHOT_REJECT
 from k7.core.models import OperationResult
 
 TEST_KEY = "k7-test-secret-key-lifecycle"
@@ -25,8 +27,10 @@ TEST_KEY_HASH = hashlib.sha256(TEST_KEY.encode()).hexdigest()
 def keys_file(tmp_path: Path):
     p = tmp_path / "api_keys.json"
     future_ts = int(time.time()) + 86400
-    p.write_text(json.dumps({TEST_KEY_HASH: {"name": "test-key", "expires": future_ts, "last_used": None}}))
-    with patch("k7.api.main.API_KEYS_FILE", p):
+    p.write_text(
+        json.dumps({TEST_KEY_HASH: {"name": "test-key", "expires": future_ts, "last_used": None, "role": "admin"}})
+    )
+    with patch("k7.api.main.STORE", FileKeyStore(p)):
         yield p
 
 
@@ -191,3 +195,32 @@ class TestForkEndpoint:
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await _post(client, "/api/v1/sandboxes/demo/fork", {"new_name": "child"})
         assert resp.status_code == 400
+
+
+# --- missing sandbox → 404 ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method, path, body",
+    [
+        ("pause_sandbox", "/api/v1/sandboxes/demo/pause", {}),
+        ("create_snapshot", "/api/v1/sandboxes/demo/snapshot", {"snapshot_name": "s1"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "error, code",
+    [
+        ("Sandbox demo not found in namespace default", 404),
+        ("k7d control socket /run/k7d/k7d.sock not found — is the k7d daemon running?", 400),
+        (KFD_SNAPSHOT_REJECT, 400),
+        ("boom", 400),
+    ],
+)
+async def test_missing_sandbox_is_404_other_failures_400(keys_file, method, path, body, error, code):
+    with patch("k7.api.main.K7Core") as core_cls:
+        setattr(core_cls.return_value, method, AsyncMock(return_value=OperationResult(success=False, error=error)))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await _post(client, path, body)
+    assert resp.status_code == code
+    assert resp.json()["error"]["message"] == error

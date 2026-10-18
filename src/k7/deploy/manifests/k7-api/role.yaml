@@ -1,0 +1,42 @@
+# The API reads the key store, patches it for the admin key routes,
+# merges coarse last_used into the usage Secret, and holds
+# tenant Leases. Both Secrets are created by the playbook
+# (`k7_api_keys.py migrate`), so no `create` verb is needed here (RBAC
+# cannot scope `create` by resourceNames).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k7-api-keys
+  namespace: kube-system
+  labels:
+    app: k7-api
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["k7-api-keys"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["k7-api-keys-usage"]
+    verbs: ["get", "patch"]
+  # Per-tenant quota Leases (k7-quota-<tenant>) and the status leader
+  # Lease (k7-tenant-status). Tenant names are dynamic, so no resourceNames.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k7-api-keys
+  namespace: kube-system
+  labels:
+    app: k7-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k7-api-keys
+subjects:
+  - kind: ServiceAccount
+    name: k7-api
+    namespace: kube-system

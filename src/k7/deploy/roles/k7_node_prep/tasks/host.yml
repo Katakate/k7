@@ -1,0 +1,206 @@
+---
+# The k7 package on a node is often the CLI running this play, or a local
+# build the PPA would replace: hold it for the upgrade. An operator's own
+# hold (dpkg status `hold ...`) is left as it is.
+- name: Read the k7 package selection
+  ansible.builtin.command: dpkg-query -W -f=${Status} k7
+  register: k7_pkg_status
+  changed_when: false
+  failed_when: k7_pkg_status.rc not in [0, 1]
+  when: not (k7_node_installer | bool)
+  tags: ['system_update']
+
+- name: Upgrade all packages with the k7 package held
+  vars:
+    k7_pkg_hold: "{{ k7_pkg_status.stdout == 'install ok installed' }}"
+  when: not (k7_node_installer | bool)
+  tags: ['system_update']
+  block:
+    - name: Hold the k7 package
+      ansible.builtin.command: apt-mark hold k7
+      changed_when: true
+      when: k7_pkg_hold | bool
+
+    - name: Update apt cache and upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        autoremove: true
+  always:
+    - name: Release the k7 package hold
+      ansible.builtin.command: apt-mark unhold k7
+      changed_when: true
+      when: k7_pkg_hold | bool
+
+# ---- LVM utilities (devmapper-only) ----
+- name: Install LVM2
+  ansible.builtin.apt:
+    name: lvm2
+    state: present
+  when: k7_has_devmapper
+  tags: ['lvm']
+
+# Section: KVM Installation (always — both backends use KVM)
+- name: Install required KVM and support utilities
+  ansible.builtin.apt:
+    name:
+      - bridge-utils
+      - cpu-checker
+      - jq
+    state: present
+  tags: ['kvm']
+
+- name: Check if KVM acceleration can be used
+  ansible.builtin.command: kvm-ok
+  register: kvm_ok_result
+  changed_when: false
+  failed_when: "'KVM acceleration can be used' not in kvm_ok_result.stdout and 'INFO: /dev/kvm exists' not in kvm_ok_result.stdout"
+  tags: ['kvm']
+
+- name: Ensure KVM modules (generic, Intel, AMD) are configured to load at boot
+  ansible.builtin.lineinfile:
+    path: /etc/modules-load.d/k7-kvm.conf
+    line: "{{ item }}"
+    create: true
+    mode: '0644'
+  loop:
+    - kvm
+    - kvm_intel
+    - kvm_amd
+    - dm_thin_pool
+  tags: ['kvm']
+
+- name: Load KVM + device-mapper thin-pool modules
+  ansible.builtin.shell: |
+    for mod in kvm kvm_intel kvm_amd dm_thin_pool; do
+      modprobe "$mod" 2>/dev/null || true
+    done
+  changed_when: false
+  tags: ['kvm']
+
+- name: Add target user to the KVM group
+  ansible.builtin.user:
+    name: "{{ target_user }}"
+    groups: kvm
+    append: true
+  tags: ['kvm']
+
+- name: Check /dev/kvm ownership
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: kvm_dev
+
+- name: Fail if /dev/kvm is not owned by kvm group
+  ansible.builtin.fail:
+    msg: "/dev/kvm must be owned by group 'kvm'. Check system configuration."
+  when:
+    - kvm_dev.stat.exists
+    - kvm_dev.stat.grp is defined
+    - kvm_dev.stat.grp != 'kvm'
+
+# Each runc or Kata shim holds about two inotify instances. At the kernel's
+# 128 per user, sandbox creation fails ("Creating watcher returned error too
+# many open files") once a node runs about 50 pods.
+- name: Raise the per-user inotify instance limit
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-k7-inotify.conf
+    content: "fs.inotify.max_user_instances = 8192\n"
+    mode: '0644'
+  tags: ['sysctl']
+
+# Now, not in a handler: k3s starts pods later in this play.
+- name: Apply the inotify instance limit now
+  ansible.builtin.command: sysctl -p /etc/sysctl.d/90-k7-inotify.conf
+  changed_when: false
+  tags: ['sysctl']
+
+# ---------------------------------------------------------------------------------------
+# Force iptables/ip6tables legacy backend (this is for k3s; a running cluster's
+# CNI already chose its backend, so k7-node-installer leaves it alone)
+# ---------------------------------------------------------------------------------------
+- name: Set iptables master alternative to legacy
+  ansible.builtin.command: update-alternatives --set iptables /usr/sbin/iptables-legacy
+  changed_when: "'link group' in result.stdout or result.rc == 0"
+  register: result
+  when: not (k7_node_installer | bool)
+  tags: ['iptables']
+
+- name: Set ip6tables master alternative to legacy
+  ansible.builtin.command: update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+  changed_when: "'link group' in result.stdout or result.rc == 0"
+  register: result
+  when: not (k7_node_installer | bool)
+  tags: ['iptables']
+
+- name: Ensure xt_mark module loads at boot and now
+  ansible.builtin.lineinfile:
+    path: /etc/modules-load.d/k7.conf
+    line: xt_mark
+    create: true
+    mode: '0644'
+  notify: Load xt_mark
+  tags: ['iptables']
+
+- name: Load xt_mark module now
+  ansible.builtin.command: modprobe xt_mark
+  changed_when: false
+  tags: ['iptables']
+
+# ------------------------------------------------------------------
+# Pre-clean stale containerd config (we always rewrite it below)
+# ------------------------------------------------------------------
+- name: Remove devmapper snapshotter block (if present) early
+  ansible.builtin.blockinfile:
+    path: "{{ k7_containerd_config_path }}"
+    marker: "# {mark} ANSIBLE MANAGED DEVMAPPER"
+    state: absent
+    create: true
+    mode: '0644'
+  when: k7_containerd_config_mode == 'k3s-template'
+  tags: ['devmapper']
+
+- name: Remove stale custom Kata QEMU config (when QEMU not in backends)
+  ansible.builtin.file:
+    path: /opt/kata/share/kata-containers/configuration-qemu.toml
+    state: absent
+  when: not k7_has_longhorn
+  tags: ['kata']
+
+# ------------------------------------------------------------------
+# CNI bootstrap (always)
+# ------------------------------------------------------------------
+- name: Download CNI plugin tarball early
+  ansible.builtin.get_url:
+    url: https://github.com/containernetworking/plugins/releases/download/{{ cni_plugins_version }}/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz
+    dest: /tmp/cni-plugins.tgz
+    checksum: "sha256:{{ cni_plugins_sha256 }}"
+    mode: '0644'
+    timeout: 60
+  register: cni_dl
+  retries: 5
+  delay: 10
+  until: cni_dl is success
+  when: k7_artifact_dir | length == 0
+  tags: ['cni']
+
+- name: Stage CNI plugin tarball from k7_artifact_dir
+  ansible.builtin.copy:
+    src: "{{ k7_artifact_dir }}/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz"
+    dest: /tmp/cni-plugins.tgz
+    mode: '0644'
+  when: k7_artifact_dir | length > 0
+  tags: ['cni']
+
+- name: Ensure /opt/cni/bin exists
+  ansible.builtin.file:
+    path: /opt/cni/bin
+    state: directory
+    mode: '0755'
+  tags: ['cni']
+
+- name: Extract CNI plugins early
+  ansible.builtin.unarchive:
+    src: /tmp/cni-plugins.tgz
+    dest: /opt/cni/bin
+    remote_src: true
+  tags: ['cni']

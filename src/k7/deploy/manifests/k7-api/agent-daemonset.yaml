@@ -13,35 +13,60 @@ spec:
     metadata:
       labels:
         app: k7-agent
+      annotations:
+        # The metering config is read at start: roll the agents when it changes.
+        k7.katakate.org/metering-config: "__K7_METERING_CONFIG_HASH__"
+        # Annotation-based scraping; the port is reachable only from the
+        # scraper selector (k7-api-metrics policies).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
     spec:
       # Dedicated SA with no token and no ClusterRole — VM ops are crictl
       # + k7d.sock only. Kubernetes writes stay on k7-api.
       serviceAccountName: k7-agent
       automountServiceAccountToken: false
+      # The k7d group, pinned by node prep on every node (k7d_gid).
+      securityContext:
+        supplementalGroups: [770]
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
           effect: NoSchedule
       containers:
         - name: k7-agent
-          image: k7-api:local
-          imagePullPolicy: Never
+          image: __K7_API_IMAGE__
+          imagePullPolicy: __K7_API_IMAGE_PULL_POLICY__
           # Same image as k7-api, different app: only the node-local VM ops
           # and the storage endpoint.
           command: ["uvicorn", "k7.api.agent:app", "--host", "0.0.0.0", "--port", "8000"]
-          # Privileged: `lvs` (kfd thin-pool utilization) issues device-mapper
-          # ioctls and reads raw block devices under the hostPath-mounted
-          # /dev — the default device cgroup denies that to unprivileged
-          # containers. Root (the image defaults to uid 1000) is required for
-          # crictl, the k7d socket, and the 0600 root-owned agent token.
+          # Unprivileged. uid 0 owns the containerd socket; k7d.sock is
+          # k7d:k7d 0660, so the pod carries the k7d gid as a supplemental
+          # group. No capability is needed for either. `lvs` runs on
+          # the host (k7-storage-report.timer → /run/k7/storage.json).
           securityContext:
-            privileged: true
             runAsUser: 0
             runAsGroup: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - containerPort: 8000
               protocol: TCP
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
           env:
+            - name: K7_LOG_FORMAT
+              value: json
+            - name: K7_LOG_LEVEL
+              value: info
+            - name: K7_METRICS_PORT
+              value: "9464"
             - name: K7_AGENT
               value: "1"
             - name: K7_AGENT_TOKEN_FILE
@@ -50,24 +75,58 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: K7_SYSTEM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: K7_CONTAINERD_SOCKET
+              value: __K7_CONTAINERD_SOCKET__
+            # ConfigMaps k7-metering (k7 install --metering-*) and
+            # k7-cluster-id (written once at install, never regenerated).
+            - name: K7_METERING_CONFIG
+              value: /etc/k7-metering/config/metering.json
+            - name: K7_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: k7-cluster-id
+                  key: id
+            - name: K7_USAGE_SPOOL_DIR
+              value: /var/lib/k7/usage-spool
+          # Directory mounts, not single files: a file bind mount pins the
+          # inode and goes stale when containerd recreates its socket or the
+          # timer renames storage.json into place.
           volumeMounts:
-            # Shared agent token (playbook writes it on every node).
+            # agent_token from Secret k7-agent-token.
             - name: k7-config
               mountPath: /etc/k7
               readOnly: true
             # k7d daemon control socket (VM pause/resume/fork/lookup).
             - name: k7d-run
               mountPath: /run/k7d
-            # k3s containerd socket for crictl pod → CRI sandbox id lookup.
-            - name: k3s-containerd
-              mountPath: /run/k3s/containerd
+            # containerd socket dir for crictl pod → CRI sandbox id lookup.
+            # Rendered from the distro adapter (k7_containerd_socket).
+            - name: containerd-socket
+              mountPath: __K7_CONTAINERD_SOCKET_DIR__
             # k7d disks pool (XFS loopback mount) for `df` utilization.
             - name: k7d-lib
               mountPath: /var/lib/k7d
               readOnly: true
-            # Raw devices for `lvs` (kfd thin-pool utilization).
-            - name: dev
-              mountPath: /dev
+            # Host-side `lvs` report (kfd thin-pool utilization).
+            - name: k7-run
+              mountPath: /run/k7
+              readOnly: true
+            # Durable usage spool, sampler state and pause transitions.
+            - name: usage-spool
+              mountPath: /var/lib/k7/usage-spool
+            - name: metering-config
+              mountPath: /etc/k7-metering/config
+              readOnly: true
+            # Sink auth headers; the only Secret the agent reads for sinks.
+            - name: metering-headers
+              mountPath: /etc/k7-metering/headers
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
           livenessProbe:
             httpGet:
               path: /health
@@ -93,22 +152,36 @@ spec:
               memory: 256Mi
       volumes:
         - name: k7-config
-          hostPath:
-            path: /etc/k7
-            type: DirectoryOrCreate
+          secret:
+            secretName: k7-agent-token
+            defaultMode: 0400
         - name: k7d-run
           hostPath:
             path: /run/k7d
             type: DirectoryOrCreate
-        - name: k3s-containerd
+        - name: containerd-socket
           hostPath:
-            path: /run/k3s/containerd
+            path: __K7_CONTAINERD_SOCKET_DIR__
             type: Directory
         - name: k7d-lib
           hostPath:
             path: /var/lib/k7d
             type: DirectoryOrCreate
-        - name: dev
+        - name: k7-run
           hostPath:
-            path: /dev
-            type: Directory
+            path: /run/k7
+            type: DirectoryOrCreate
+        - name: usage-spool
+          hostPath:
+            path: /var/lib/k7/usage-spool
+            type: DirectoryOrCreate
+        - name: metering-config
+          configMap:
+            name: k7-metering
+        - name: metering-headers
+          secret:
+            secretName: k7-metering-headers
+            optional: true
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}

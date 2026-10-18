@@ -23,17 +23,19 @@ from uuid import uuid4
 
 import pytest
 
+from k7.core import cluster_config
 from k7.core.core import K7Core
 from k7.core.models import SandboxConfig, SandboxConfigOverrides
 
+from .cluster import KUBECTL
+
 pytestmark = pytest.mark.integration
 
-_K3S = "/usr/local/bin/k3s"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _run_kubectl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([_K3S, "kubectl", *args], capture_output=True, text=True)
+    return subprocess.run([*KUBECTL, *args], capture_output=True, text=True)
 
 
 def _wait_pod_ready(name: str, namespace: str, timeout: int = 240) -> None:
@@ -213,7 +215,7 @@ class TestRestoreOverrides:
                 "kind": "VolumeSnapshot",
                 "metadata": {"name": snap, "namespace": test_namespace},
                 "spec": {
-                    "volumeSnapshotClassName": "longhorn",
+                    "volumeSnapshotClassName": cluster_config.kql_snapshot_class(),
                     "source": {"persistentVolumeClaimName": f"{source}-root-lh"},
                 },
             },

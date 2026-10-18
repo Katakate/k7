@@ -1,0 +1,5 @@
+# Target A, step 4: the same cluster with v1 NetworkPolicy only. Layered on
+# rke2-cilium-values.yaml.
+networkPolicy:
+  provider: kubernetes
+  acknowledgeNoPlatformDeny: true

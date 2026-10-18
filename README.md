@@ -39,7 +39,7 @@
   </a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"></a>
   <img src="https://img.shields.io/badge/install%20with-apt-blue?logo=debian">
-  <a href="https://pypi.org/project/k7-sdk/"><img src="https://img.shields.io/pypi/v/k7-sdk" alt="PyPI k7-sdk"></a>
+  <a href="https://pypi.org/project/k7-sdk/0.5.0/"><img src="https://img.shields.io/pypi/v/k7-sdk/0.5.0" alt="PyPI k7-sdk 0.5.0"></a>
 </p> 
 
 
@@ -84,7 +84,7 @@ Sandbox backends
 | RuntimeClass | `kata` | `kata-qemu` | `k7` | `k7-fc` |
 | Sandbox storage | devmapper thin-pool (needs a spare raw disk) | Longhorn PVC (replicated, persistent) | erofs images + reflink XFS + guest tmpfs | same as k7d (no virtiofs / hostPath) |
 | Create → Ready* | not re-measured† | 17.1s | **2.1s** | **2.1s** |
-| Named snapshot* | — | 6.5s (Longhorn, disk-only) | — (VM snapshot trees via the k7d API) | — (same as k7d) |
+| Named snapshot* | n/a (rejected) | 6.5s (Longhorn, disk-only) | — (not yet exposed by K7) | — (not yet exposed by K7) |
 | Fork → usable* | n/a (rejected) | 46.7s (disk clone + cold boot) | **~5 ms VM CoW fork**; **~2.4 s** end-to-end via k7/k8s (pod Ready + exec) | **~2.5 s** end-to-end (same CoW; child `--docker` stays overlay2) |
 | Pause / resume* | scale to 0 / 1 | 1.3s / 4.1s (disk survives) | **0.2s / 0.3s (VM frozen in place, memory survives)** | **0.2s / —‡** |
 | Docker in the VM | **`--docker`**: vehicle + overlay2 on ephemeral LVM block | **`--docker`**: vehicle + overlay2 on Longhorn block (fork/restore) | **`--docker`**: in-guest dockerd, overlay2 on virtio-blk, **forkable** | **same guest dockerd**, overlay2, **forkable** |
@@ -107,7 +107,7 @@ Also available today
 - 🌐 Multi-node clusters (Ansible + Longhorn)
 - 🔍 Cilium CNI with FQDN egress policies (optional Hubble flow observability via <code>k7 install --hubble</code>; off by default, observability only)
 - 📸 Pause / resume / fork / restore and <code>k7 snapshot</code> lifecycle
-- 🐍 Python SDK: <code>pip install k7-sdk==0.4.0</code> (<code>katakate</code> package deprecated)
+- 🐍 Python SDK: <code>pip install k7-sdk==0.5.0</code> (<code>katakate</code> package deprecated)
 
 📋 **See [ROADMAP.md](ROADMAP.md) for upcoming work (GPU passthrough, …).**
 
@@ -127,7 +127,7 @@ We provide a:
 
 - **CLI**: to use on the node(s) directly --> `apt install k7`
 - **API**: deployed automatically by `k7 install` (toggle with `k7 api enable` / `k7 api disable`)
-- **Python SDK**: HTTP client sync/async --> `pip install k7-sdk==0.4.0`
+- **Python SDK**: HTTP client sync/async --> `pip install k7-sdk==0.5.0`
 
 ## Current requirements
 
@@ -155,10 +155,6 @@ We provide a:
   sudo apt update
   sudo apt install -y ansible
   ```
-- Docker and Docker Compose (for the API):
-  ```bash
-  curl -fsSL https://get.docker.com | sh
-  ```
 
 Already tested setups:
   - Hetzner Robot dedicated with Ubuntu 24.04 and a **spare raw NVMe** for the `kfd` thin-pool. Dual-NVMe boxes (no third drive): install the OS on one disk only — see [tutorials/k7_hetzner_node_setup.md](tutorials/k7_hetzner_node_setup.md). (Older PDF that assumed an add-on third NVMe: [tutorials/k7_hetzner_node_setup.pdf](tutorials/k7_hetzner_node_setup.pdf).)
@@ -174,7 +170,7 @@ The **`.deb` / PPA package is Linux-only** (amd64/arm64). On a MacBook:
 - **CLI from source:** `./src/k7/cli/dev.sh` (same commands as `k7`; uses `uv` + `PYTHONPATH=src`)
 - **API client from laptop:** set `K7_API_URL` and `K7_API_KEY`, then `dev.sh create` / `dev.sh list` (no `--core`)
 - **`k7 install`** targets Linux servers with KVM — run on the node or via SSH, not on macOS locally
-- **`pip install k7-sdk==0.4.0`** for Python scripts only
+- **`pip install k7-sdk==0.5.0`** for Python scripts only
 
 Do not install the Ubuntu `.deb` on macOS.
 
@@ -183,29 +179,30 @@ Do not install the Ubuntu `.deb` on macOS.
 
 ### Get your node(s) ready
 
-The Launchpad PPA publishes **0.4.0**. Install the CLI, then clone the matching
-source — `k7 install` builds `k7-api:local` from the current working directory:
+The Launchpad PPA publishes **0.5.0**. Install the CLI. This release deploys
+the signed GHCR `k7-api` by digest, with no clone and no Docker. `k7 install`
+0.4.0 built `k7-api:local` from a checkout (the playbook installed Docker for
+that). On `main` that build is opt-in with `k7 install --api-image local`:
 
 ```shell
 sudo add-apt-repository ppa:katakate.org/k7
 sudo apt update
 sudo apt install k7
-k7 -V   # 0.4.0
+k7 -V   # 0.5.0
 # GitHub .deb is the same package if you prefer not to add the PPA:
-# curl -fsSL -O https://github.com/Katakate/k7/releases/download/v0.4.0/k7_0.4.0_amd64.deb
-# sudo apt install ./k7_0.4.0_amd64.deb
-git clone --branch v0.4.0 https://github.com/Katakate/k7.git
-cd k7
+# curl -fsSL -O https://github.com/Katakate/k7/releases/download/v0.5.0/k7_0.5.0_amd64.deb
+# sudo apt install ./k7_0.5.0_amd64.deb
 sudo apt install -y ansible
-curl -fsSL https://get.docker.com | sh
 ```
 
 Then let `k7` get your node ready. **`--backend` is required** (no silent
 default). kfd needs a spare raw disk; kql uses Longhorn on the OS disk; k7d
-is the warm-fork daemon. `none` is control-plane only (no sandbox runtime):
+is the warm-fork daemon. `none` is control-plane only (no sandbox runtime).
+**`--api-mode` is required too**: `production` (every API key belongs to a
+tenant, HTTPS only) or `development` (unscoped keys keep working):
 
 ```console
-$ k7 install --backend kfd,kql,k7d
+$ k7 install --backend kfd,kql,k7d --api-mode development
 Current task: Reminder about logging out and back in for group changes
   Installing K7 on 1 host(s)... ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:01:41
 ✅ Installation completed successfully!
@@ -362,19 +359,45 @@ separate "start" step.
 k7 api status
 k7 api endpoint
 
-# Generate API key (optionally pin to a namespace and/or node)
-k7 generate-api-key my-key1
+# Generate API keys: every key has a role (read-only/user per tenant, operator/admin cluster-wide)
+k7 generate-api-key my-key1 --role admin
 k7 nodes list   # NAME is the Linux hostname K3s registered; not an inventory label
-k7 generate-api-key tenant-a -n tenant-a --node k7-node-01
+k7 generate-api-key tenant-a --role user --tenant acme --node k7-node-01
+
+# Tenants: namespaces, dedicated nodes, default size, quotas, per-VM limits
+k7 tenant create acme -n acme-dev -n acme-prod \
+  --default-size cpu=1 --default-size memory=2Gi \
+  --quota sandboxes=20 --quota vcpu=16 --quota memory=32Gi --quota snapshotStorage=200Gi \
+  --network egressBps=100M
+k7 generate-api-key acme-ci --role user --tenant acme   # reaches acme-dev and acme-prod
 k7 nodes dedicate k7-node-01 --tenant acme
+k7 tenant list                              # quotas and reconciled usage
+
+# Humans: sign in through the OIDC IdP set with `k7 install --oidc-*`
+k7 login --api https://<node>:31007
+k7 whoami
 
 # Temporarily disable / re-enable
 k7 api disable
 k7 api enable
 ```
 
-Generating / listing / revoking keys talks to `/etc/k7/api_keys.json`, so
-those subcommands need to run on the node (typically `sudo` or `root`).
+Generating / listing / revoking keys edits the `kube-system/k7-api-keys`
+Secret through kubectl, so those subcommands need to run on a server node
+(typically `sudo` or `root`). Every API replica picks up a change within
+5 seconds. Keys from before 0.5 were migrated from `/etc/k7/api_keys.json`
+by `k7 install` (`k7 api keys migrate`) and keep working until they expire;
+the same step gives every key created before roles existed a role. With `--api`, the key commands
+go through k7-api instead (an `admin` key or `k7 login`). Roles, OIDC and
+role bindings: `SECURITY.md` and `docs/HARDENING.md`.
+
+A tenant key reaches every namespace of its tenant (narrowed by `-n` if
+given), and a namespace added later works without reissuing the key. Creates
+over a quota return 403 `QuotaExceeded` with the limit, usage and request;
+limits a backend cannot enforce return 400 rather than running unlimited
+(see [SECURITY.md](SECURITY.md#tenants-and-quotas)). To move existing
+namespace-scoped keys onto tenants: `k7 tenant adopt --from-keys` (dry run),
+then `--apply`.
 
 
 ### Python SDK Usage
@@ -383,12 +406,12 @@ After your k7 API is up, usage is very simple.
 
 Install the Python SDK via:
 ```shell
-pip install k7-sdk==0.4.0
+pip install k7-sdk==0.5.0
 ```
 
 Or if you want async support:
 ```shell
-pip install "k7-sdk[async]==0.4.0"
+pip install "k7-sdk[async]==0.5.0"
 ```
 
 The legacy `katakate` PyPI name remains as a one-release shim that re-exports `k7_sdk` with a deprecation warning.
@@ -528,8 +551,9 @@ K7 sandboxes are hardened by default with multiple layers of security:
 
 - **API security**:
   - API keys stored as SHA256 hashes with timing-attack-resistant comparison
-  - Expiry enforced; last-used timestamp recorded
-  - File-based storage with 600 permissions (`/etc/k7/api_keys.json` by default)
+  - Expiry enforced; coarse last-used timestamp (flushed every 5 minutes)
+  - Stored in the `kube-system/k7-api-keys` Secret; never written on authenticate
+  - Audit log: one JSON line per mutating or auth-failed request on the API pod's stdout
 
 - **Network policies**: Complete network isolation for VM sandboxes
   - **Ingress isolation**: All inter-VM communication is blocked by default to prevent sandbox-to-sandbox access; opt in per sandbox with `--ingress-port` / `--ingress-from` (`sandbox:<name>`, `namespace:<ns>`, `cidr:<cidr>`)

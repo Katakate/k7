@@ -21,6 +21,7 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
 from k7.cli.k7 import app
@@ -38,27 +39,39 @@ def _make_completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> 
 
 
 class TestApiEnableDisable:
-    def test_enable_calls_kubectl_scale_1(self):
-        with patch("k7.cli.k7.subprocess.run", return_value=_make_completed()) as run:
+    @staticmethod
+    def _scale_cmd(run) -> list[str]:
+        scale_calls = [c.args[0] for c in run.call_args_list if "scale" in (c.args[0] if c.args else [])]
+        assert scale_calls, "expected a kubectl scale call"
+        assert "deployment" in scale_calls[0] and "k7-api" in scale_calls[0]
+        return scale_calls[0]
+
+    def test_enable_restores_recorded_replicas(self):
+        with patch("k7.cli.k7.subprocess.run", return_value=_make_completed(stdout="2")) as run:
             result = runner.invoke(app, ["api", "enable"])
         assert result.exit_code == 0, result.output
-        # Find the scale call.
-        scale_calls = [c for c in run.call_args_list if "scale" in (c.args[0] if c.args else [])]
-        assert scale_calls, "expected at least one kubectl scale call"
-        cmd = scale_calls[0].args[0]
-        assert "deployment" in cmd
-        assert "k7-api" in cmd
-        assert "--replicas=1" in cmd
+        assert "--replicas=2" in self._scale_cmd(run)
         assert "enabled" in result.output.lower()
 
-    def test_disable_calls_kubectl_scale_0(self):
+    def test_enable_explicit_replicas(self):
         with patch("k7.cli.k7.subprocess.run", return_value=_make_completed()) as run:
+            result = runner.invoke(app, ["api", "enable", "--replicas", "3"])
+        assert result.exit_code == 0, result.output
+        assert "--replicas=3" in self._scale_cmd(run)
+
+    def test_enable_without_record_fails_loud(self):
+        with patch("k7.cli.k7.subprocess.run", return_value=_make_completed(stdout="")):
+            result = runner.invoke(app, ["api", "enable"])
+        assert result.exit_code != 0
+        assert "--replicas" in result.output
+
+    def test_disable_records_replicas_then_scales_0(self):
+        with patch("k7.cli.k7.subprocess.run", return_value=_make_completed(stdout="2")) as run:
             result = runner.invoke(app, ["api", "disable"])
         assert result.exit_code == 0, result.output
-        scale_calls = [c for c in run.call_args_list if "scale" in (c.args[0] if c.args else [])]
-        assert scale_calls
-        cmd = scale_calls[0].args[0]
-        assert "--replicas=0" in cmd
+        annotate = [c.args[0] for c in run.call_args_list if "annotate" in c.args[0]]
+        assert annotate and "k7.katakate.org/enabled-replicas=2" in annotate[0]
+        assert "--replicas=0" in self._scale_cmd(run)
         assert "disabled" in result.output.lower()
 
     def test_enable_exits_nonzero_on_kubectl_failure(self):
@@ -82,6 +95,13 @@ class TestApiEnableDisable:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture()
+def kubectl_on_path():
+    with patch("k7.cli.k7.shutil.which", return_value="/usr/bin/kubectl"):
+        yield
+
+
+@pytest.mark.usefixtures("kubectl_on_path")
 class TestApiStatus:
     def test_reports_running_when_replicas_ready(self):
         # subprocess.run is called three times by api_status_cmd:
@@ -91,6 +111,7 @@ class TestApiStatus:
         calls = [
             _make_completed(stdout="1/1"),  # deployment readyReplicas/replicas
             _make_completed(stdout="k7-api-abc 1/1 Running 0 1m k7-node-01"),  # pods
+            _make_completed(stdout="ciliumclusterwidenetworkpolicy/k7-sandbox-platform-deny"),
             _make_completed(stdout="31007"),  # service nodePort
             _make_completed(stdout='[{"type":"InternalIP","address":"10.0.0.1"}]'),
         ]
@@ -99,6 +120,15 @@ class TestApiStatus:
         assert result.exit_code == 0, result.output
         assert "running" in result.output.lower()
         assert "1/1" in result.output
+        assert "deny" not in result.output
+
+    def test_reports_absent_platform_deny(self):
+        calls = [_make_completed(stdout="1/1"), _make_completed(stdout="")]
+        calls += [_make_completed(stderr="NotFound", returncode=1)] + [_make_completed(stdout="") for _ in range(3)]
+        with patch("k7.cli.k7.subprocess.run", side_effect=calls):
+            result = runner.invoke(app, ["api", "status"])
+        assert result.exit_code == 0, result.output
+        assert "k7-sandbox-platform-deny) is absent" in result.output
 
     def test_reports_disabled_when_replicas_zero(self):
         calls = [_make_completed(stdout="0/0")]
@@ -179,6 +209,7 @@ class TestApiEndpoint:
 
 
 class TestDeprecatedAliases:
+    @pytest.mark.usefixtures("kubectl_on_path")
     def test_api_status_alias_warns_and_forwards(self):
         # Calls subprocess.run several times under the hood; first call returns
         # something that lets api_status_cmd produce output.
@@ -258,7 +289,7 @@ class TestInstallNoApi:
             patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
         ):
             core_cls.return_value.install_node = _capture
-            result = runner.invoke(app, ["install", "--backend", "kql", "host"])
+            result = runner.invoke(app, ["install", "--backend", "kql", "--api-mode", "development", "host"])
         assert result.exit_code == 0, result.output
         extra_vars = seen["kwargs"]["extra_vars"]
         assert extra_vars.get("k7_api_enabled") == "true"
@@ -277,7 +308,9 @@ class TestInstallHubble:
             patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
         ):
             core_cls.return_value.install_node = _capture
-            result = runner.invoke(app, ["install", "--backend", "kql", "--hubble", "host"])
+            result = runner.invoke(
+                app, ["install", "--backend", "kql", "--api-mode", "development", "--hubble", "host"]
+            )
         assert result.exit_code == 0, result.output
         extra_vars = seen["kwargs"]["extra_vars"]
         assert extra_vars.get("k7_hubble_enabled") == "true"
@@ -294,7 +327,7 @@ class TestInstallHubble:
             patch("k7.cli.k7._build_default_inventory", return_value="[k7_servers]\nhost ansible_host=1.2.3.4"),
         ):
             core_cls.return_value.install_node = _capture
-            result = runner.invoke(app, ["install", "--backend", "kql", "host"])
+            result = runner.invoke(app, ["install", "--backend", "kql", "--api-mode", "development", "host"])
         assert result.exit_code == 0, result.output
         extra_vars = seen["kwargs"]["extra_vars"]
         assert extra_vars.get("k7_hubble_enabled") == "false"

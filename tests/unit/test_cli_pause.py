@@ -10,9 +10,11 @@ These verify the cleaned-up CLI surface:
 import re
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from k7.cli.k7 import _PAUSE_SNAPSHOT_AUTO, _rewrite_bare_snapshot_flag, app
+from k7.core.core import KFD_SNAPSHOT_REJECT
 from k7.core.models import OperationResult
 
 runner = CliRunner()
@@ -128,3 +130,20 @@ def test_pause_core_failure_propagates_nonzero_exit():
         core_cls.return_value.pause_sandbox = fake
         result = runner.invoke(app, ["pause", "demo"])
     assert result.exit_code != 0
+
+
+@pytest.mark.parametrize(
+    ("argv", "method"),
+    [
+        (["--core", "pause", "fc", "--snapshot=s1"], "pause_sandbox"),
+        (["--core", "snapshot", "create", "fc", "s1"], "create_snapshot"),
+    ],
+)
+def test_kfd_snapshot_reject_exits_1_with_the_reason(argv, method):
+    fake = AsyncMock(return_value=OperationResult(success=False, error=KFD_SNAPSHOT_REJECT))
+    with patch("k7.cli.k7.K7Core") as core_cls:
+        setattr(core_cls.return_value, method, fake)
+        result = runner.invoke(app, argv)
+    assert result.exit_code == 1
+    assert KFD_SNAPSHOT_REJECT in result.output + (result.stderr or "")
+    fake.assert_awaited_once()

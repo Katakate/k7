@@ -744,4 +744,18 @@ release; the install itself was one command and succeeded.
 
 **Time lost:** caught on the HA integration run after the partner walkthrough.
 
+---
+
+## 28. kfd delete leaves `firecracker-v1.16.2` running; the reaper and leak test both miss it
+
+**Symptom:** After one `k7 --core create -b kfd` and `k7 --core delete`, the pod and the Kata shim are gone and `/firecracker-v1.16.2 --id <first 32 hex of the sandbox id>` is still running, PPID 1, cgroup `/kata_overhead/<sandbox id>`. On the AMD node this piled up to 358 processes and exhausted 62 GB. `test_zz_leaks` stayed green.
+
+**Root cause:** While the sandbox is running, `ps` shows `jailer-v1.16.2` as a zombie child of `containerd-shim-kata-v2` and `firecracker-v1.` (comm, 15 bytes) as PPID 1. Kata 3.24.0 `fcInit` always appends `--daemonize`. The jailer double-forks and execs Firecracker in the grandchild; `fc.info.PID` is the parent, which has already exited. `fcEnd` → `WaitLocalProcess` signals that zombie (kill succeeds; the process is not ESRCH, it just is not Firecracker) and returns. `StopVM` has no other kill path. `/usr/local/bin/firecracker` is a symlink to `firecracker-v1.16.2` (k7d-fc's pin); the jailer `canonicalize`s it and the comm is `firecracker-v1.`. `pgrep -x firecracker` in `k7-vmm-reaper.sh` and `comm == "firecracker"` in `test_zz_leaks` both miss it, so the 1-minute backstop never reaped them and the suite never failed. SIGTERM to the real PID exits the VM immediately.
+
+**Fix:** `/usr/local/bin/k7-kata-jailer` drops `--daemonize` and execs `/usr/local/bin/jailer`. The shim's PID is Firecracker for the whole lifetime, so delete's SIGTERM kills it. No retry and no sleep. The reaper and the leak test match `firecracker` or `firecracker-*`. The reaper then keeps only a 32-hex `--id` (Kata's sandbox prefix): k7d-fc's ids are `vm-*` / `fcf-*` and those VMs have no kata shim, so reaping every versioned Firecracker kills them. The leak test stops the reaper timer so the watchdog cannot hide a missed signal.
+
+**Reference:** kata `src/runtime/virtcontainers/fc.go` `fcInit`/`fcEnd`; firecracker `src/jailer/src/env.rs` `run` (double fork only when `daemonize`).
+
+**Time lost:** one create-and-delete on <node-ip> reproduced it; the 358-process pile-up was already on the node from earlier suite runs. PR #87 saw the same leak on every kfd delete it ran (41/41 on RKE2, 40 on K3s, 40 on the `.deb` stack): the shim's `SIGTERM` hits the jailer pid, and Firecracker, a different pid, survives. A full suite on the Intel node OOM'd it the same way (321 Firecracker processes reparented to PID 1). The playbook's v1.14.0 file and k7d-fc's v1.16.2 symlink are why `comm` is the versioned name the old exact match missed.
+
 

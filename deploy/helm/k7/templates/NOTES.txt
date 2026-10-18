@@ -1,0 +1,28 @@
+K7 {{ .Chart.AppVersion }} in namespace {{ .Release.Namespace }}: backends {{ include "k7.backends" . | fromJsonArray | join ", " }}, networkPolicy.provider={{ .Values.networkPolicy.provider }}, tls.mode={{ .Values.tls.mode }}.
+{{- if eq .Values.tls.mode "insecureHTTP" }}
+
+WARNING: tls.mode=insecureHTTP. k7-api serves plain HTTP: API keys and
+sandbox output cross the network in cleartext. Use it only behind your own
+TLS terminator, never on a reachable address.
+{{- end }}
+{{- if ne .Values.networkPolicy.provider "cilium" }}
+
+WARNING: networkPolicy.provider={{ .Values.networkPolicy.provider }}. There is NO sandbox→platform deny:
+sandboxes can reach the nodes, the apiserver, cloud metadata (169.254.169.254)
+and platform pods unless your own policies block them. `k7 api status` says so.
+{{- if eq .Values.networkPolicy.provider "kubernetes" }}
+Egress is CIDR-only: a create with a domain in `egress` returns 400.
+{{- else }}
+No egress policy at all: a create with any `egress` field returns 400.
+{{- end }}
+{{- end }}
+
+Nodes labelled k7.katakate.org/node-pool=true are prepared by k7-node-installer;
+a node takes sandboxes once it carries k7.katakate.org/node-ready:
+  kubectl get nodes -L k7.katakate.org/node-ready
+Smoke test (one sandbox per backend):
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --timeout 35m
+Uninstall undoes node prep first (disks kept unless nodeInstaller.wipeDisks):
+  helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }} --timeout 35m
+API keys (kubectl current context, or K7_KUBECONFIG):
+  k7 --system-namespace {{ .Release.Namespace }} generate-api-key <name> --role admin

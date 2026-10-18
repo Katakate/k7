@@ -1,0 +1,173 @@
+---
+# `--api-remote-install` (remote install via the node installer): the k7-node-installer stack in
+# k7-system, its image pinned here and in the k7-api env (api.yml). The API
+# only labels nodes k7.katakate.org/node-pool=true; the DaemonSet does the
+# rest. One config for the pool: the first master's distro, backends and
+# disk settings. Re-running without the flag removes the stack again (pool
+# labels, manifests, the k7-system namespace with its operation records)
+# unless Helm owns it.
+- name: Check whether a non-Helm k7-node-installer stack is deployed
+  ansible.builtin.command: >-
+    {{ k7_kubectl }} get clusterrole/k7-node-installer namespace/k7-system --ignore-not-found -o json
+  register: k7_installer_live
+  changed_when: false
+  when: not k7_api_remote_install | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# The namespace counts too, so a run that timed out waiting for it retries.
+- name: Decide whether to remove the k7-node-installer stack
+  ansible.builtin.set_fact:
+    k7_installer_remove: >-
+      {%- set live = k7_installer_live.stdout | default('{"items": []}', true) | from_json -%}
+      {%- set objs = live['items'] if 'items' in live else [live] -%}
+      {{ objs | length > 0 and objs | map(attribute='metadata') | selectattr('annotations', 'defined')
+         | map(attribute='annotations') | select('contains', 'meta.helm.sh/release-name') | list | length == 0 }}
+  when: not k7_api_remote_install | bool
+  run_once: true
+  tags: ['k7', 'api']
+
+- name: Compute the installer config from the first master
+  ansible.builtin.set_fact:
+    k7_node_installer_config:
+      distro: "{{ k7_distro }}"
+      backends: "{{ hostvars[k7_first_master].k7_backends_list | map('extract', k7_installer_backend_names) | list }}"
+      diskSource: "{{ hostvars[k7_first_master].k7_disk_source_effective }}"
+      # hostvars carry only the inventory override; the play default is the play var.
+      k7dDisksImageSize: "{{ hostvars[k7_first_master].k7d_disks_image_size | default(k7d_disks_image_size) }}"
+      kataThinpoolPvSize: "{{ hostvars[k7_first_master].kata_thinpool_pv_size | default(kata_thinpool_pv_size) }}"
+      allowServerRestart: "{{ k7_node_installer_allow_server_restart | bool }}"
+  vars:
+    k7_installer_backend_names:
+      kata-firecracker-devmapper: kfd
+      kata-qemu-longhorn: kql
+      k7d: k7d
+      k7d-fc: k7d-fc
+  when: k7_api_remote_install | bool
+  tags: ['k7', 'api']
+
+- name: Copy the k7-node-installer manifests on first master
+  ansible.builtin.copy:
+    src: "{{ k7_deploy_dir }}/manifests/k7-node-installer/"
+    dest: /etc/k7/manifests/k7-node-installer/
+    mode: '0644'
+  when: k7_api_remote_install | bool or k7_installer_remove | default(false) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Render the pinned installer image
+  ansible.builtin.replace:
+    path: /etc/k7/manifests/k7-node-installer/daemonset.yaml
+    regexp: __K7_NODE_INSTALLER_IMAGE__
+    replace: "{{ k7_node_installer_image_ref }}"
+  when: k7_api_remote_install | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Fail if the installer config would not pass the installer's validation
+  ansible.builtin.assert:
+    that:
+      - k7_node_installer_config.backends | length > 0
+      - k7_node_installer_config.diskSource in ['spare-disk', 'loopback'] or k7_node_installer_config.diskSource is match('^device:/dev/\S+$')
+    fail_msg: >-
+      The first master ({{ k7_first_master }}) gives the installer backends={{ k7_node_installer_config.backends }}
+      and diskSource={{ k7_node_installer_config.diskSource }}; it needs at least one backend and
+      spare-disk, loopback or device:/dev/<disk>.
+  when: k7_api_remote_install | bool
+  run_once: true
+  tags: ['k7', 'api']
+
+- name: Render the installer config
+  ansible.builtin.copy:
+    dest: /etc/k7/manifests/k7-node-installer/configmap.yaml
+    mode: '0644'
+    content: |
+      # Rendered by `k7 install --api-remote-install`. Edits are overwritten.
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: k7-node-installer
+        namespace: k7-system
+      data:
+        config.json: {{ k7_node_installer_config | to_json | to_json }}
+  when: k7_api_remote_install | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Fail if any k7-node-installer manifest placeholder is left unrendered  # noqa: command-instead-of-shell
+  ansible.builtin.shell: grep -l __K7_ /etc/k7/manifests/k7-node-installer/*.yaml
+  register: k7_installer_placeholders
+  changed_when: false
+  failed_when: k7_installer_placeholders.rc != 1
+  when: k7_api_remote_install | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# Non-recursive: cleanup/ is the uninstall DaemonSet.
+- name: Apply the k7-node-installer stack and the k7-api's read access to it
+  ansible.builtin.command: "{{ k7_kubectl }} apply --recursive=false -f {{ item }}"
+  loop:
+    - /etc/k7/manifests/k7-node-installer/
+    - /etc/k7/manifests/k7-node-installer/k7-api-access/
+  register: k7_installer_apply
+  changed_when: "'created' in k7_installer_apply.stdout or 'configured' in k7_installer_apply.stdout"
+  when: k7_api_remote_install | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Roll the installer onto the rebuilt local image
+  ansible.builtin.command: >-
+    {{ k7_kubectl }} -n k7-system patch daemonset/k7-node-installer -p
+    '{"spec":{"template":{"metadata":{"annotations":{"k7.katakate.org/installer-image-id":"{{ k7_local_image_id['k7-node-installer:local'] }}"}}}}}'
+  register: k7_installer_roll
+  changed_when: "'no change' not in k7_installer_roll.stdout"
+  when: k7_node_installer_local | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# Labels first: the DaemonSet's pods leave before the stack is deleted.
+- name: Remove the k7-node-installer pool labels from every node
+  ansible.builtin.shell: |
+    set -euo pipefail
+    for key in k7.katakate.org/node-pool k7.katakate.org/node-pool-added-by; do
+      nodes=$({{ k7_kubectl }} get nodes -l "$key" -o name)
+      [ -z "$nodes" ] || {{ k7_kubectl }} label $nodes "$key-"
+    done
+  args:
+    executable: /bin/bash
+  register: k7_installer_unlabel
+  changed_when: "'unlabeled' in k7_installer_unlabel.stdout"
+  when: k7_installer_remove | default(false) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# The namespace takes the DaemonSet, ConfigMap, records and k7-api-access
+# with it; rbac.yaml (the ClusterRole checked above) goes last.
+- name: Delete the k7-node-installer stack and the k7-api's access to it
+  ansible.builtin.command: >-
+    {{ k7_kubectl }} delete --ignore-not-found --recursive=false --timeout=300s
+    -f /etc/k7/manifests/k7-node-installer/k7-api-access/
+    -f /etc/k7/manifests/k7-node-installer/
+  register: k7_installer_delete
+  changed_when: "'deleted' in k7_installer_delete.stdout"
+  when: k7_installer_remove | default(false) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Remove the k7-node-installer manifests from first master
+  ansible.builtin.file:
+    path: /etc/k7/manifests/k7-node-installer
+    state: absent
+  when: k7_installer_remove | default(false) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']

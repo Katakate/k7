@@ -11,6 +11,7 @@ binary being installed on the node.
 """
 
 import asyncio
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -18,12 +19,14 @@ from uuid import uuid4
 
 import pytest
 
+from k7.core import cluster_config
 from k7.core.core import K7Core
 from k7.core.models import SandboxConfig
 
+from .cluster import KUBECTL
+
 pytestmark = pytest.mark.integration
 
-_K3S = "/usr/local/bin/k3s"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEV_SH = _REPO_ROOT / "src" / "k7" / "cli" / "dev.sh"
 
@@ -44,7 +47,7 @@ def _wait_replicas(name: str, namespace: str, expected: int, timeout: int = 60) 
     deadline = time.time() + timeout
     while time.time() < deadline:
         out = subprocess.run(
-            [_K3S, "kubectl", "get", "deployment", name, "-n", namespace, "-o", "jsonpath={.spec.replicas}"],
+            [*KUBECTL, "get", "deployment", name, "-n", namespace, "-o", "jsonpath={.spec.replicas}"],
             capture_output=True,
             text=True,
         )
@@ -56,7 +59,7 @@ def _wait_replicas(name: str, namespace: str, expected: int, timeout: int = 60) 
 
 def _snapshot_exists(name: str, namespace: str) -> bool:
     out = subprocess.run(
-        [_K3S, "kubectl", "get", "volumesnapshot", name, "-n", namespace, "-o", "name"],
+        [*KUBECTL, "get", "volumesnapshot", name, "-n", namespace, "-o", "name"],
         capture_output=True,
         text=True,
     )
@@ -65,7 +68,7 @@ def _snapshot_exists(name: str, namespace: str) -> bool:
 
 def _list_snapshots(namespace: str) -> list[str]:
     out = subprocess.run(
-        [_K3S, "kubectl", "get", "volumesnapshot", "-n", namespace, "-o", "name"],
+        [*KUBECTL, "get", "volumesnapshot", "-n", namespace, "-o", "name"],
         capture_output=True,
         text=True,
     )
@@ -79,8 +82,7 @@ def _wait_pod_ready(name: str, namespace: str, timeout: int = 240) -> None:
     while time.time() < deadline:
         out = subprocess.run(
             [
-                _K3S,
-                "kubectl",
+                *KUBECTL,
                 "get",
                 "pods",
                 "-n",
@@ -152,8 +154,7 @@ class TestPauseSnapshotBugRegression:
         finally:
             subprocess.run(
                 [
-                    _K3S,
-                    "kubectl",
+                    *KUBECTL,
                     "delete",
                     "volumesnapshot",
                     snap,
@@ -197,8 +198,7 @@ class TestPauseSnapshotBugRegression:
                     snap_name = s.split("/", 1)[1] if "/" in s else s
                     subprocess.run(
                         [
-                            _K3S,
-                            "kubectl",
+                            *KUBECTL,
                             "delete",
                             "volumesnapshot",
                             snap_name,
@@ -227,7 +227,7 @@ class TestPauseSnapshotBugRegression:
 
 
 def _runtimeclass_present(name: str) -> bool:
-    out = subprocess.run([_K3S, "kubectl", "get", "runtimeclass", name], capture_output=True, text=True, check=False)
+    out = subprocess.run([*KUBECTL, "get", "runtimeclass", name], capture_output=True, text=True, check=False)
     return out.returncode == 0
 
 
@@ -250,7 +250,11 @@ class TestPauseResumeExecAnswers:
         if not _runtimeclass_present(runtime_class):
             pytest.skip(f"RuntimeClass {runtime_class} not registered")
         name = f"pause-exec-{backend}-{uuid4().hex[:6]}"
-        cfg = SandboxConfig(name=name, image="alpine:3.20", namespace=test_namespace, backend=backend)
+        # In-process K7Core is host-side: on a multi-node cluster another node's k7-agent
+        # only accepts k7-api, so the VM ops need the sandbox on this node.
+        cfg = SandboxConfig(
+            name=name, image="alpine:3.20", namespace=test_namespace, backend=backend, node_name=os.uname().nodename
+        )
         result = await k7_core.create_sandbox(cfg)
         assert result.success, f"{backend}: create failed: {result.error}"
         try:
@@ -291,7 +295,15 @@ class TestRemovedPauseFlags:
 
     def test_snapshot_class_flag_rejected(self, test_namespace: str):
         result = subprocess.run(
-            [str(_DEV_SH), "--core", "pause", "any-name", "-n", test_namespace, "--snapshot-class=longhorn"],
+            [
+                str(_DEV_SH),
+                "--core",
+                "pause",
+                "any-name",
+                "-n",
+                test_namespace,
+                f"--snapshot-class={cluster_config.kql_snapshot_class()}",
+            ],
             capture_output=True,
             text=True,
             cwd=str(_REPO_ROOT),

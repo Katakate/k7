@@ -1,0 +1,198 @@
+{{- $cfg := include "k7.installerConfig" . }}
+{{- $ns := .Release.Namespace }}
+# k7-node-installer: same objects as
+# src/k7/deploy/manifests/k7-node-installer/, in the release namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k7-node-installer
+  namespace: {{ $ns }}
+data:
+  config.json: {{ $cfg | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k7-node-installer
+  namespace: {{ $ns }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k7-node-cleanup
+  namespace: {{ $ns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k7-node-installer
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k7-node-cleanup
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "delete"]
+{{- range $sa := list "k7-node-installer" "k7-node-cleanup" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $sa }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $sa }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k7-node-installer-events
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k7-node-installer-events
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k7-node-installer-events
+subjects:
+  - kind: ServiceAccount
+    name: k7-node-installer
+    namespace: {{ $ns }}
+  - kind: ServiceAccount
+    name: k7-node-cleanup
+    namespace: {{ $ns }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: k7-node-installer-own-node
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["nodes"]
+  matchConditions:
+    - name: k7-node-installer-service-accounts
+      expression: >-
+        request.userInfo.username in [
+          'system:serviceaccount:{{ $ns }}:k7-node-installer',
+          'system:serviceaccount:{{ $ns }}:k7-node-cleanup']
+  validations:
+    - expression: >-
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/node-name' in request.userInfo.extra &&
+        request.userInfo.extra['authentication.kubernetes.io/node-name'][0] == object.metadata.name
+      message: k7-node-installer may only patch the node its pod runs on
+    - expression: object.spec == oldObject.spec
+      message: k7-node-installer may not change the node spec
+    - expression: >-
+        object.metadata.labels.all(k, k.startsWith('k7.katakate.org/') ||
+          (k in oldObject.metadata.labels && oldObject.metadata.labels[k] == object.metadata.labels[k])) &&
+        oldObject.metadata.labels.all(k, k.startsWith('k7.katakate.org/') || k in object.metadata.labels)
+      message: k7-node-installer may only change k7.katakate.org/ labels
+    - expression: >-
+        has(object.metadata.annotations) == has(oldObject.metadata.annotations) &&
+        (!has(object.metadata.annotations) || object.metadata.annotations == oldObject.metadata.annotations)
+      message: k7-node-installer may not change node annotations
+    - expression: >-
+        has(object.metadata.finalizers) == has(oldObject.metadata.finalizers) &&
+        (!has(object.metadata.finalizers) || object.metadata.finalizers == oldObject.metadata.finalizers)
+      message: k7-node-installer may not change node finalizers
+    - expression: >-
+        has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences) &&
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences)
+      message: k7-node-installer may not change node ownerReferences
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: k7-node-installer-own-node
+spec:
+  policyName: k7-node-installer-own-node
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: k7-node-cleanup-own-node-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: k7-node-cleanup-service-account
+      expression: request.userInfo.username == 'system:serviceaccount:{{ $ns }}:k7-node-cleanup'
+  validations:
+    - expression: >-
+        has(request.userInfo.extra) &&
+        'authentication.kubernetes.io/node-name' in request.userInfo.extra &&
+        has(oldObject.spec.nodeName) &&
+        request.userInfo.extra['authentication.kubernetes.io/node-name'][0] == oldObject.spec.nodeName
+      message: k7-node-cleanup may only delete pods on the node its pod runs on
+    - expression: >-
+        has(oldObject.spec.runtimeClassName) &&
+        oldObject.spec.runtimeClassName in ['k7', 'k7-fc', 'kata', 'kata-qemu']
+      message: k7-node-cleanup may only delete K7 sandbox pods
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: k7-node-cleanup-own-node-pods
+spec:
+  policyName: k7-node-cleanup-own-node-pods
+  validationActions: [Deny]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k7-node-installer
+  namespace: {{ $ns }}
+  labels:
+    app: k7-node-installer
+spec:
+  selector:
+    matchLabels:
+      app: k7-node-installer
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: k7-node-installer
+      annotations:
+        # Rolls the pods (and so restarts containerd) only when the config changes.
+        k7.katakate.org/installer-config-sha256: {{ sha256sum $cfg | quote }}
+    spec:
+      {{- include "k7.installerPodSpec" (dict "ctx" . "sa" "k7-node-installer" "name" "installer" "args" (list "install")) | nindent 6 }}

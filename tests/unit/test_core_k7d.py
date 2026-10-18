@@ -16,6 +16,8 @@ from k7.core.core import (
     K7D_ANN_FORK_SOURCE_VM,
     K7D_ANN_PAUSED,
     K7D_FC_VIRTIOFS_REFUSED,
+    K7D_SNAPSHOT_UNSUPPORTED,
+    KFD_SNAPSHOT_REJECT,
     K7Core,
 )
 from k7.core.models import OperationResult, SandboxConfig
@@ -533,8 +535,39 @@ class TestK7dSnapshotRejected:
 
         result = await core.create_snapshot("k7d-sb", "snap1")
         assert not result.success
-        assert "k7d" in result.error
-        assert "katakate/k7d" in result.error
+        assert K7D_SNAPSHOT_UNSUPPORTED in result.error
+        assert "daemon API" not in result.error
+
+
+class TestKfdSnapshotRejected:
+    """kfd has no PVC to snapshot: refuse before any K8s call past backend detection."""
+
+    @staticmethod
+    def _kfd_core(core: K7Core) -> tuple[AsyncMock, AsyncMock]:
+        dep = mock_deployment(annotations={"k7.katakate.org/backend": "kfd"})
+        apps, custom = AsyncMock(), AsyncMock()
+        apps.read_namespaced_deployment.return_value = dep
+        core._apps_v1_client = apps
+        core._custom_objects_client = custom
+        core._core_v1_client = AsyncMock()
+        return apps, custom
+
+    async def test_create_snapshot_rejected(self, core: K7Core):
+        apps, custom = self._kfd_core(core)
+        result = await core.create_snapshot("kfd-sb", "snap1")
+        assert not result.success
+        assert result.error == KFD_SNAPSHOT_REJECT
+        assert {c[0] for c in apps.mock_calls} == {"read_namespaced_deployment"}
+        assert custom.mock_calls == []
+        assert core._core_v1_client.mock_calls == []
+
+    async def test_pause_with_snapshot_rejected(self, core: K7Core):
+        apps, custom = self._kfd_core(core)
+        result = await core.pause_sandbox("kfd-sb", snapshot_name="snap1")
+        assert not result.success
+        assert result.error == KFD_SNAPSHOT_REJECT
+        apps.patch_namespaced_deployment_scale.assert_not_called()
+        assert custom.mock_calls == []
 
 
 # --- daemon socket helper ---

@@ -6,7 +6,10 @@ metadata:
   labels:
     app: k7-api
 spec:
-  replicas: 1
+  # Stateless: auth reads the k7-api-keys Secret, so replicas spread across
+  # nodes (PDB minAvailable: 1). The ACME TLS overlay pins back to one
+  # replica on the first master (hostPort 80 + certificate storage).
+  replicas: 2
   selector:
     matchLabels:
       app: k7-api
@@ -14,59 +17,135 @@ spec:
     metadata:
       labels:
         app: k7-api
+      annotations:
+        k7.katakate.org/oidc-config: "__K7_OIDC_CONFIG_HASH__"
+        k7.katakate.org/metering-config: "__K7_METERING_CONFIG_HASH__"
+        # Annotation-based scraping; the port is reachable only from the
+        # scraper selector (k7-api-metrics policies).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: k7-api
-      # /etc/k7 is hostPath-mounted (api_keys.json lives there). Pin the API
-      # pod to the first master so single-node and multi-node clusters both
-      # have a predictable, stable location for the host-side key store.
-      # The first master is labelled `k7.katakate.org/first-master=true` by
-      # the install playbook.
-      nodeSelector:
-        k7.katakate.org/first-master: "true"
+      # One replica prefers the first master: /etc/k7/api_endpoint names it,
+      # and with --api-allow-cidr (externalTrafficPolicy: Local) only nodes
+      # running a replica answer the NodePort. The spread keeps the other
+      # replica off that node when there is more than one node.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: k7.katakate.org/first-master
+                    operator: In
+                    values: ["true"]
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: k7-api
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
           effect: NoSchedule
+      securityContext:
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: k7-api
-          image: k7-api:local
-          imagePullPolicy: Never
-          # Root is required for the co-located k7d VM-op fallback:
-          # `crictl` must reach the k3s containerd socket (0660
-          # root:root) to resolve a pod's CRI sandbox id before talking to
-          # the k7d daemon socket. No added capabilities / not privileged.
-          # k7d VM ops only work for sandboxes on THIS node (the first
-          # master) — core fails loudly on a node mismatch; see
-          # docs/BACKENDS.md.
+          image: __K7_API_IMAGE__
+          imagePullPolicy: __K7_API_IMAGE_PULL_POLICY__
+          # No host access: k7d VM ops always go to the k7-agent on the
+          # sandbox's node (K7_K7D_REMOTE_ONLY), so the API needs neither
+          # the containerd nor the k7d socket.
           securityContext:
-            runAsUser: 0
-            runAsGroup: 0
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 8000
               protocol: TCP
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
           env:
-            - name: K7_API_KEYS_FILE
-              value: /etc/k7/api_keys.json
-            # k7d VM operations (pause/fork) are node-local; core compares
-            # the sandbox pod's node against this (os.uname() inside a
-            # container returns the pod name, which never matches).
+            - name: K7_LOG_FORMAT
+              value: json
+            - name: K7_LOG_LEVEL
+              value: info
+            - name: K7_METRICS_PORT
+              value: "9464"
+            - name: K7_API_KEY_STORE
+              value: secret
+            - name: K7_K7D_REMOTE_ONLY
+              value: "1"
+            # Production | development (k7 install --api-mode, no
+            # default) and https | insecure-http; production refuses the latter.
+            - name: K7_API_MODE
+              value: __K7_API_MODE__
+            - name: K7_API_TRANSPORT
+              value: __K7_API_TRANSPORT__
+            - name: K7_SYSTEM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: K7_EGRESS_MODE
+              value: full
+            - name: K7_KQL_STORAGE_CLASS
+              value: longhorn
+            - name: K7_KQL_SNAPSHOT_CLASS
+              value: longhorn
+            # POST /api/v1/install (k7.api.remote_install): off unless
+            # `k7 install --api-remote-install` deployed the node-installer
+            # stack; then the image it runs, pinned at deploy time.
+            - name: K7_API_ENABLE_REMOTE_INSTALL
+              value: "__K7_API_REMOTE_INSTALL__"
+            - name: K7_NODE_INSTALLER_IMAGE
+              value: "__K7_NODE_INSTALLER_IMAGE__"
+            - name: K7_NODE_INSTALLER_NAMESPACE
+              value: "__K7_NODE_INSTALLER_NAMESPACE__"
+            # The storage sampler hands its events to the k7-agent
+            # on this node; config and cluster id as on the agent.
             - name: K7_NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: K7_METERING_CONFIG
+              value: /etc/k7-metering/config/metering.json
+            - name: K7_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: k7-cluster-id
+                  key: id
+          envFrom:
+            - configMapRef:
+                name: k7-oidc
+                optional: true
           volumeMounts:
+            # backend + k7d_version (ConfigMap) and agent_token (Secret),
+            # written by the playbook from the first master's /etc/k7.
             - name: k7-config
               mountPath: /etc/k7
-            # k7d daemon control socket (VM pause/resume/fork). Present only
-            # on nodes provisioned with the k7d backend; DirectoryOrCreate
-            # keeps the pod schedulable on clusters without it (core then
-            # fails loudly with "socket not found").
-            - name: k7d-run
-              mountPath: /run/k7d
-            # k3s containerd socket for crictl pod → CRI sandbox id lookup.
-            - name: k3s-containerd
-              mountPath: /run/k3s/containerd
+              readOnly: true
+            - name: metering-config
+              mountPath: /etc/k7-metering/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          # Keep serving while the endpoint removal reaches Cilium; without
+          # it a rollout drops ~200 ms of connections to the old replica.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           livenessProbe:
             httpGet:
               path: /health
@@ -92,14 +171,15 @@ spec:
               memory: 512Mi
       volumes:
         - name: k7-config
-          hostPath:
-            path: /etc/k7
-            type: DirectoryOrCreate
-        - name: k7d-run
-          hostPath:
-            path: /run/k7d
-            type: DirectoryOrCreate
-        - name: k3s-containerd
-          hostPath:
-            path: /run/k3s/containerd
-            type: Directory
+          projected:
+            defaultMode: 0440
+            sources:
+              - configMap:
+                  name: k7-host-config
+              - secret:
+                  name: k7-agent-token
+        - name: metering-config
+          configMap:
+            name: k7-metering
+        - name: tmp
+          emptyDir: {}

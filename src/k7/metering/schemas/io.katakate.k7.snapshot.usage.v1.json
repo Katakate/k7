@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://katakate.org/schemas/io.katakate.k7.snapshot.usage.v1.json",
+  "title": "io.katakate.k7.snapshot.usage.v1",
+  "description": "CloudEvents 1.0 envelope. Bytes one snapshot holds over one storage-sampler window. v1 is frozen: a changed field is a new vN type.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "type",
+    "source",
+    "subject",
+    "id",
+    "time",
+    "datacontenttype",
+    "data"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "type": {
+      "const": "io.katakate.k7.snapshot.usage.v1"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^k7://[0-9a-f-]{36}/(node/[^/]+|storage)$"
+    },
+    "subject": {
+      "type": "string",
+      "minLength": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "bytes",
+        "gib_seconds",
+        "kind",
+        "location",
+        "namespace",
+        "seconds",
+        "snapshot",
+        "snapshot_uid",
+        "source_sandbox",
+        "tenant",
+        "window_end",
+        "window_start"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tenant": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "snapshot": {
+          "type": "string",
+          "minLength": 1
+        },
+        "snapshot_uid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_sandbox": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "volume",
+            "k7d"
+          ]
+        },
+        "location": {
+          "enum": [
+            "local",
+            "exported"
+          ]
+        },
+        "window_start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "window_end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gib_seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

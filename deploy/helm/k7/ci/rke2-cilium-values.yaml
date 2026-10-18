@@ -1,0 +1,34 @@
+# Target A (ci/rke2-hetzner.md): one RKE2 server with Cilium and Longhorn.
+# images.*.digest come from --set (the locally built test images).
+# api.mode has no chart default. development is this validation cluster
+# (the same choice as `k7 install --api-mode development`).
+# Metrics default on and refuse to render without a scraper. This is the
+# kube-prometheus-stack Prometheus; the port admits only those pods.
+images:
+  api:
+    repository: localhost:5000/k7-api
+  nodeInstaller:
+    repository: localhost:5000/k7-node-installer
+networkPolicy:
+  provider: cilium
+tls:
+  mode: secret
+api:
+  mode: development
+  service:
+    type: NodePort
+observability:
+  scraperSelector:
+    namespace: monitoring
+    podLabels:
+      app.kubernetes.io/name: prometheus
+backends:
+  kfd: {enabled: true}
+  kql: {enabled: true, storageClass: longhorn, volumeSnapshotClass: longhorn}
+  k7d: {enabled: true}
+  k7dFc: {enabled: true}
+nodeInstaller:
+  distro: rke2
+  diskSource: spare-disk
+  # The only node is the RKE2 server.
+  allowServerRestart: true

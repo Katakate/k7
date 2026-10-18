@@ -8,8 +8,13 @@ rules:
   # services: the `{name}-expose` NodePort. Delete always attempts this
   # cleanup; a missing verb is 403, not 404, so every API delete 400s.
   - apiGroups: [""]
-    resources: ["pods", "pods/exec", "pods/log", "secrets", "configmaps", "persistentvolumeclaims", "namespaces", "nodes", "services"]
+    resources: ["pods", "pods/exec", "pods/log", "configmaps", "persistentvolumeclaims", "namespaces", "nodes", "services"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Sandbox `{name}-env` Secrets are only created and deleted, never read
+  # back. The key-store Secrets are a namespaced Role (role.yaml).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments", "deployments/scale"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -27,6 +32,15 @@ rules:
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots", "volumesnapshotcontents", "volumesnapshotclasses"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Fork deletes its temporary snapshot only after Longhorn reports the
+  # clone copied (volumes.longhorn.io status.cloneStatus).
+  - apiGroups: ["longhorn.io"]
+    resources: ["volumes"]
+    verbs: ["get"]
+  # ...but only on a Longhorn StorageClass (its provisioner says so).
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
     verbs: ["get", "list"]
@@ -39,3 +53,14 @@ rules:
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get"]
+  # Tenants: admin CRUD, the leader's status reconcile, and the
+  # single-namespace ResourceQuota backstop it writes.
+  - apiGroups: ["k7.katakate.org"]
+    resources: ["tenants"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["k7.katakate.org"]
+    resources: ["tenants/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "create", "update", "delete"]

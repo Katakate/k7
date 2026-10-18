@@ -3,10 +3,24 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import pytest
+from kubernetes_asyncio import client
 from kubernetes_asyncio.client.exceptions import ApiException
 
-from k7.core.core import K7_TENANT_LABEL, K7Core
+from k7.core.core import (
+    ANN_DOCKER_PVC,
+    ANN_K7_DOCKER,
+    EXEC_NO_STATUS,
+    EXEC_WS_PROTOCOL,
+    K7_TENANT_LABEL,
+    K7Core,
+    _cilium_egress_spec,
+    _cnp_dns_matchers,
+    _exec_ws_client,
+)
 from k7.core.models import ExecResult, OperationResult, SandboxConfig
+from k7.core.tenancy import AdmissionError
 from tests.unit.conftest import mock_deployment, mock_pod
 
 # ---------------------------------------------------------------------------
@@ -377,6 +391,7 @@ class TestPauseSandbox:
     async def test_with_snapshot_explicit_pvc(self, core: K7Core):
         mock_apps = AsyncMock()
         _setup_clients(core, apps=mock_apps)
+        core._detect_backend = AsyncMock(return_value="kata-qemu-longhorn")
 
         with patch.object(
             core,
@@ -402,6 +417,7 @@ class TestPauseSandbox:
         """
         mock_apps = AsyncMock()
         _setup_clients(core, apps=mock_apps)
+        core._detect_backend = AsyncMock(return_value="kata-qemu-longhorn")
 
         with patch.object(
             core,
@@ -436,6 +452,7 @@ class TestPauseSandbox:
     async def test_snapshot_fails(self, core: K7Core):
         mock_apps = AsyncMock()
         _setup_clients(core, apps=mock_apps)
+        core._detect_backend = AsyncMock(return_value="kata-qemu-longhorn")
 
         with patch.object(
             core,
@@ -542,6 +559,11 @@ class TestDeleteAllSandboxes:
 
 
 class TestForkSandbox:
+    @pytest.fixture(autouse=True)
+    def _clone_copied(self, core: K7Core):
+        with patch.object(core, "_wait_for_longhorn_clone", new_callable=AsyncMock, return_value=OperationResult(True)):
+            yield
+
     def _setup_fork(self, core):
         """Set up mock clients for fork tests and return them."""
         mock_apps = AsyncMock()
@@ -689,12 +711,77 @@ class TestForkSandbox:
         assert "Forked" in result.message
         mock_apps.create_namespaced_deployment.assert_called_once()
 
+    async def test_snapshot_kept_until_clone_copied(self, core: K7Core):
+        """Purging the snapshot mid-copy left forks with a corrupt filesystem."""
+        self._setup_fork(core)
+        snap, ready, bound = self._patch_fork_storage(core)
+        failed = OperationResult(success=False, error="clone failed")
+        with (
+            snap,
+            ready,
+            bound,
+            patch.object(core, "_wait_for_longhorn_clone", new_callable=AsyncMock, return_value=failed),
+            patch.object(
+                core, "_apply_sandbox_network_policies", new_callable=AsyncMock, return_value=OperationResult(True)
+            ),
+            patch.object(core, "delete_snapshot", new_callable=AsyncMock) as delete_snapshot,
+            patch.object(core, "_delete_sandbox_resources", new_callable=AsyncMock) as rollback,
+        ):
+            result = await core.fork_sandbox("src", "dst")
+
+        assert result is failed
+        delete_snapshot.assert_not_called()
+        rollback.assert_awaited_once_with("dst", "default")
+
     def _patch_fork_storage(self, core: K7Core):
         return (
             patch.object(core, "_create_volume_snapshot", new_callable=AsyncMock, return_value=OperationResult(True)),
             patch.object(core, "_wait_for_snapshot_ready", new_callable=AsyncMock, return_value=OperationResult(True)),
             patch.object(core, "_wait_for_pvc_bound", new_callable=AsyncMock, return_value=OperationResult(True)),
         )
+
+    async def _fork_recording(self, core: K7Core, *, docker: bool, snapshot_name: str | None = None) -> list:
+        mock_apps, _ = self._setup_fork(core)
+        if docker:
+            mock_apps.read_namespaced_deployment.return_value.metadata.annotations = {
+                ANN_K7_DOCKER: "true",
+                ANN_DOCKER_PVC: "src-docker-lh",
+            }
+        events: list = []
+
+        def rec(name, ret=OperationResult(True)):
+            async def f(*a, **kw):
+                events.append((name, a[0] if a else kw.get("snapshot_name") or kw.get("target_pvc_name")))
+                return ret
+
+            return f
+
+        ok = OperationResult(True)
+        with (
+            patch.object(core, "_create_kata_snapshots_quiesced", new=AsyncMock(return_value=ok)),
+            patch.object(core, "_wait_for_snapshot_ready", new=rec("ready")),
+            patch.object(core, "_create_pvc_from_snapshot", new=rec("clone_pvc")),
+            patch.object(core, "_ensure_docker_vehicle_configmap", new=AsyncMock(return_value=ok)),
+            patch.object(core, "_apply_sandbox_network_policies", new=AsyncMock(return_value=ok)),
+            patch.object(core, "_wait_for_pvc_bound", new=rec("bound")),
+            patch.object(core, "_wait_for_longhorn_clone", new=rec("copied")),
+            patch.object(core, "delete_snapshot", new=rec("delete_snapshot")),
+        ):
+            result = await core.fork_sandbox("src", "dst", snapshot_name=snapshot_name)
+        assert result.success, result.error
+        return events
+
+    async def test_docker_fork_waits_for_both_copies_before_deleting_the_auto_snapshot(self, core: K7Core):
+        events = await self._fork_recording(core, docker=True)
+        tail = [e for e in events if e[0] in ("copied", "delete_snapshot")]
+        assert tail[:2] == [("copied", "dst-root-lh"), ("copied", "dst-docker-lh")]
+        assert tail[2][0] == "delete_snapshot" and tail[2][1].startswith("src-fork-")
+        assert ("bound", "dst-docker-lh") in events
+
+    async def test_named_snapshot_fork_keeps_the_snapshot_and_skips_the_copy_wait(self, core: K7Core):
+        events = await self._fork_recording(core, docker=False, snapshot_name="keep-me")
+        assert not [e for e in events if e[0] in ("copied", "delete_snapshot")]
+        assert ("ready", "keep-me") in events
 
     async def test_fork_applies_network_policies(self, core: K7Core):
         """a fork used to come up with no policy at all."""
@@ -768,6 +855,26 @@ class TestForkSandbox:
         assert result.success is False
         assert "rolled back" in result.error and "boom" in result.error
         rollback.assert_awaited_once_with("dst", "default")
+
+    async def test_fork_over_quota_rolls_back_clone_and_temp_snapshot(self, core: K7Core):
+        """A fork is a create; a quota refusal leaves no PVC and no temporary snapshot."""
+        mock_apps, _ = self._setup_fork(core)
+        snap, ready, bound = self._patch_fork_storage(core)
+        refusal = AdmissionError(403, "QuotaExceeded", "tenant acme sandboxes quota exceeded")
+        with (
+            snap,
+            ready,
+            bound,
+            patch.object(core, "_create_sandbox_deployment", new_callable=AsyncMock, side_effect=refusal),
+            patch.object(core, "_delete_sandbox_resources", new_callable=AsyncMock) as rollback,
+            patch.object(core, "delete_snapshot", new_callable=AsyncMock) as delete_snapshot,
+            pytest.raises(AdmissionError),
+        ):
+            await core.fork_sandbox("src", "dst")
+        rollback.assert_awaited_once_with("dst", "default")
+        delete_snapshot.assert_awaited_once()
+        assert delete_snapshot.await_args.args[0].startswith("src-fork-")
+        mock_apps.create_namespaced_deployment.assert_not_called()
 
 
 class TestApplySandboxNetworkPolicies:
@@ -1053,6 +1160,32 @@ class TestK7dAgentForwarding:
         new_dep = mock_apps.create_namespaced_deployment.call_args.kwargs["body"]
         assert new_dep.spec.template.spec.node_name == "node-remote"
 
+    async def test_api_forwards_even_for_its_own_node(self, core: K7Core):
+        """k7-api has no host sockets (K7_K7D_REMOTE_ONLY=1): a co-located
+        sandbox still goes through that node's k7-agent."""
+        dep = mock_deployment(annotations={"k7.katakate.org/backend": "k7d"})
+        mock_apps = AsyncMock()
+        mock_apps.read_namespaced_deployment.return_value = dep
+        mock_v1 = AsyncMock()
+        mock_v1.list_namespaced_pod.return_value = MagicMock(items=[self._remote_pod()])
+        _setup_clients(core, apps=mock_apps, v1=mock_v1)
+
+        with (
+            patch.dict("os.environ", {"K7_NODE_NAME": "node-remote", "K7_K7D_REMOTE_ONLY": "1"}),
+            patch.object(core, "_k7d_vm_for_sandbox", new_callable=AsyncMock) as local,
+            patch.object(
+                core,
+                "_k7d_forward_vm_op",
+                new_callable=AsyncMock,
+                return_value=OperationResult(success=True, message="forwarded"),
+            ) as fwd,
+        ):
+            result = await core.resume_sandbox("sb1")
+
+        assert result.success is True
+        assert fwd.call_args.args[:2] == ("node-remote", "resume")
+        local.assert_not_called()
+
     async def test_agent_refuses_to_reforward(self, core: K7Core):
         """An agent that resolves a sandbox to yet another node must fail
         loudly instead of forwarding again (no proxy loops)."""
@@ -1062,6 +1195,21 @@ class TestK7dAgentForwarding:
                 raise AssertionError("expected RuntimeError")
             except RuntimeError as e:
                 assert "refusing to re-forward" in str(e)
+
+    async def test_unreachable_agent_names_the_cause(self, core: K7Core):
+        """httpx timeouts stringify to '' — the error must still say what failed."""
+        http = AsyncMock()
+        http.post.side_effect = httpx.ConnectTimeout("")
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=http)
+        client.__aexit__ = AsyncMock(return_value=False)
+        with (
+            patch.object(core, "_k7d_agent_base_url", new=AsyncMock(return_value="http://10.0.0.9:8000")),
+            patch.object(core, "_k7d_agent_token", return_value="tok"),
+            patch("k7.core.core.httpx.AsyncClient", return_value=client),
+            pytest.raises(RuntimeError, match="cannot reach k7-agent on node-b .*ConnectTimeout.*through k7-api"),
+        ):
+            await core._k7d_forward_vm_op("node-b", "pause", {}, timeout=5)
 
     async def test_missing_agent_pod_fails_loudly(self, core: K7Core):
         mock_v1 = AsyncMock()
@@ -1114,7 +1262,7 @@ class TestExecCommand:
         _setup_clients(core, apps=mock_apps, v1=AsyncMock())
 
         result = await core.exec_command("missing", "echo hi")
-        assert result.exit_code == 1
+        assert result.exit_code == EXEC_NO_STATUS
         assert "not found" in result.stderr
 
     async def test_no_pods(self, core: K7Core):
@@ -1124,7 +1272,7 @@ class TestExecCommand:
         _setup_clients(core, apps=mock_apps, v1=mock_v1)
 
         result = await core.exec_command("sb1", "echo hi")
-        assert result.exit_code == 1
+        assert result.exit_code == EXEC_NO_STATUS
         assert "No pods" in result.stderr
 
     async def test_pod_not_running(self, core: K7Core):
@@ -1135,30 +1283,85 @@ class TestExecCommand:
         _setup_clients(core, apps=mock_apps, v1=mock_v1)
 
         result = await core.exec_command("sb1", "echo hi")
-        assert result.exit_code == 1
+        assert result.exit_code == EXEC_NO_STATUS
         assert "not running" in result.stderr
 
-    async def test_successful_exec(self, core: K7Core):
-        mock_apps = AsyncMock()
+    async def _exec(self, core: K7Core, frames: list[bytes]):
         mock_v1 = AsyncMock()
-        pod = mock_pod(phase="Running")
-        mock_v1.list_namespaced_pod.return_value = MagicMock(items=[pod])
-        _setup_clients(core, apps=mock_apps, v1=mock_v1)
+        mock_v1.list_namespaced_pod.return_value = MagicMock(items=[mock_pod(phase="Running")])
+        _setup_clients(core, apps=AsyncMock(), v1=mock_v1)
+
+        class _Ws:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def __aiter__(self):
+                for f in frames:
+                    yield MagicMock(data=f)
 
         with patch("k7.core.core.WsApiClient") as mock_ws_cls:
-            mock_ws_ctx = AsyncMock()
-            mock_ws_cls.return_value.__aenter__ = AsyncMock(return_value=mock_ws_ctx)
+            mock_ws_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock())
             mock_ws_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-
             mock_v1_ws = AsyncMock()
-            mock_v1_ws.connect_get_namespaced_pod_exec.return_value = "hello\n"
-
+            mock_v1_ws.connect_get_namespaced_pod_exec.return_value = _Ws()
             with patch("k7.core.core.client.CoreV1Api", return_value=mock_v1_ws):
                 result = await core.exec_command("sb1", "echo hello")
+        assert mock_v1_ws.connect_get_namespaced_pod_exec.call_args.kwargs["_preload_content"] is False
+        assert mock_ws_cls.call_args.kwargs == {
+            "header_name": "sec-websocket-protocol",
+            "header_value": "v5.channel.k8s.io",
+        }
+        return result
 
-        assert result.exit_code == 0
-        assert result.stdout == "hello\n"
+    async def test_successful_exec(self, core: K7Core):
+        result = await self._exec(core, [b"\x01hello\n", b'\x03{"status":"Success"}'])
+        assert (result.exit_code, result.stdout, result.stderr) == (0, "hello\n", "")
         assert result.duration_ms >= 0
+
+    async def test_nonzero_exit_and_split_streams(self, core: K7Core):
+        status = (
+            b'\x03{"status":"Failure","reason":"NonZeroExitCode",'
+            b'"details":{"causes":[{"reason":"ExitCode","message":"7"}]}}'
+        )
+        result = await self._exec(core, [b"\x01out", b"\x02wget: download timed out\n", status])
+        assert (result.exit_code, result.stdout, result.stderr) == (7, "out", "wget: download timed out\n")
+
+    async def test_stream_without_status_is_not_success(self, core: K7Core):
+        """A stream cut short must not read as exit 0 with partial output."""
+        result = await self._exec(core, [b"\x02wget: download timed out\n"])
+        assert result.exit_code == EXEC_NO_STATUS
+        assert "without an exit status" in result.stderr
+
+    async def test_failure_status_without_exit_code(self, core: K7Core):
+        result = await self._exec(core, [b'\x03{"status":"Failure","message":"container not found"}'])
+        assert result.exit_code == EXEC_NO_STATUS
+        assert "container not found" in result.stderr
+
+    async def test_multibyte_split_across_frames(self, core: K7Core):
+        snow = "☃".encode()
+        frames = [b"\x01" + snow[:1], b"\x01" + snow[1:], b'\x03{"status":"Success"}']
+        assert (await self._exec(core, frames)).stdout == "☃"
+
+    async def test_large_output_across_many_frames(self, core: K7Core):
+        frames = [b"\x01" + b"x" * 1024] * 9 + [b"\x01" + b"x" * 784, b'\x03{"status":"Success"}']
+        result = await self._exec(core, frames)
+        assert (result.exit_code, len(result.stdout)) == (0, 10000)
+
+
+async def test_exec_ws_client_negotiates_v5():
+    """v4 truncates output on Kata (see EXEC_WS_PROTOCOL); the handshake must offer v5 only."""
+    assert EXEC_WS_PROTOCOL == "v5.channel.k8s.io"
+    async with _exec_ws_client() as ws_api:
+        with patch.object(ws_api.rest_client.pool_manager, "ws_connect") as ws_connect:
+            await client.CoreV1Api(api_client=ws_api).connect_get_namespaced_pod_exec(
+                "pod", "ns", command=["true"], stdout=True, stderr=True, stdin=False, tty=False, _preload_content=False
+            )
+    url, kwargs = ws_connect.call_args.args[0], ws_connect.call_args.kwargs
+    assert kwargs["headers"]["sec-websocket-protocol"] == "v5.channel.k8s.io"
+    assert "stdin=False" in url
 
 
 # --- get_sandbox_metrics ---
@@ -1217,6 +1420,63 @@ class TestGetSandboxMetrics:
             result = await core.get_sandbox_metrics(namespace="default")
 
         assert result == []
+
+
+# --- _wait_for_longhorn_clone ---
+
+
+class TestWaitForLonghornClone:
+    def _setup(self, core: K7Core, *states, provisioner: str = "driver.longhorn.io"):
+        mock_v1, mock_custom = AsyncMock(), AsyncMock()
+        mock_v1.read_namespaced_persistent_volume_claim.return_value = SimpleNamespace(
+            spec=SimpleNamespace(volume_name="pv1", storage_class_name="sc1")
+        )
+        mock_custom.get_namespaced_custom_object.side_effect = [
+            {"status": {"cloneStatus": {"state": s}}} for s in states
+        ]
+        _setup_clients(core, v1=mock_v1, custom=mock_custom)
+        core._get_api_client = AsyncMock()
+        storage = MagicMock()
+        storage.return_value.read_storage_class = AsyncMock(return_value=SimpleNamespace(provisioner=provisioner))
+        patcher = patch("k7.core.core.client.StorageV1Api", storage)
+        patcher.start()
+        self._patchers = [*getattr(self, "_patchers", []), patcher]
+        return mock_custom
+
+    def teardown_method(self):
+        for p in getattr(self, "_patchers", []):
+            p.stop()
+        self._patchers = []
+
+    async def test_other_csi_driver_does_not_wait(self, core: K7Core):
+        custom = self._setup(core, provisioner="ebs.csi.aws.com")
+        result = await core._wait_for_longhorn_clone("pvc1", "ns")
+        assert result.success is True
+        custom.get_namespaced_custom_object.assert_not_awaited()
+
+    async def test_waits_for_completed(self, core: K7Core):
+        custom = self._setup(core, "initiated", "completed")
+        with patch("k7.core.core.asyncio.sleep", new_callable=AsyncMock):
+            result = await core._wait_for_longhorn_clone("pvc1", "ns")
+        assert result.success is True
+        assert custom.get_namespaced_custom_object.await_args.kwargs["name"] == "pv1"
+
+    async def test_failed_clone_is_loud(self, core: K7Core):
+        self._setup(core, "failed")
+        result = await core._wait_for_longhorn_clone("pvc1", "ns")
+        assert result.success is False
+        assert "failed" in result.error
+
+    async def test_clone_never_completing_times_out_loudly(self, core: K7Core):
+        self._setup(core, "initiated", "initiated")
+        clock = iter([0.0, 0.0, 1.0, 5.0])
+        with (
+            patch("k7.core.core.asyncio.sleep", new_callable=AsyncMock),
+            patch("k7.core.core.time", SimpleNamespace(time=lambda: next(clock))),
+        ):
+            result = await core._wait_for_longhorn_clone("pvc1", "ns", timeout=3)
+        assert result.success is False
+        assert result.error == "Longhorn clone of PVC pvc1 (pv1) not completed within 3s: initiated"
 
 
 # --- _wait_for_pvc_bound ---
@@ -1599,9 +1859,23 @@ class TestCheckScheduling:
         result = await core._check_scheduling("sb1", "default", "kata-qemu-longhorn", timeout_seconds=1)
         assert result.success is True
 
+    async def test_bound_pending_pod_returns_success_without_waiting(self, core: K7Core):
+        mock_v1 = AsyncMock()
+        pod = mock_pod(name="sb1-x", phase="Pending")
+        pod.spec.node_name = "node1"
+        mock_v1.list_namespaced_pod.return_value = MagicMock(items=[pod])
+        _setup_clients(core, v1=mock_v1)
+
+        with patch("k7.core.core.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            result = await core._check_scheduling("sb1", "default", "kata-qemu-longhorn", timeout_seconds=30)
+        assert result.success is True
+        sleep.assert_not_awaited()
+        mock_v1.list_namespaced_event.assert_not_awaited()
+
     async def test_failed_scheduling_returns_explanatory_error(self, core: K7Core):
         mock_v1 = AsyncMock()
         pod = mock_pod(name="sb1-x", phase="Pending")
+        pod.spec.node_name = None
         mock_v1.list_namespaced_pod.return_value = MagicMock(items=[pod])
         events = SimpleNamespace(
             items=[
@@ -1651,6 +1925,7 @@ class TestCheckScheduling:
     async def test_unrelated_event_does_not_trigger(self, core: K7Core):
         mock_v1 = AsyncMock()
         pod = mock_pod(name="sb1-x", phase="Pending")
+        pod.spec.node_name = None
         mock_v1.list_namespaced_pod.return_value = MagicMock(items=[pod])
         mock_v1.list_namespaced_event.return_value = SimpleNamespace(
             items=[_event("Scheduled", "Successfully assigned default/sb1-x to node1")]
@@ -1755,6 +2030,151 @@ class TestApplyCiliumEgressPolicy:
         assert result.success is False
         assert "CiliumNetworkPolicy" in result.error
 
+    async def test_dns_rule_allows_only_the_allowlist(self, core: K7Core):
+        mock_custom = AsyncMock()
+        _setup_clients(core, custom=mock_custom)
+        await core._apply_cilium_egress_policy("sb1", "default", ["10.0.0.0/8"], ["api.openai.com", "*.docker.com"])
+        cnp = mock_custom.create_namespaced_custom_object.call_args.kwargs["body"]
+        fqdn_rule = next(r for r in cnp["spec"]["egress"] if "toFQDNs" in r)
+        assert _cnp_dns_matchers(cnp) == fqdn_rule["toFQDNs"]
+        assert _cnp_dns_matchers(cnp) == [{"matchName": "api.openai.com"}, {"matchPattern": "**.docker.com"}]
+        assert {"matchPattern": "*"} not in _cnp_dns_matchers(cnp)
+
+    def test_spec_refuses_an_empty_fqdn_list(self):
+        with pytest.raises(ValueError, match="at least one FQDN"):
+            _cilium_egress_spec("sb1", ["10.0.0.0/8"], [])
+
+
+def _legacy_cnp(sandbox: str, namespace: str = "ns1") -> dict:
+    """A `{name}-egress` policy as k7 wrote it before the DNS rule mirrored the allowlist."""
+    spec = _cilium_egress_spec(sandbox, ["10.0.0.0/8"], ["api.openai.com", "*.docker.com"])
+    spec["egress"][0]["toPorts"][0]["rules"]["dns"] = [{"matchPattern": "*"}]
+    return {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+            "name": f"{sandbox}-egress",
+            "namespace": namespace,
+            "resourceVersion": "42",
+            "labels": {"k7.katakate.org/tenant": "acme"},
+        },
+        "spec": spec,
+    }
+
+
+class TestReconcileCiliumEgressPolicies:
+    def _wire(self, core: K7Core, items: list[dict]) -> AsyncMock:
+        custom = AsyncMock()
+        custom.list_cluster_custom_object.return_value = {"items": items}
+        apiext = AsyncMock()
+        apiext.read_custom_resource_definition.return_value = MagicMock()
+        _setup_clients(core, custom=custom, apiext=apiext)
+        return custom
+
+    async def test_rewrites_legacy_dns_rule_keeping_metadata(self, core: K7Core):
+        custom = self._wire(core, [_legacy_cnp("sb1")])
+        assert await core.reconcile_cilium_egress_policies() == ["ns1/sb1-egress"]
+        kw = custom.replace_namespaced_custom_object.call_args.kwargs
+        assert (kw["namespace"], kw["name"]) == ("ns1", "sb1-egress")
+        body = kw["body"]
+        assert body["metadata"]["resourceVersion"] == "42"
+        assert body["metadata"]["labels"] == {"k7.katakate.org/tenant": "acme"}
+        assert body["spec"] == _cilium_egress_spec("sb1", ["10.0.0.0/8"], ["api.openai.com", "*.docker.com"])
+        custom.create_namespaced_custom_object.assert_not_called()
+
+    async def test_is_idempotent(self, core: K7Core):
+        cnp = _legacy_cnp("sb1")
+        cnp["spec"] = _cilium_egress_spec("sb1", ["10.0.0.0/8"], ["api.openai.com", "*.docker.com"])
+        custom = self._wire(core, [cnp])
+        assert await core.reconcile_cilium_egress_policies() == []
+        custom.replace_namespaced_custom_object.assert_not_called()
+
+    async def test_skips_policies_k7_did_not_write(self, core: K7Core):
+        foreign = _legacy_cnp("sb1")
+        foreign["metadata"]["name"] = "someone-elses"
+        unlabelled = _legacy_cnp("sb2")
+        unlabelled["spec"]["endpointSelector"] = {"matchLabels": {"app": "x"}}
+        custom = self._wire(core, [foreign, unlabelled])
+        assert await core.reconcile_cilium_egress_policies() == []
+        custom.replace_namespaced_custom_object.assert_not_called()
+
+    async def test_no_cilium_is_a_no_op(self, core: K7Core):
+        custom = AsyncMock()
+        apiext = AsyncMock()
+        apiext.read_custom_resource_definition.side_effect = ApiException(status=404)
+        _setup_clients(core, custom=custom, apiext=apiext)
+        assert await core.reconcile_cilium_egress_policies() == []
+        custom.list_cluster_custom_object.assert_not_called()
+
+    async def test_conflict_with_a_replica_that_already_fixed_it(self, core: K7Core):
+        custom = self._wire(core, [_legacy_cnp("sb1")])
+        custom.replace_namespaced_custom_object.side_effect = ApiException(status=409)
+        fixed = _legacy_cnp("sb1")
+        fixed["spec"] = _cilium_egress_spec("sb1", ["10.0.0.0/8"], ["api.openai.com", "*.docker.com"])
+        custom.get_namespaced_custom_object.return_value = fixed
+        assert await core.reconcile_cilium_egress_policies() == []
+
+    async def test_conflict_left_stale_is_loud(self, core: K7Core):
+        custom = self._wire(core, [_legacy_cnp("sb1")])
+        custom.replace_namespaced_custom_object.side_effect = ApiException(status=409)
+        custom.get_namespaced_custom_object.return_value = _legacy_cnp("sb1")
+        with pytest.raises(ApiException):
+            await core.reconcile_cilium_egress_policies()
+
+
+class TestCidrEgressWithoutCilium:
+    """v1 NetworkPolicy engines match pod/Service IPs, so a CIDR over CoreDNS is a DNS channel."""
+
+    def _wire(self, core: K7Core, cilium: bool, dns_ips: tuple[str, str] | None = ("10.43.0.10", "10.42.0.5")):
+        apiext = AsyncMock()
+        if cilium:
+            apiext.read_custom_resource_definition.return_value = MagicMock()
+        else:
+            apiext.read_custom_resource_definition.side_effect = ApiException(status=404)
+        v1 = AsyncMock()
+        svc_ip, pod_ip = dns_ips or (None, None)
+        svc = MagicMock()
+        svc.spec.cluster_i_ps, svc.spec.cluster_ip = ([svc_ip] if svc_ip else None), svc_ip
+        pod = MagicMock()
+        pod.status.pod_ip = pod_ip
+        v1.list_namespaced_service.return_value = MagicMock(items=[svc] if dns_ips else [])
+        v1.list_namespaced_pod.return_value = MagicMock(items=[pod] if dns_ips else [])
+        net = AsyncMock()
+        _setup_clients(core, v1=v1, net=net, apiext=apiext)
+        return net, v1
+
+    @pytest.mark.parametrize("cidr", ["10.43.0.0/16", "10.42.0.0/16", "10.0.0.0/8", "0.0.0.0/0"])
+    async def test_cidr_covering_cluster_dns_is_refused(self, core: K7Core, cidr: str):
+        net, _ = self._wire(core, cilium=False)
+        result = await core._apply_sandbox_network_policies("sb", "default", egress_whitelist=["1.1.1.1/32", cidr])
+        assert result.success is False
+        assert cidr in result.error and "1.1.1.1/32" not in result.error
+        assert "cluster DNS" in result.error
+        net.create_namespaced_network_policy.assert_not_called()
+
+    async def test_cidr_clear_of_cluster_dns_is_applied(self, core: K7Core):
+        net, _ = self._wire(core, cilium=False)
+        result = await core._apply_sandbox_network_policies("sb", "default", egress_whitelist=["1.1.1.1/32"])
+        assert result.success is True
+        assert net.create_namespaced_network_policy.await_count == 2
+
+    async def test_cilium_skips_the_check(self, core: K7Core):
+        net, v1 = self._wire(core, cilium=True)
+        result = await core._apply_sandbox_network_policies("sb", "default", egress_whitelist=["10.0.0.0/8"])
+        assert result.success is True
+        v1.list_namespaced_service.assert_not_called()
+
+    async def test_block_all_needs_no_dns_lookup(self, core: K7Core):
+        _, v1 = self._wire(core, cilium=False)
+        result = await core._apply_sandbox_network_policies("sb", "default", egress_whitelist=[])
+        assert result.success is True
+        v1.list_namespaced_service.assert_not_called()
+
+    async def test_unknown_cluster_dns_is_loud(self, core: K7Core):
+        self._wire(core, cilium=False, dns_ips=None)
+        with pytest.raises(RuntimeError, match="cannot find the cluster DNS server"):
+            await core._apply_sandbox_network_policies("sb", "default", egress_whitelist=["1.1.1.1/32"])
+
 
 # --- kubernetes_asyncio ApiClient lifecycle ---
 
@@ -1813,6 +2233,7 @@ class TestCreateSnapshotMessage:
         mock_apps = AsyncMock()
         mock_apps.read_namespaced_deployment.return_value = dep
         _setup_clients(core, apps=mock_apps)
+        wait = AsyncMock(return_value=OperationResult(success=True))
 
         with (
             patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-qemu-longhorn")),
@@ -1823,6 +2244,7 @@ class TestCreateSnapshotMessage:
                     return_value=OperationResult(success=True, message="Snapshot snap1 created for PVC sb-root-lh")
                 ),
             ),
+            patch.object(core, "_wait_for_snapshot_ready", new=wait),
             patch.object(
                 core,
                 "exec_command",
@@ -1832,3 +2254,26 @@ class TestCreateSnapshotMessage:
             result = await core.create_snapshot("sb", "snap1")
         assert result.success, result.error
         assert "snap1" in result.message
+        assert [c.args[0] for c in wait.await_args_list] == ["snap1"]
+
+    async def test_named_snapshot_not_ready_is_loud(self, core: K7Core):
+        dep = MagicMock()
+        dep.metadata.annotations = {}
+        dep.status.ready_replicas = 1
+        mock_apps = AsyncMock()
+        mock_apps.read_namespaced_deployment.return_value = dep
+        _setup_clients(core, apps=mock_apps)
+        not_ready = OperationResult(success=False, error="VolumeSnapshot snap1 not ready within 120s")
+        with (
+            patch.object(core, "_detect_backend", new=AsyncMock(return_value="kata-qemu-longhorn")),
+            patch.object(core, "_create_volume_snapshot", new=AsyncMock(return_value=OperationResult(success=True))),
+            patch.object(core, "_wait_for_snapshot_ready", new=AsyncMock(return_value=not_ready)),
+            patch.object(
+                core,
+                "exec_command",
+                new=AsyncMock(return_value=ExecResult(exit_code=0, stdout="", stderr="", duration_ms=0)),
+            ),
+        ):
+            result = await core.create_snapshot("sb", "snap1")
+        assert not result.success
+        assert "not ready" in result.error

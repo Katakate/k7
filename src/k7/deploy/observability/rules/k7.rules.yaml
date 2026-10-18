@@ -1,0 +1,141 @@
+# K7 alerts. One file, two groups:
+#   k7.thresholds  tunables as recording rules; the chart renders this group
+#                  from observability.thresholds, the playbook uses it as is.
+#   k7.alerts      static expressions compared against the thresholds, so
+#                  `promtool test rules` (../tests/k7.rules.test.yaml) proves them.
+# Jobs: ServiceMonitor/PodMonitor set job="k7-api" / job="k7-agent" (jobLabel: app).
+groups:
+  - name: k7.thresholds
+    rules:
+      - record: k7:threshold:api_error_ratio
+        expr: vector(0.05)
+      - record: k7:threshold:key_store_stale_seconds
+        expr: vector(60)
+      - record: k7:threshold:thinpool_data_ratio
+        expr: vector(0.8)
+      - record: k7:threshold:thinpool_metadata_ratio
+        expr: vector(0.7)
+      - record: k7:threshold:k7d_disks_ratio
+        expr: vector(0.85)
+      - record: k7:threshold:storage_report_stale_seconds
+        expr: vector(90)
+      - record: k7:threshold:tls_expiry_seconds
+        expr: vector(1209600)
+      # p95 budget per op from PERFORMANCE.md (slowest backend); the alert fires at 2x.
+      - record: k7:threshold:op_p95_budget_seconds
+        expr: vector(25)
+        labels: {op: create}
+      - record: k7:threshold:op_p95_budget_seconds
+        expr: vector(2)
+        labels: {op: delete}
+      - record: k7:threshold:op_p95_budget_seconds
+        expr: vector(10)
+        labels: {op: fork}
+      - record: k7:threshold:op_p95_budget_seconds
+        expr: vector(2)
+        labels: {op: pause}
+      - record: k7:threshold:op_p95_budget_seconds
+        expr: vector(10)
+        labels: {op: resume}
+      - record: k7:threshold:op_p95_budget_seconds
+        expr: vector(10)
+        labels: {op: snapshot}
+      - record: k7:threshold:op_p95_budget_seconds
+        expr: vector(25)
+        labels: {op: restore}
+  - name: k7.alerts
+    rules:
+      - alert: K7APIDown
+        expr: max(up{job="k7-api"}) == 0 or absent(up{job="k7-api"})
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: No k7-api replica answers its /metrics scrape.
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7APIDown.md
+      - alert: K7APIHighErrorRate
+        expr: >-
+          sum(rate(k7_http_requests_total{status=~"5.."}[5m])) / sum(rate(k7_http_requests_total[5m]))
+          > scalar(k7:threshold:api_error_ratio)
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: '{{ $value | humanizePercentage }} of k7-api requests return 5xx.'
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7APIHighErrorRate.md
+      - alert: K7OperationSlow
+        expr: >-
+          histogram_quantile(0.95, sum by (op, le) (rate(k7_operation_duration_seconds_bucket{outcome="success"}[15m])))
+          > on (op) group_left () (2 * k7:threshold:op_p95_budget_seconds)
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: 'p95 of k7 {{ $labels.op }} is {{ $value | humanizeDuration }}, over twice its budget.'
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7OperationSlow.md
+      - alert: K7KeyStoreStale
+        expr: time() - max(k7_key_store_last_sync_timestamp_seconds) > scalar(k7:threshold:key_store_stale_seconds)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: k7-api has not read the k7-api-keys Secret for {{ $value | humanizeDuration }}; auth returns 503.
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7KeyStoreStale.md
+      - alert: K7AgentDown
+        expr: up{job="k7-agent"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: k7-agent on {{ $labels.instance }} does not answer its /metrics scrape.
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7AgentDown.md
+      - alert: K7dDaemonDown
+        expr: k7d_daemon_up == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The k7d daemon socket on {{ $labels.instance }} refuses connections.
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7dDaemonDown.md
+      - alert: K7StoragePoolFilling
+        expr: >-
+          (k7_storage_pool_bytes{pool="thinpool_data", kind="used"}
+            / ignoring (kind) k7_storage_pool_bytes{pool="thinpool_data", kind="size"}
+            > scalar(k7:threshold:thinpool_data_ratio))
+          or (k7_storage_pool_bytes{pool="thinpool_metadata", kind="used"}
+            / ignoring (kind) k7_storage_pool_bytes{pool="thinpool_metadata", kind="size"}
+            > scalar(k7:threshold:thinpool_metadata_ratio))
+          or (k7_storage_pool_bytes{pool="k7d_disks", kind="used"}
+            / ignoring (kind) k7_storage_pool_bytes{pool="k7d_disks", kind="size"}
+            > scalar(k7:threshold:k7d_disks_ratio))
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: '{{ $labels.pool }} on {{ $labels.instance }} is {{ $value | humanizePercentage }} full.'
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7StoragePoolFilling.md
+      - alert: K7StorageReportStale
+        expr: k7_storage_report_age_seconds > scalar(k7:threshold:storage_report_stale_seconds)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: /run/k7/storage.json on {{ $labels.instance }} is {{ $value | humanizeDuration }} old.
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7StorageReportStale.md
+      - alert: K7SnapshotGCFailing
+        expr: kube_job_status_failed{job_name=~"k7-snapshot-gc-.*"} > 0
+        labels: {severity: warning}
+        annotations:
+          summary: Snapshot GC Job {{ $labels.namespace }}/{{ $labels.job_name }} failed.
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7SnapshotGCFailing.md
+      - alert: K7UsageSpoolOverflow
+        expr: increase(k7_usage_events_dropped_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: k7 dropped usage events in the last 10m (metering spool full).
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7UsageSpoolOverflow.md
+      - alert: K7UsageSinkStopped
+        expr: k7_usage_sink_stopped == 1
+        labels: {severity: warning}
+        annotations:
+          summary: Usage sink {{ $labels.sink }} on {{ $labels.instance }} stopped on a 4xx; its events wait in the spool.
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7UsageSinkStopped.md
+      - alert: K7TLSCertExpiringSoon
+        expr: k7_tls_cert_expiry_timestamp_seconds - time() < scalar(k7:threshold:tls_expiry_seconds)
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: The {{ $labels.source }} certificate k7-api serves expires in {{ $value | humanizeDuration }}.
+          runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7TLSCertExpiringSoon.md

@@ -1,0 +1,139 @@
+---
+- name: Re-create /etc/cni/net.d directory
+  ansible.builtin.file:
+    path: /etc/cni/net.d
+    state: directory
+    mode: '0755'
+  tags: ['cni']
+
+- name: Check for a running Cilium's CNI config
+  ansible.builtin.stat:
+    path: /etc/cni/net.d/05-cilium.conflist
+  register: cilium_conflist
+  tags: ['cni']
+
+# A running Cilium agent (cni.exclusive) renames every other config here to
+# *.cilium_bak, racing the copy's chmod; it would drop this file anyway.
+- name: Drop loop-back CNI config
+  ansible.builtin.copy:
+    dest: /etc/cni/net.d/99-loopback.conf
+    mode: '0644'
+    content: |
+      {
+        "cniVersion": "1.0.0",
+        "name": "loopback",
+        "type": "loopback"
+      }
+  when: not cilium_conflist.stat.exists
+  tags: ['cni']
+
+# Fresh nodes only: on a running cluster (k7-node-installer) the ruleset holds
+# the CNI's chains (Cilium's iptables-nft rules); flushing them cuts pod traffic.
+- name: Disable nftables FORWARD rules (they conflict with iptables)
+  ansible.builtin.shell: |
+    nft flush ruleset || true
+    systemctl mask nftables || true
+  changed_when: false
+  when: not (k7_node_installer | bool)
+  tags: ['network']
+
+# Host Docker only builds `--api-image local` / `--node-installer-image local`.
+# Release installs pull images with the nodes' containerd and never install
+# or call Docker.
+- name: Docker (local image build) — fetch Docker apt key (sha256 pinned)
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    checksum: "sha256:{{ docker_apt_key_sha256 }}"
+    mode: '0644'
+  when: k7_local_image_build | bool and inventory_hostname == k7_first_master
+  tags: ['docker']
+
+- name: Docker (local image build) — add Docker apt repository
+  ansible.builtin.apt_repository:
+    repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    filename: docker
+  when: k7_local_image_build | bool and inventory_hostname == k7_first_master
+  tags: ['docker']
+
+- name: Docker (local image build) — install pinned Docker
+  ansible.builtin.apt:
+    name:
+      - "docker-ce={{ docker_ce_version }}"
+      - "docker-ce-cli={{ docker_ce_version }}"
+      - "containerd.io={{ docker_containerd_version }}"
+      - "docker-buildx-plugin={{ docker_buildx_version }}"
+    allow_downgrade: true
+    allow_change_held_packages: true
+    update_cache: true
+  register: k7_docker_pkgs
+  when: k7_local_image_build | bool and inventory_hostname == k7_first_master
+  tags: ['docker']
+
+# Held so a re-run's dist-upgrade (host.yml) keeps the pins. Before the hold
+# existed, that upgrade and the downgrade above each restarted Docker, and with
+# the restart below systemd's start limit (3 per minute) refused docker.service.
+- name: Docker (local image build) — hold the pinned packages
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin]
+  when: k7_local_image_build | bool and inventory_hostname == k7_first_master
+  tags: ['docker']
+
+# Package scripts restart Docker; clear the start-rate counter they used up.
+- name: Docker (local image build) — reset the start limit after a package change
+  ansible.builtin.command: systemctl reset-failed docker.service docker.socket
+  changed_when: false
+  when: k7_local_image_build | bool and inventory_hostname == k7_first_master and k7_docker_pkgs is changed
+  tags: ['docker']
+
+# docker.service allows 3 starts per 60s (StartLimitBurst). Restarting
+# docker.socket restarts docker.service as well (Requires=), so looping both
+# is two dockerd starts per run and the next install inside that minute is
+# refused. A failed socket (fresh package install) is cleared here — that is
+# not a start — and `started` does nothing when the socket is already up.
+- name: Docker (local image build) — clear a failed docker.socket without starting dockerd
+  ansible.builtin.command: systemctl reset-failed docker.socket
+  changed_when: false
+  when: k7_local_image_build | bool and inventory_hostname == k7_first_master
+  tags: ['docker', 'iptables']
+
+- name: Docker (local image build) — enable docker.socket without restarting it
+  ansible.builtin.systemd:
+    name: docker.socket
+    state: started
+    enabled: true
+  when: k7_local_image_build | bool and inventory_hostname == k7_first_master
+  tags: ['docker', 'iptables']
+
+- name: Docker (local image build) — restart once to recreate iptables chains (after flushing nft)
+  ansible.builtin.systemd:
+    name: docker.service
+    state: restarted
+    enabled: true
+  when: k7_local_image_build | bool and inventory_hostname == k7_first_master
+  tags: ['docker', 'iptables']
+
+- name: Persist iptables FORWARD rules for CNI traffic
+  ansible.builtin.iptables:
+    chain: FORWARD
+    in_interface: cni0
+    jump: ACCEPT
+    action: insert
+    rule_num: 1
+    state: present
+  when: not (k7_node_installer | bool)
+  tags: ['network']
+
+- name: Persist iptables FORWARD rules for return CNI traffic
+  ansible.builtin.iptables:
+    chain: FORWARD
+    out_interface: cni0
+    ctstate: ESTABLISHED,RELATED
+    jump: ACCEPT
+    action: insert
+    rule_num: 1
+    state: present
+  when: not (k7_node_installer | bool)
+  tags: ['network']

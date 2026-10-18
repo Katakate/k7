@@ -18,6 +18,8 @@ import pytest
 from k7.core.core import K7Core
 from k7.core.models import SandboxConfig
 
+from .cluster import KUBECTL
+
 pytestmark = [pytest.mark.integration, pytest.mark.k7d]
 
 # k7d VM operations (pause/resume/fork) go through the node-local
@@ -34,8 +36,7 @@ def _wait_pod_ready(sandbox_name: str, namespace: str, timeout: int = 300) -> No
     while time.time() < deadline:
         result = subprocess.run(
             [
-                "k3s",
-                "kubectl",
+                *KUBECTL,
                 "get",
                 "pods",
                 "-n",
@@ -65,8 +66,7 @@ def _wait_pod_ready(sandbox_name: str, namespace: str, timeout: int = 300) -> No
 def _pod_runtime_class(sandbox_name: str, namespace: str) -> str:
     result = subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "get",
             "pods",
             "-n",

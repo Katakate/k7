@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from k7.api.keystore import FileKeyStore
 from k7.api.main import app
 from k7.core.core import K7Core
 from k7.core.models import (
@@ -192,8 +193,10 @@ class TestCollectSourceAnnotations:
 def keys_file(tmp_path: Path):
     p = tmp_path / "api_keys.json"
     future_ts = int(time.time()) + 86400
-    p.write_text(json.dumps({TEST_KEY_HASH: {"name": "test-key", "expires": future_ts, "last_used": None}}))
-    with patch("k7.api.main.API_KEYS_FILE", p):
+    p.write_text(
+        json.dumps({TEST_KEY_HASH: {"name": "test-key", "expires": future_ts, "last_used": None, "role": "admin"}})
+    )
+    with patch("k7.api.main.STORE", FileKeyStore(p)):
         yield p
 
 

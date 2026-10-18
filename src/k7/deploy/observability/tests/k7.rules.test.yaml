@@ -1,0 +1,287 @@
+# `promtool test rules` for ../rules/k7.rules.yaml: one firing and one
+# non-firing case per alert (tests/unit/test_alert_rules_and_dashboards.py runs it).
+rule_files: [../rules/k7.rules.yaml]
+evaluation_interval: 1m
+tests:
+  # --- K7APIDown -------------------------------------------------------------
+  - name: K7APIDown fires when every replica is down
+    interval: 1m
+    input_series:
+      - {series: 'up{job="k7-api", instance="10.42.0.10:9464"}', values: '0x10'}
+      - {series: 'up{job="k7-api", instance="10.42.0.11:9464"}', values: '0x10'}
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: K7APIDown
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations: &api_down
+              summary: No k7-api replica answers its /metrics scrape.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7APIDown.md
+  - name: K7APIDown fires when no replica is scraped at all
+    interval: 1m
+    input_series:
+      - {series: 'up{job="k7-agent", instance="10.42.0.20:9464"}', values: '1x10'}
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: K7APIDown
+        exp_alerts:
+          - exp_labels: {job: k7-api, severity: critical}
+            exp_annotations: *api_down
+  - name: K7APIDown stays quiet while one replica answers
+    interval: 1m
+    input_series:
+      - {series: 'up{job="k7-api", instance="10.42.0.10:9464"}', values: '0x10'}
+      - {series: 'up{job="k7-api", instance="10.42.0.11:9464"}', values: '1x10'}
+    alert_rule_test:
+      - {eval_time: 5m, alertname: K7APIDown, exp_alerts: []}
+
+  # --- K7APIHighErrorRate ------------------------------------------------------
+  - name: K7APIHighErrorRate fires at 10% 5xx
+    interval: 1m
+    input_series:
+      - {series: 'k7_http_requests_total{route="/api/v1/sandboxes", method="POST", status="500"}', values: '0+6x30'}
+      - {series: 'k7_http_requests_total{route="/api/v1/sandboxes", method="POST", status="201"}', values: '0+54x30'}
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: K7APIHighErrorRate
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: 10% of k7-api requests return 5xx.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7APIHighErrorRate.md
+  - name: K7APIHighErrorRate stays quiet at 1% 5xx
+    interval: 1m
+    input_series:
+      - {series: 'k7_http_requests_total{route="/api/v1/sandboxes", method="POST", status="500"}', values: '0+1x30'}
+      - {series: 'k7_http_requests_total{route="/api/v1/sandboxes", method="POST", status="201"}', values: '0+99x30'}
+    alert_rule_test:
+      - {eval_time: 20m, alertname: K7APIHighErrorRate, exp_alerts: []}
+
+  # --- K7OperationSlow ---------------------------------------------------------
+  - name: K7OperationSlow fires when create p95 passes 2x its 25s budget
+    interval: 1m
+    input_series:
+      - {series: 'k7_operation_duration_seconds_bucket{op="create", backend="kata-qemu-longhorn", outcome="success", le="100"}', values: '0x30'}
+      - {series: 'k7_operation_duration_seconds_bucket{op="create", backend="kata-qemu-longhorn", outcome="success", le="200"}', values: '0+10x30'}
+      - {series: 'k7_operation_duration_seconds_bucket{op="create", backend="kata-qemu-longhorn", outcome="success", le="+Inf"}', values: '0+10x30'}
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: K7OperationSlow
+        exp_alerts:
+          - exp_labels: {op: create, severity: warning}
+            exp_annotations:
+              summary: p95 of k7 create is 3m 15s, over twice its budget.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7OperationSlow.md
+  - name: K7OperationSlow stays quiet for a fast delete and slow failures
+    interval: 1m
+    input_series:
+      - {series: 'k7_operation_duration_seconds_bucket{op="delete", backend="k7d", outcome="success", le="0.25"}', values: '0x30'}
+      - {series: 'k7_operation_duration_seconds_bucket{op="delete", backend="k7d", outcome="success", le="0.5"}', values: '0+10x30'}
+      - {series: 'k7_operation_duration_seconds_bucket{op="delete", backend="k7d", outcome="success", le="+Inf"}', values: '0+10x30'}
+      - {series: 'k7_operation_duration_seconds_bucket{op="create", backend="k7d", outcome="error", le="100"}', values: '0x30'}
+      - {series: 'k7_operation_duration_seconds_bucket{op="create", backend="k7d", outcome="error", le="+Inf"}', values: '0+10x30'}
+    alert_rule_test:
+      - {eval_time: 20m, alertname: K7OperationSlow, exp_alerts: []}
+
+  # --- K7KeyStoreStale ---------------------------------------------------------
+  - name: K7KeyStoreStale fires when the last sync is 5 minutes old
+    interval: 1m
+    input_series:
+      - {series: 'k7_key_store_last_sync_timestamp_seconds{job="k7-api", instance="10.42.0.10:9464"}', values: '0x10'}
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: K7KeyStoreStale
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: k7-api has not read the k7-api-keys Secret for 5m 0s; auth returns 503.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7KeyStoreStale.md
+  - name: K7KeyStoreStale stays quiet while one replica keeps syncing
+    interval: 1m
+    input_series:
+      - {series: 'k7_key_store_last_sync_timestamp_seconds{job="k7-api", instance="10.42.0.10:9464"}', values: '0+60x10'}
+      - {series: 'k7_key_store_last_sync_timestamp_seconds{job="k7-api", instance="10.42.0.11:9464"}', values: '0x10'}
+    alert_rule_test:
+      - {eval_time: 5m, alertname: K7KeyStoreStale, exp_alerts: []}
+
+  # --- K7AgentDown -------------------------------------------------------------
+  - name: K7AgentDown fires for a node whose agent is down
+    interval: 1m
+    input_series:
+      - {series: 'up{job="k7-agent", instance="10.42.0.20:9464"}', values: '0x10'}
+      - {series: 'up{job="k7-agent", instance="10.42.0.21:9464"}', values: '1x10'}
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: K7AgentDown
+        exp_alerts:
+          - exp_labels: {job: k7-agent, instance: '10.42.0.20:9464', severity: critical}
+            exp_annotations:
+              summary: k7-agent on 10.42.0.20:9464 does not answer its /metrics scrape.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7AgentDown.md
+  - name: K7AgentDown stays quiet when every agent answers
+    interval: 1m
+    input_series:
+      - {series: 'up{job="k7-agent", instance="10.42.0.20:9464"}', values: '1x10'}
+    alert_rule_test:
+      - {eval_time: 7m, alertname: K7AgentDown, exp_alerts: []}
+
+  # --- K7dDaemonDown -----------------------------------------------------------
+  - name: K7dDaemonDown fires when the socket refuses connections
+    interval: 1m
+    input_series:
+      - {series: 'k7d_daemon_up{job="k7-agent", instance="10.42.0.20:9464"}', values: '0x10'}
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: K7dDaemonDown
+        exp_alerts:
+          - exp_labels: {job: k7-agent, instance: '10.42.0.20:9464', severity: critical}
+            exp_annotations:
+              summary: The k7d daemon socket on 10.42.0.20:9464 refuses connections.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7dDaemonDown.md
+  - name: K7dDaemonDown stays quiet when the daemon is up
+    interval: 1m
+    input_series:
+      - {series: 'k7d_daemon_up{job="k7-agent", instance="10.42.0.20:9464"}', values: '1x10'}
+    alert_rule_test:
+      - {eval_time: 5m, alertname: K7dDaemonDown, exp_alerts: []}
+
+  # --- K7StoragePoolFilling ----------------------------------------------------
+  - name: K7StoragePoolFilling fires per pool over its threshold
+    interval: 1m
+    input_series:
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="thinpool_data", kind="used"}', values: '900x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="thinpool_data", kind="size"}', values: '1000x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="thinpool_metadata", kind="used"}', values: '50x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="thinpool_metadata", kind="size"}', values: '100x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n2", pool="thinpool_metadata", kind="used"}', values: '75x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n2", pool="thinpool_metadata", kind="size"}', values: '100x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="k7d_disks", kind="used"}', values: '90x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="k7d_disks", kind="size"}', values: '100x20'}
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: K7StoragePoolFilling
+        exp_alerts:
+          - exp_labels: {job: k7-agent, instance: n1, pool: thinpool_data, severity: warning}
+            exp_annotations:
+              summary: thinpool_data on n1 is 90% full.
+              runbook_url: &pool_runbook https://github.com/Katakate/k7/blob/main/docs/runbooks/K7StoragePoolFilling.md
+          - exp_labels: {job: k7-agent, instance: n2, pool: thinpool_metadata, severity: warning}
+            exp_annotations:
+              summary: thinpool_metadata on n2 is 75% full.
+              runbook_url: *pool_runbook
+          - exp_labels: {job: k7-agent, instance: n1, pool: k7d_disks, severity: warning}
+            exp_annotations:
+              summary: k7d_disks on n1 is 90% full.
+              runbook_url: *pool_runbook
+  - name: K7StoragePoolFilling stays quiet under every threshold
+    interval: 1m
+    input_series:
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="thinpool_data", kind="used"}', values: '790x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="thinpool_data", kind="size"}', values: '1000x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="thinpool_metadata", kind="used"}', values: '69x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="thinpool_metadata", kind="size"}', values: '100x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="k7d_disks", kind="used"}', values: '84x20'}
+      - {series: 'k7_storage_pool_bytes{job="k7-agent", instance="n1", pool="k7d_disks", kind="size"}', values: '100x20'}
+    alert_rule_test:
+      - {eval_time: 15m, alertname: K7StoragePoolFilling, exp_alerts: []}
+
+  # --- K7StorageReportStale ----------------------------------------------------
+  - name: K7StorageReportStale fires past 90s
+    interval: 1m
+    input_series:
+      - {series: 'k7_storage_report_age_seconds{job="k7-agent", instance="n1"}', values: '200x10'}
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: K7StorageReportStale
+        exp_alerts:
+          - exp_labels: {job: k7-agent, instance: n1, severity: warning}
+            exp_annotations:
+              summary: /run/k7/storage.json on n1 is 3m 20s old.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7StorageReportStale.md
+  - name: K7StorageReportStale stays quiet while the timer runs
+    interval: 1m
+    input_series:
+      - {series: 'k7_storage_report_age_seconds{job="k7-agent", instance="n1"}', values: '30x10'}
+    alert_rule_test:
+      - {eval_time: 7m, alertname: K7StorageReportStale, exp_alerts: []}
+
+  # --- K7SnapshotGCFailing -----------------------------------------------------
+  - name: K7SnapshotGCFailing fires on a failed GC Job
+    interval: 1m
+    input_series:
+      - {series: 'kube_job_status_failed{job="kube-state-metrics", namespace="kube-system", job_name="k7-snapshot-gc-29000000"}', values: '1x5'}
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: K7SnapshotGCFailing
+        exp_alerts:
+          - exp_labels: {job: kube-state-metrics, namespace: kube-system, job_name: k7-snapshot-gc-29000000, severity: warning}
+            exp_annotations:
+              summary: Snapshot GC Job kube-system/k7-snapshot-gc-29000000 failed.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7SnapshotGCFailing.md
+  - name: K7SnapshotGCFailing ignores successful runs and other Jobs
+    interval: 1m
+    input_series:
+      - {series: 'kube_job_status_failed{job="kube-state-metrics", namespace="kube-system", job_name="k7-snapshot-gc-29000000"}', values: '0x5'}
+      - {series: 'kube_job_status_failed{job="kube-state-metrics", namespace="kube-system", job_name="unrelated-job"}', values: '1x5'}
+    alert_rule_test:
+      - {eval_time: 1m, alertname: K7SnapshotGCFailing, exp_alerts: []}
+
+  # --- K7UsageSpoolOverflow ----------------------------------------------------
+  - name: K7UsageSpoolOverflow fires when events are dropped
+    interval: 1m
+    input_series:
+      - {series: 'k7_usage_events_dropped_total{job="k7-agent", instance="10.42.0.10:9464"}', values: '0 0 0 5 5 5 5'}
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: K7UsageSpoolOverflow
+        exp_alerts:
+          - exp_labels: {job: k7-agent, instance: '10.42.0.10:9464', severity: warning}
+            exp_annotations:
+              summary: k7 dropped usage events in the last 10m (metering spool full).
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7UsageSpoolOverflow.md
+  - name: K7UsageSpoolOverflow stays quiet without new drops
+    interval: 1m
+    input_series:
+      - {series: 'k7_usage_events_dropped_total{job="k7-agent", instance="10.42.0.10:9464"}', values: '5x20'}
+    alert_rule_test:
+      - {eval_time: 15m, alertname: K7UsageSpoolOverflow, exp_alerts: []}
+
+  # --- K7UsageSinkStopped ------------------------------------------------------
+  - name: K7UsageSinkStopped fires once a sink stops on a 4xx
+    interval: 1m
+    input_series:
+      - {series: 'k7_usage_sink_stopped{job="k7-agent", instance="10.42.0.10:9464", sink="openmeter"}', values: '0 0 1 1 1'}
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: K7UsageSinkStopped
+        exp_alerts:
+          - exp_labels: {job: k7-agent, instance: '10.42.0.10:9464', sink: openmeter, severity: warning}
+            exp_annotations:
+              summary: Usage sink openmeter on 10.42.0.10:9464 stopped on a 4xx; its events wait in the spool.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7UsageSinkStopped.md
+  - name: K7UsageSinkStopped stays quiet while sinks deliver
+    interval: 1m
+    input_series:
+      - {series: 'k7_usage_sink_stopped{job="k7-agent", instance="10.42.0.10:9464", sink="openmeter"}', values: '0x10'}
+    alert_rule_test:
+      - {eval_time: 10m, alertname: K7UsageSinkStopped, exp_alerts: []}
+
+  # --- K7TLSCertExpiringSoon ---------------------------------------------------
+  - name: K7TLSCertExpiringSoon fires a week before expiry
+    interval: 1m
+    input_series:
+      - {series: 'k7_tls_cert_expiry_timestamp_seconds{job="k7-api", instance="10.42.0.10:9464", source="files"}', values: '604800x150'}
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: K7TLSCertExpiringSoon
+        exp_alerts:
+          - exp_labels: {job: k7-api, instance: '10.42.0.10:9464', source: files, severity: warning}
+            exp_annotations:
+              summary: The files certificate k7-api serves expires in 6d 22h 0m 0s.
+              runbook_url: https://github.com/Katakate/k7/blob/main/docs/runbooks/K7TLSCertExpiringSoon.md
+  - name: K7TLSCertExpiringSoon stays quiet with 60 days left
+    interval: 1m
+    input_series:
+      - {series: 'k7_tls_cert_expiry_timestamp_seconds{job="k7-api", instance="10.42.0.10:9464", source="acme"}', values: '5184000x150'}
+    alert_rule_test:
+      - {eval_time: 2h, alertname: K7TLSCertExpiringSoon, exp_alerts: []}

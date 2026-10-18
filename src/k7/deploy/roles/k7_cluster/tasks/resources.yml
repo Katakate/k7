@@ -1,0 +1,44 @@
+---
+- name: Fail if no kubeconfig was provided for cilium-cli and helm
+  ansible.builtin.fail:
+    msg: "k7_kubeconfig is not set; k7_k3s sets it, other distros must pass it."
+  when: k7_kubeconfig is not defined
+  tags: ['always']
+
+# Host-side `k7 --core` and the integration suite read these (k7.core.cluster_config);
+# the k7-api manifests set the same values as env. A chart cluster has no file.
+- name: Record cluster settings for host-side k7 tooling
+  ansible.builtin.copy:
+    dest: /etc/k7/config
+    mode: '0644'
+    content: |
+      K7_SYSTEM_NAMESPACE=kube-system
+      K7_EGRESS_MODE=full
+      K7_KQL_STORAGE_CLASS=longhorn
+      K7_KQL_SNAPSHOT_CLASS=longhorn
+      {% if k7_api_enabled | default(true) | bool %}
+      K7_API_MODE={{ k7_api_mode }}
+      {% endif %}
+  tags: ['k7', 'config']
+
+- name: Cilium and Hubble
+  ansible.builtin.import_tasks: cilium.yml
+
+- name: Node readiness, RuntimeClasses, backend labels
+  ansible.builtin.import_tasks: nodes.yml
+
+- name: Longhorn and VolumeSnapshot CRDs
+  ansible.builtin.import_tasks: longhorn.yml
+
+- name: Local image builds (--api-image / --node-installer-image local)
+  ansible.builtin.import_tasks: local_images.yml
+
+- name: OpenEBS LVM, k7-api TLS and manifests
+  ansible.builtin.import_tasks: api.yml
+
+- name: Node-installer stack for POST /api/v1/install
+  ansible.builtin.import_tasks: node_installer.yml
+
+- name: Monitoring stack, K7 dashboards and alerts (--monitoring)
+  ansible.builtin.import_tasks: monitoring.yml
+  when: k7_monitoring | bool

@@ -1,0 +1,8 @@
+---
+# Proven by `k7 install`.
+k7_containerd_socket: /run/k3s/containerd/containerd.sock
+k7_containerd_config_mode: k3s-template
+k7_containerd_config_path: /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
+k7_containerd_service: "{{ 'k3s' if k7_node_role == 'server' else 'k3s-agent' }}"
+k7_containerd_root: /var/lib/rancher/k3s/agent/containerd
+k7_kubectl: k3s kubectl

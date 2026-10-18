@@ -1,0 +1,90 @@
+---
+# Undo node prep on one node (k7-node-installer cleanup mode).
+# Labels and the running-sandbox refusal are the installer entrypoint's job.
+# Disks are kept unless k7_cleanup_wipe_disks=true. Runtime binaries under
+# /opt/kata, /opt/k7d and /usr/local/bin stay: without the containerd
+# handlers and units nothing runs them.
+- name: Require a supported k7_distro
+  ansible.builtin.fail:
+    msg: "k7_distro={{ k7_distro | default('<unset>') }}; allowed: {{ k7_adapter_distros }}"
+  when: k7_distro is not defined or k7_distro not in k7_adapter_distros
+
+- name: Load the distro adapter for k7_distro={{ k7_distro }}
+  ansible.builtin.include_vars:
+    file: "{{ k7_distro }}.yml"
+
+- name: Compute the node role for the containerd service name
+  ansible.builtin.set_fact:
+    k7_node_role: "{{ 'server' if inventory_hostname in (groups['k7_servers'] | default([])) else 'agent' }}"
+
+- name: Stop and disable k7 systemd units
+  ansible.builtin.shell: |
+    set -eu
+    for u in k7d.service k7-vmm-reaper.timer k7-vmm-reaper.service k7-storage-report.timer k7-storage-report.service; do
+      if systemctl cat "$u" >/dev/null 2>&1; then
+        systemctl disable --now "$u"
+        echo "disabled $u"
+      fi
+    done
+  register: k7_cleanup_units
+  changed_when: "'disabled' in k7_cleanup_units.stdout"
+
+- name: Remove k7 unit files, node config and the kata shim link
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/k7d.service
+    - /etc/systemd/system/k7-vmm-reaper.service
+    - /etc/systemd/system/k7-vmm-reaper.timer
+    - /etc/systemd/system/k7-storage-report.service
+    - /etc/systemd/system/k7-storage-report.timer
+    - /run/k7/storage.json
+    - /usr/local/bin/k7-vmm-reaper.sh
+    - /usr/local/bin/k7-kata-jailer
+    - /usr/local/bin/containerd-shim-kata-v2
+    - /etc/k7/backend
+    - /etc/k7/k7d_version
+    - /etc/k7/containerd_socket
+    - /etc/k7/config
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Remove the k7 containerd config ({{ k7_containerd_config_mode }})
+  ansible.builtin.file:
+    path: "{{ k7_containerd_config_path }}"
+    state: absent
+  register: k7_cleanup_containerd
+
+- name: Restart the containerd service without the k7 runtime handlers
+  ansible.builtin.systemd:
+    name: "{{ k7_containerd_service }}"
+    state: restarted
+  async: 300
+  poll: 0
+  when: k7_cleanup_containerd.changed
+
+- name: Wait for the containerd socket
+  ansible.builtin.wait_for:
+    path: "{{ k7_containerd_socket }}"
+    state: present
+    timeout: 120
+
+- name: Unmount and remove the k7d XFS disks image
+  ansible.builtin.shell: |
+    set -eu
+    if mountpoint -q /var/lib/k7d/disks; then umount /var/lib/k7d/disks; fi
+    sed -i '\|^/var/lib/k7d/disks.img |d' /etc/fstab
+    rm -f /var/lib/k7d/disks.img
+  when: k7_cleanup_wipe_disks | bool
+  changed_when: true
+
+- name: Remove the kfd LVM volume group and its k7-tagged PVs
+  ansible.builtin.shell: |
+    set -eu
+    if vgs kata-vg >/dev/null 2>&1; then vgremove -y kata-vg; fi
+    for pv in $(pvs --noheadings -o pv_name @k7 2>/dev/null); do pvremove -y "$pv"; done
+  when: k7_cleanup_wipe_disks | bool
+  changed_when: true

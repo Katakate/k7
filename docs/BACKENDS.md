@@ -15,7 +15,7 @@ not kfd.
 | VMM | Firecracker via Kata Containers | QEMU via Kata Containers | [k7d](https://github.com/katakate/k7d) in-process rust-vmm | Same k7d daemon; stock Firecracker under the stock jailer |
 | containerd RuntimeClass | `kata` | `kata-qemu` | `k7` | `k7-fc` |
 | Rootfs / storage | devmapper LVM thin-pool (needs a spare raw disk) | overlayfs + Longhorn PVC mounted at `/mnt/state` | cached erofs images on virtio-blk, guest tmpfs upper, reflink-XFS volume images | same as k7d (erofs/scratch virtio-blk; **no virtiofs / hostPath**) |
-| Named snapshots (`k7 snapshot`) | ✗ | ✅ Longhorn VolumeSnapshot (disk-only, crash-consistent) | ✗ by design — see below | ✗ (same as k7d) |
+| Named snapshots (`k7 snapshot`) | ✗ rejected up front (node-local devmapper root) | ✅ Longhorn VolumeSnapshot (disk-only, crash-consistent) | ✗ not yet exposed by K7 — see below | ✗ (same as k7d) |
 | `k7 fork` | ✗ | disk clone: snapshot → new PVC → cold boot | **warm fork: CoW disk *and* memory of the live VM** | same daemon socket / `fork-source-*` annotations |
 | `k7 pause` / `resume` | scale to 0/1 (state lost) | scale to 0/1, disk persists on the PVC | **VM frozen in place: vCPUs stop, memory stays** | same `/run/k7d/k7d.sock` path |
 | `k7 restore` | ✗ | ✅ boot a new sandbox from any named snapshot | ✗ (fork the live sandbox instead) | ✗ |
@@ -90,7 +90,9 @@ The Ansible playbook:
    `/usr/local/share/k7d/docker` or `/root/k7d/guest/docker/payload`); an
    older k7d fails loudly.
 4. registers the `k7` runtime in the k3s containerd template **with**
-   `pod_annotations = ["k7d.katakate.org/*"]` and **without** a `BinaryName`
+   `pod_annotations` listing only the k7d keys k7 sets (`docker`,
+   `docker-disk`, `fork-source-cluster`, `fork-source-vm`; SECURITY.md
+   "Runtime annotations") and **without** a `BinaryName`
    option (containerd resolves the shim from
    `runtime_type = "io.containerd.k7.v1"`), restarts k3s, and creates
    RuntimeClass `k7`;
@@ -155,20 +157,22 @@ Properties and limits (fail loudly, never silently):
   cross-node fork is k7d's M12 roadmap item).
 - If the fork pod is ever restarted by Kubernetes it re-forks from the (then
   current) source — a fork is a live branch, not a stored artifact.
-- `k7 snapshot`/`k7 restore` are rejected on k7d: named, storable snapshots
-  are a Longhorn/kql feature. k7d has its own richer VM snapshot **trees**
-  (fork/rollback/suspend of whole VM states, including multi-VM clusters)
-  driven through the k7d daemon API — see the
-  [k7d project](https://github.com/katakate/k7d). Whole-cluster fork
-  (forking an inner k8s cluster of VMs as one unit) is deliberately a
-  k7d-level feature, not a k7 verb.
+- `k7 snapshot`, `k7 pause --snapshot`, `k7 fork --snapshot` and
+  `k7 restore` are rejected on k7d / k7d-fc: K7 does not expose k7d
+  snapshots yet. Named disk snapshots and restore are kql only. Warm fork
+  and in-place pause/resume are available. Whole-cluster fork (forking
+  an inner k8s cluster of VMs as one unit) is deliberately a k7d-level
+  feature, not a k7 verb.
+- kfd rejects `k7 snapshot create` and `k7 pause --snapshot` before
+  touching the cluster: its root is a node-local devmapper volume with no
+  PVC to snapshot. Use kql for durable disk snapshots.
 
 ### k7d VM ops work on any node (per-node k7-agent)
 
 k7d pause/resume/fork need three things that only exist **on the node
 hosting the sandbox**: the k7d daemon socket (`/run/k7d/k7d.sock`), the k3s
 containerd socket, and `crictl`. This is handled by the `k7-agent`
-DaemonSet (kube-system, same `k7-api:local` image running
+DaemonSet (kube-system, same `k7-api` image running
 `k7.api.agent:app`), so VM ops work **through the API for a sandbox on any
 node**:
 
@@ -193,7 +197,7 @@ node**:
 
 k7d is one daemon per node. Namespace scoping on API keys does not stop
 two tenants sharing that daemon. Pin a tenant with
-`k7 generate-api-key tenant-a -n tenant-a --node <node>` so creates
+`k7 generate-api-key tenant-a --role user --tenant acme --node <node>` so creates
 cannot *choose* another node. `<node>` is the Kubernetes Node name
 (`k7 nodes list` / `kubectl get nodes`) — the Linux hostname K3s
 registered. The pin is a `nodeSelector` on `kubernetes.io/hostname`
@@ -201,7 +205,18 @@ registered. The pin is a `nodeSelector` on `kubernetes.io/hostname`
 `k7_backends` only stamps `k7.katakate.org/backend-*` at install.
 To keep **other** sandboxes off that node, also run
 `k7 nodes dedicate <node> --tenant <id>` (label + NoSchedule taint
-`k7.katakate.org/tenant`). See `SECURITY.md`.
+`k7.katakate.org/tenant`). A Tenant's sandboxes land only on its
+`spec.nodes`, without a pin. See `SECURITY.md`.
+
+Per-VM tenant limits, by backend. "400" means a create under
+a tenant with that limit is refused, never run unlimited:
+
+| Limit | kfd | kql | k7d / k7d-fc |
+|---|---|---|---|
+| `network.egressBps` / `ingressBps` | Firecracker rate limiter | tc on the qemu tap | 400 |
+| `diskIO` | 400 | 400 | 400 |
+| `disk` quota, `maxSandboxSize.disk` | 10 GB root + PVCs | root (and docker) PVCs | 400 |
+| `vcpu`, `memory` quota | container limits | container limits | container limits |
 
 kql pause/resume/fork have none of these constraints (they are pure
 Kubernetes/Longhorn operations) and work through the API for any node.
@@ -247,6 +262,18 @@ CDN-backed registries. The install also sets Cilium `dnsProxy.minTtl=3600`
 so clients that cache a resolved IP longer than the CDN's 30–60s DNS TTL
 (dockerd's blob downloader does) keep their learned FQDN→IP allowance for an
 hour.
+
+DNS in a whitelist sandbox:
+- With domain entries, the sandbox resolves only those names. Cilium's DNS
+  proxy answers every other query with NXDOMAIN and never forwards it, so a
+  program that resolves a name it may not reach now fails at the lookup
+  instead of at connect.
+- The install sets `dnsProxy.dnsRejectResponseCode=nameError`; the default
+  REFUSED makes musl (Alpine) abandon the `ndots:5` search list on its first
+  `<name>.<ns>.svc.cluster.local` candidate. The chart's pre-install hook
+  refuses a Cilium without it.
+- In-cluster names (`*.svc.cluster.local`) resolve only if allowlisted.
+- CIDR-only and block-all sandboxes have no DNS.
 
 ## Ingress
 
@@ -459,6 +486,36 @@ A `Policy denied DROPPED` verdict with the destination still labelled
 the learned IP expired). `cilium fqdn cache list` shows what Cilium
 learned; `cilium ip list` shows which IPs carry an `fqdn:` identity.
 
+## CoreDNS upstream resolvers
+
+By default CoreDNS forwards to the node's own resolvers. The k3s Corefile
+says `forward . /etc/resolv.conf`, and the kubelet fills that file from
+k3s's `--resolv-conf`, which the playbook points at systemd-resolved's
+upstream list. If the provider's resolvers degrade, every pod's lookups fail
+with them: image pulls, FQDN egress, and `POST /api/v1/sandboxes`, which then
+returns **503** "Cannot resolve registry host".
+
+Set `k7_dns_upstreams` to pin CoreDNS's resolvers instead. In the inventory
+use a YAML list or a comma-separated string under `[k7_cluster:vars]`, or
+pass `k7 install --dns-upstream 1.1.1.1 --dns-upstream 9.9.9.9`:
+
+- **Accepted values:** 1 to 3 IPv4 addresses. The kubelet passes at most 3
+  nameservers to CoreDNS and silently drops the rest.
+- **Refused values:** IPv6 is refused, because the pod network is IPv4-only
+  and CoreDNS could not reach it. So are 0.x and 127.x, which would point
+  CoreDNS back at itself. An invalid entry fails the install before any host
+  is touched.
+- **How it's applied:** the playbook writes `/etc/k7/resolv.conf` and sets
+  `K3S_RESOLV_CONF` in the k3s unit's env file. Re-running the install
+  converges an existing cluster: k3s restarts, and CoreDNS is recreated
+  only if a node's file changed. Removing the variable restores the host's
+  resolvers.
+- **Side effect:** every `dnsPolicy: Default` pod gets the same resolvers,
+  not just CoreDNS.
+
+The Helm chart does not manage CoreDNS; your Kubernetes distribution owns it
+(on RKE2, the `rke2-coredns` HelmChartConfig). Configure upstreams there.
+
 ## Disk pool sizing (kfd + k7d)
 
 Both node-local storage pools have fixed sizes chosen at install
@@ -500,20 +557,23 @@ like `2Gi` / `4096Mi`):
 
 | Backend | Mechanism |
 |---|---|
-| **kfd** | Kata stamps `io.katacontainers.config.hypervisor.default_memory` (MiB). containerd forwards `io.katacontainers.*` (`pod_annotations` on `runtimes.kata`) and `configuration-fc.toml` allowlists `default_memory` (before that the annotation was silently ignored and the VM stayed at the 2048 MiB default). |
+| **kfd** | Kata stamps `io.katacontainers.config.hypervisor.default_memory` (MiB). containerd forwards exactly that key (`pod_annotations` on `runtimes.kata`) and `configuration-fc.toml` allowlists `default_memory` (before that the annotation was silently ignored and the VM stayed at the 2048 MiB default). |
 | **kql** | Same annotation path via `runtimes.kata-qemu` + `configuration-qemu.toml`. |
 | **k7d** | No Kata annotation — the k7d shim sizes the VM straight from the pod's CRI CPU/memory limits. |
 
 ## Known issues
 
-- **kata-fc VMM leak under churn**: kata 3.24.0 with the jailer records the
-  `--daemonize`d jailer's PID, so its SIGTERM fallback at pod deletion
-  signals a dead PID. When the graceful in-guest shutdown fails (dead agent
-  under parallel churn), the firecracker process is orphaned and spins at
-  100% CPU. `k7 install` deploys a per-node systemd timer
-  (`k7-vmm-reaper.timer`, 1-minute cadence) that kills VMM processes whose
-  kata shim is gone, and the integration suite asserts zero orphans cluster
-  wide after teardown (`tests/integration/test_zz_leaks.py`).
+- **kata-fc VMM leak on delete — FIXED**: kata 3.24.0 always passes
+  `jailer --daemonize`. The jailer double-forks, the shim records the
+  parent PID (already a zombie), and `fcEnd`'s SIGTERM never reaches
+  Firecracker. Every kfd delete left `firecracker-v1.*` (comm truncated
+  to `firecracker-v1.`) reparented to init. `k7 install` points Kata at
+  `/usr/local/bin/k7-kata-jailer`, which drops `--daemonize` and execs
+  the real jailer in the same PID, so the shim's SIGTERM kills the VMM.
+  The reaper timer remains a backstop and matches that versioned comm,
+  but only a 32-hex `--id` (k7d-fc's `vm-*` / `fcf-*` VMs are left alone).
+  `tests/integration/test_zz_leaks.py` counts those processes and fails
+  if one outlives its sandbox.
 - **kql docker-in-VM wedge under heavy fsync + replicas ≥ 2 — FIXED**:
   kata's default single-threaded virtiofsd serialized all virtio-fs IO;
   under a sustained fsync burst against an r≥2 Longhorn volume the

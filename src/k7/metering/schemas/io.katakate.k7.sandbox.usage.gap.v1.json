@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://katakate.org/schemas/io.katakate.k7.sandbox.usage.gap.v1.json",
+  "title": "io.katakate.k7.sandbox.usage.gap.v1",
+  "description": "CloudEvents 1.0 envelope. A window no sampler observed (agent restart, metering start, storage leader change). Never filled in. v1 is frozen: a changed field is a new vN type.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "type",
+    "source",
+    "subject",
+    "id",
+    "time",
+    "datacontenttype",
+    "data"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "specversion": {
+      "const": "1.0"
+    },
+    "type": {
+      "const": "io.katakate.k7.sandbox.usage.gap.v1"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^k7://[0-9a-f-]{36}/(node/[^/]+|storage)$"
+    },
+    "subject": {
+      "type": "string",
+      "minLength": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "datacontenttype": {
+      "const": "application/json"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "api_key_id",
+        "backend",
+        "gap_end",
+        "gap_start",
+        "meter",
+        "namespace",
+        "reason",
+        "sandbox",
+        "sandbox_uid",
+        "tenant"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "meter": {
+          "enum": [
+            "sandbox",
+            "egress",
+            "disk",
+            "snapshot"
+          ]
+        },
+        "tenant": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sandbox": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sandbox_uid": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "api_key_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backend": {
+          "enum": [
+            "kata-firecracker-devmapper",
+            "kata-qemu-longhorn",
+            "k7d",
+            "k7d-fc",
+            null
+          ]
+        },
+        "gap_start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "gap_end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reason": {
+          "enum": [
+            "agent-restart",
+            "metering-start",
+            "leader-change"
+          ]
+        }
+      }
+    }
+  }
+}

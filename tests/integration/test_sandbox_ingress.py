@@ -17,16 +17,18 @@ from kubernetes_asyncio.client.exceptions import ApiException
 from k7.core.core import K7Core
 from k7.core.models import OperationResult, SandboxConfig
 
+from .cluster import KUBECTL
+from .netprobe import reachable, verdict, wget
+
 pytestmark = pytest.mark.integration
 
-_K3S = "/usr/local/bin/k3s"
 _LOCAL_NODE = os.uname().nodename
 
 
 def _cilium_crd_present() -> bool:
     try:
         result = subprocess.run(
-            [_K3S, "kubectl", "get", "crd", "ciliumnetworkpolicies.cilium.io"],
+            [*KUBECTL, "get", "crd", "ciliumnetworkpolicies.cilium.io"],
             capture_output=True,
             text=True,
         )
@@ -48,7 +50,18 @@ async def _wait_ready(k7_core: K7Core, name: str, namespace: str, timeout: int =
         if any(s.name == name and s.ready == "True" for s in sandboxes):
             return
         await asyncio.sleep(3)
-    raise AssertionError(f"Sandbox {name} never became Ready within {timeout}s")
+    state = {
+        q: subprocess.run([*KUBECTL, *q.split()], capture_output=True, text=True).stdout
+        for q in (
+            f"-n {namespace} get pods,pvc -o wide",
+            "-n longhorn-system get volumes.longhorn.io -o wide",
+            f"-n {namespace} get events --sort-by=.lastTimestamp",
+        )
+    }
+    raise AssertionError(
+        f"Sandbox {name} never became Ready within {timeout}s\n"
+        + "\n".join(f"$ kubectl {q}\n{out[-3000:]}" for q, out in state.items())
+    )
 
 
 async def _read_netpol(k7_core: K7Core, name: str, namespace: str):
@@ -69,7 +82,7 @@ async def _read_cnp(k7_core: K7Core, name: str, namespace: str):
 
 def _deployment_exists(name: str, namespace: str) -> bool:
     result = subprocess.run(
-        [_K3S, "kubectl", "-n", namespace, "get", "deployment", name],
+        [*KUBECTL, "-n", namespace, "get", "deployment", name],
         capture_output=True,
         text=True,
     )
@@ -99,25 +112,20 @@ async def _serve(k7_core: K7Core, name: str, namespace: str, port: int) -> None:
         f"netstat -ltn | grep ':{port} '"
     )
     result = await k7_core.exec_command(name, setup, namespace=namespace)
-    assert f":{port}" in result.stdout, f"listener on {port} never bound: {result.stdout!r} {result.stderr!r}"
+    assert result.exit_code == 0 and f":{port}" in result.stdout, (
+        f"listener on {port} never bound: exit={result.exit_code} {result.stdout!r} {result.stderr!r}"
+    )
 
 
 async def _probe(k7_core: K7Core, client_sb: str, target_ip: str, port: int, namespace: str) -> str:
-    """Return "OK" or "BLOCKED" for an HTTP GET from ``client_sb`` — the
-    `&& echo OK || echo BLOCKED` sentinel style `test_cilium.py` uses, because a
-    policy drop shows up as a hang, not a refusal.
+    """Return "OK" or "BLOCKED" for an HTTP GET from ``client_sb``. A policy
+    drop shows up as a hang, not a refusal.
 
     That distinction is the debugging tool when one of these tests fails:
     "connection refused" in `wget`'s output means the policy passed the packet
     and the listener is the problem, a timeout means the policy dropped it.
     """
-    result = await k7_core.exec_command(
-        client_sb,
-        f"wget -q -T 6 -O /dev/null http://{target_ip}:{port}/ && echo OK || echo BLOCKED",
-        namespace=namespace,
-    )
-    lines = result.stdout.strip().splitlines()
-    return lines[-1] if lines else f"NO-OUTPUT({result.stderr!r})"
+    return await verdict(k7_core, client_sb, wget(f"http://{target_ip}:{port}/", 6), namespace)
 
 
 async def _pod_ip(k7_core: K7Core, name: str, namespace: str) -> str:
@@ -167,23 +175,11 @@ class TestForkInheritsNetworkPolicy:
 
             await _wait_ready(k7_core, fork, test_namespace)
 
-            allowed = await k7_core.exec_command(
-                fork,
-                "wget -q -T 20 -O /dev/null https://example.com/ && echo OK || echo BLOCKED",
-                namespace=test_namespace,
+            assert await reachable(k7_core, fork, wget("https://example.com/", 20), test_namespace), (
+                "whitelisted domain unreachable from fork"
             )
-            assert "OK" in allowed.stdout, (
-                f"whitelisted domain unreachable from fork: stdout={allowed.stdout!r} stderr={allowed.stderr!r}"
-            )
-
-            blocked = await k7_core.exec_command(
-                fork,
-                "wget -q -T 8 -O /dev/null https://www.iana.org/ && echo OK || echo BLOCKED",
-                namespace=test_namespace,
-            )
-            assert "BLOCKED" in blocked.stdout, (
-                f"fork reached a non-whitelisted domain — it inherited no egress policy "
-                f"stdout={blocked.stdout!r} stderr={blocked.stderr!r}"
+            assert not await reachable(k7_core, fork, wget("https://www.iana.org/", 8), test_namespace), (
+                "fork reached a non-whitelisted domain — it inherited no egress policy"
             )
         finally:
             await k7_core.delete_sandbox(fork, namespace=test_namespace)
@@ -486,7 +482,7 @@ class TestSandboxExpose:
             await k7_core.delete_sandbox(name, namespace=test_namespace)
 
         remaining = subprocess.run(
-            [_K3S, "kubectl", "-n", test_namespace, "get", "svc", "-o", "name"],
+            [*KUBECTL, "-n", test_namespace, "get", "svc", "-o", "name"],
             capture_output=True,
             text=True,
         )

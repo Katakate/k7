@@ -1,0 +1,300 @@
+---
+# ── Longhorn installation (cluster-wide; needs >=1 kata-qemu-longhorn node) ────
+- name: Set fact for any longhorn-capable node in cluster
+  ansible.builtin.set_fact:
+    cluster_has_longhorn: >-
+      {{
+        groups['k7_cluster']
+        | map('extract', hostvars, 'k7_backends_list')
+        | flatten | unique
+        | intersect(['kata-qemu-longhorn'])
+        | length > 0
+      }}
+
+- name: Download Longhorn manifest
+  ansible.builtin.get_url:
+    url: https://raw.githubusercontent.com/longhorn/longhorn/{{ longhorn_version }}/deploy/longhorn.yaml
+    dest: /tmp/longhorn.yaml
+    checksum: "sha256:{{ longhorn_manifest_sha256 }}"
+    mode: '0644'
+    timeout: 60
+  register: longhorn_dl
+  retries: 5
+  delay: 10
+  until: longhorn_dl is success
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn']
+
+- name: Patch Longhorn manifest with custom replica count
+  ansible.builtin.replace:
+    path: /tmp/longhorn.yaml
+    regexp: 'numberOfReplicas: "3"'
+    replace: 'numberOfReplicas: "{{ longhorn_replicas_effective }}"'
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn']
+
+- name: Install Longhorn
+  ansible.builtin.command: "{{ k7_kubectl }} apply -f /tmp/longhorn.yaml"
+  register: longhorn_apply
+  changed_when: "'created' in longhorn_apply.stdout or 'configured' in longhorn_apply.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn']
+
+- name: Install CSI VolumeSnapshot CRDs (external-snapshotter)
+  ansible.builtin.shell: |
+    set -eu
+    {{ k7_kubectl }} apply -k https://github.com/kubernetes-csi/external-snapshotter//client/config/crd?ref={{ snapshotter_version }}
+  changed_when: true
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'snapshot']
+
+- name: Install snapshot-controller (external-snapshotter)
+  ansible.builtin.shell: |
+    set -eu
+    {{ k7_kubectl }} apply -k https://github.com/kubernetes-csi/external-snapshotter//deploy/kubernetes/snapshot-controller?ref={{ snapshotter_version }}
+  changed_when: true
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'snapshot']
+
+- name: Verify VolumeSnapshot CRDs exist
+  ansible.builtin.shell: |
+    set -eu
+    {{ k7_kubectl }} get crd volumesnapshots.snapshot.storage.k8s.io
+    {{ k7_kubectl }} get crd volumesnapshotcontents.snapshot.storage.k8s.io
+    {{ k7_kubectl }} get crd volumesnapshotclasses.snapshot.storage.k8s.io
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'snapshot']
+
+- name: Wait for snapshot-controller to be ready
+  ansible.builtin.shell: |
+    set -eu
+    {{ k7_kubectl }} -n kube-system rollout status deployment/snapshot-controller --timeout=120s
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'snapshot']
+
+- name: Ensure Longhorn VolumeSnapshotClass exists
+  ansible.builtin.shell: |
+    set -eu
+    cat <<'EOF' | {{ k7_kubectl }} apply -f -
+    apiVersion: snapshot.storage.k8s.io/v1
+    kind: VolumeSnapshotClass
+    metadata:
+      name: longhorn
+    driver: driver.longhorn.io
+    deletionPolicy: Delete
+    parameters:
+      type: snap
+    EOF
+  changed_when: true
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'snapshot']
+
+- name: Wait for Longhorn manager to be ready
+  ansible.builtin.command: "{{ k7_kubectl }} -n longhorn-system rollout status daemonset/longhorn-manager --timeout=300s"
+  retries: 5
+  delay: 15
+  register: longhorn_manager_status
+  until: longhorn_manager_status.rc == 0
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn']
+
+- name: Wait for Longhorn UI deployment to be ready
+  ansible.builtin.command: "{{ k7_kubectl }} -n longhorn-system rollout status deployment/longhorn-ui --timeout=300s"
+  retries: 5
+  delay: 15
+  register: longhorn_ui_status
+  until: longhorn_ui_status.rc == 0
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn']
+
+- name: Wait for Longhorn StorageClass to be created
+  ansible.builtin.command: "{{ k7_kubectl }} get storageclass longhorn"
+  retries: 20
+  delay: 10
+  register: longhorn_sc_check
+  until: longhorn_sc_check.rc == 0
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn']
+
+# Replace the upstream StorageClass with a topology-aware version:
+#   - WaitForFirstConsumer so PVC binding follows the pod's node
+#   - dataLocality=best-effort to keep one replica co-located with the pod
+# The Longhorn `longhorn-storageclass` ConfigMap is the source of truth —
+# longhorn-driver-deployer creates the StorageClass from it at startup. We
+# patch the ConfigMap, delete the existing SC, then force the deployer to
+# recreate it (volumeBindingMode and parameters are immutable on a SC).
+- name: Patch longhorn-storageclass ConfigMap with topology-aware StorageClass  # noqa: no-changed-when
+  ansible.builtin.shell: |
+    set -eu
+    cat <<EOF | {{ k7_kubectl }} apply -f -
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: longhorn-storageclass
+      namespace: longhorn-system
+      labels:
+        app.kubernetes.io/instance: longhorn
+        app.kubernetes.io/name: longhorn
+    data:
+      storageclass.yaml: |
+        kind: StorageClass
+        apiVersion: storage.k8s.io/v1
+        metadata:
+          name: longhorn
+          annotations:
+            storageclass.kubernetes.io/is-default-class: "true"
+        provisioner: driver.longhorn.io
+        allowVolumeExpansion: true
+        reclaimPolicy: "Delete"
+        volumeBindingMode: WaitForFirstConsumer
+        parameters:
+          numberOfReplicas: "{{ longhorn_replicas_effective }}"
+          staleReplicaTimeout: "2880"
+          fromBackup: ""
+          fsType: "ext4"
+          dataLocality: "best-effort"
+          unmapMarkSnapChainRemoved: "ignored"
+          disableRevisionCounter: "true"
+          dataEngine: "v1"
+          backupTargetName: "default"
+    EOF
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'topology']
+
+- name: Delete existing Longhorn StorageClass (immutable fields, will be recreated from ConfigMap)  # noqa: no-changed-when
+  ansible.builtin.command: "{{ k7_kubectl }} delete storageclass longhorn --ignore-not-found"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'topology']
+
+- name: Restart longhorn-driver-deployer to recreate StorageClass from updated ConfigMap  # noqa: no-changed-when
+  ansible.builtin.command: "{{ k7_kubectl }} -n longhorn-system rollout restart deployment/longhorn-driver-deployer"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'topology']
+
+- name: Wait for longhorn-driver-deployer rollout to complete  # noqa: no-changed-when
+  ansible.builtin.command: "{{ k7_kubectl }} -n longhorn-system rollout status deployment/longhorn-driver-deployer --timeout=120s"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'topology']
+
+- name: Wait for Longhorn StorageClass to be recreated with topology affinity
+  ansible.builtin.shell: |
+    set -eu
+    mode=$({{ k7_kubectl }} get storageclass longhorn -o jsonpath='{.volumeBindingMode}' 2>/dev/null || echo "")
+    [ "$mode" = "WaitForFirstConsumer" ]
+  register: sc_topology_check
+  retries: 30
+  delay: 5
+  until: sc_topology_check.rc == 0
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'topology']
+
+- name: Set Longhorn replica auto-balance to best-effort  # noqa: no-changed-when
+  ansible.builtin.shell: |
+    set -eu
+    cat <<EOF | {{ k7_kubectl }} apply -f -
+    apiVersion: longhorn.io/v1beta2
+    kind: Setting
+    metadata:
+      name: replica-auto-balance
+      namespace: longhorn-system
+    value: "best-effort"
+    EOF
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'topology']
+
+- name: Set Longhorn default data locality to best-effort  # noqa: no-changed-when
+  ansible.builtin.shell: |
+    set -eu
+    cat <<EOF | {{ k7_kubectl }} apply -f -
+    apiVersion: longhorn.io/v1beta2
+    kind: Setting
+    metadata:
+      name: default-data-locality
+      namespace: longhorn-system
+    value: "best-effort"
+    EOF
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn', 'topology']
+
+- name: Set Longhorn default data path
+  ansible.builtin.shell: |
+    set -eu
+    cat <<EOF | {{ k7_kubectl }} apply -f -
+    apiVersion: longhorn.io/v1beta2
+    kind: Setting
+    metadata:
+      name: default-data-path
+      namespace: longhorn-system
+    value: "{{ longhorn_data_path | default('/var/lib/longhorn') }}"
+    EOF
+  changed_when: true
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_longhorn
+  tags: ['longhorn']
+
+- name: Register extra disk with Longhorn (per-host)
+  ansible.builtin.shell: |
+    set -eu
+    cat <<EOF | {{ k7_kubectl }} apply -f -
+    apiVersion: longhorn.io/v1beta2
+    kind: Node
+    metadata:
+      name: {{ k7_k8s_node_name }}
+      namespace: longhorn-system
+    spec:
+      disks:
+        extra-disk:
+          path: "{{ longhorn_extra_disk }}"
+          allowScheduling: true
+          storageReserved: 0
+    EOF
+  changed_when: true
+  delegate_to: "{{ k7_first_master }}"
+  when:
+    - k7_has_longhorn
+    - longhorn_extra_disk is defined
+    - longhorn_extra_disk | length > 0
+  tags: ['longhorn']

@@ -15,7 +15,7 @@ def _install(args: list[str]):
     with patch("k7.cli.k7.K7Core") as core_cls:
         install = MagicMock(return_value=OperationResult(success=True, message="ok"))
         core_cls.return_value.install_node = install
-        result = runner.invoke(app, ["--core", "install", *args])
+        result = runner.invoke(app, ["--core", "install", "--api-mode", "development", *args])
     return result, install
 
 

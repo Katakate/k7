@@ -1,0 +1,41 @@
+# version = 3
+{{ template "base" . }}
+
+[plugins."io.containerd.snapshotter.v1.devmapper"]
+  pool_name       = "kata--vg-thin--pool"
+  root_path       = "/var/lib/rancher/k3s/agent/containerd/io.containerd.snapshotter.v1.devmapper"
+  base_image_size = "10GB"
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata]
+  runtime_type  = "io.containerd.kata.v2"
+  privileged_without_host_devices = true
+  snapshotter   = "devmapper"
+  pod_annotations = ["io.katacontainers.config.hypervisor.default_memory", "io.katacontainers.config.hypervisor.rx_rate_limiter_max_rate", "io.katacontainers.config.hypervisor.tx_rate_limiter_max_rate"]
+  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata.options]
+    BinaryName  = "/usr/local/bin/containerd-shim-kata-v2"
+    ConfigPath  = "/opt/kata/share/defaults/kata-containers/configuration-fc.toml"
+
+[plugins."io.containerd.snapshotter.v1.overlayfs"]
+  mount_options = ["nodev", "nosuid"]
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
+  runtime_type  = "io.containerd.kata.v2"
+  privileged_without_host_devices = true
+  snapshotter   = "overlayfs"
+  pod_annotations = ["io.katacontainers.config.hypervisor.default_memory", "io.katacontainers.config.hypervisor.rx_rate_limiter_max_rate", "io.katacontainers.config.hypervisor.tx_rate_limiter_max_rate"]
+  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu.options]
+    BinaryName  = "/usr/local/bin/containerd-shim-kata-v2"
+    ConfigPath  = "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+
+# k7d runtime: containerd resolves the shim binary from runtime_type
+# (io.containerd.k7.v1 -> containerd-shim-k7-v1). Do NOT add an
+# [options] BinaryName — it leaks into the cgroup path and breaks
+# shim startup. pod_annotations forwards only the k7d annotations
+# k7 sets into the sandbox OCI spec; the shim acts on others too
+# (cluster-id skips the pod netns, tree-* adopt/fork VMs).
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7]
+  runtime_type  = "io.containerd.k7.v1"
+  pod_annotations = ["k7d.katakate.org/docker", "k7d.katakate.org/docker-disk", "k7d.katakate.org/fork-source-cluster", "k7d.katakate.org/fork-source-vm"]
+  privileged_without_host_devices = true
+  snapshotter   = "overlayfs"
+

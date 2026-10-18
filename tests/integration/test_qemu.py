@@ -10,13 +10,15 @@ import pytest
 from k7.core.core import K7Core
 from k7.core.models import SandboxConfig
 
+from .cluster import KUBECTL
+
 pytestmark = [pytest.mark.integration, pytest.mark.qemu]
 
 
 def _kubectl_json(args: list[str]) -> str:
     """Run kubectl with JSON output and return stdout."""
     result = subprocess.run(
-        ["k3s", "kubectl", *args],
+        [*KUBECTL, *args],
         capture_output=True,
         text=True,
         check=True,
@@ -34,8 +36,7 @@ def _wait_pod_ready(sandbox_name: str, namespace: str, timeout: int = 300) -> No
     while time.time() < deadline:
         result = subprocess.run(
             [
-                "k3s",
-                "kubectl",
+                *KUBECTL,
                 "get",
                 "pods",
                 "-n",
@@ -62,15 +63,26 @@ def _wait_pod_ready(sandbox_name: str, namespace: str, timeout: int = 300) -> No
                 ):
                     return
         time.sleep(2)
-    raise TimeoutError(f"Pod for {sandbox_name} not Ready within {timeout}s")
+    events = subprocess.run(
+        [*KUBECTL, "get", "events", "-n", namespace, "--sort-by=.lastTimestamp"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    raise TimeoutError(f"Pod for {sandbox_name} not Ready within {timeout}s; events:\n{events[-3000:]}")
+
+
+# A fork is a Longhorn clone of the source volume plus a cold kata-qemu boot.
+# On a 3-node r=3 cluster the clone hydrates a replica on every node, and the
+# first fork after an install also pulls the Longhorn engine image on each one
+# (>240 s cold, ~150 s warm measured). Every fork wait in this file uses this.
+_FORK_READY_TIMEOUT = 600
 
 
 def _delete_snapshot(name: str, namespace: str) -> None:
     """Delete a VolumeSnapshot without hanging on CSI finalizers."""
     subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "patch",
             "volumesnapshot",
             name,
@@ -86,8 +98,7 @@ def _delete_snapshot(name: str, namespace: str) -> None:
     )
     subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "delete",
             "volumesnapshot",
             name,
@@ -106,7 +117,7 @@ def _wait_snapshot_gone(name: str, namespace: str, timeout: int = 60) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         out = subprocess.run(
-            ["k3s", "kubectl", "get", "volumesnapshot", name, "-n", namespace, "-o", "name"],
+            [*KUBECTL, "get", "volumesnapshot", name, "-n", namespace, "-o", "name"],
             capture_output=True,
             text=True,
             check=False,
@@ -118,11 +129,38 @@ def _wait_snapshot_gone(name: str, namespace: str, timeout: int = 60) -> None:
     raise TimeoutError(f"VolumeSnapshot {name} still present after {timeout}s")
 
 
+def assert_clone_copied(pvc: str, namespace: str) -> None:
+    """A Longhorn-backed clone PVC has ``cloneStatus.state == completed`` (other CSI
+    drivers only bind once the content is in place, so there is nothing to check)."""
+    spec = json.loads(_kubectl_json(["get", "pvc", pvc, "-n", namespace, "-o", "json"]))["spec"]
+    sc = _kubectl_json(["get", "storageclass", spec["storageClassName"], "-o", "jsonpath={.provisioner}"])
+    if sc != "driver.longhorn.io":
+        return
+    vol = json.loads(
+        _kubectl_json(["get", "volumes.longhorn.io", spec["volumeName"], "-n", "longhorn-system", "-o", "json"])
+    )
+    state = ((vol.get("status") or {}).get("cloneStatus") or {}).get("state")
+    assert state == "completed", f"PVC {namespace}/{pvc} returned by fork with Longhorn clone state {state!r}"
+
+
+def assert_fork_snapshot_released(source: str, namespace: str, timeout: int = 120) -> None:
+    """The auto ``<source>-fork-<ts>`` snapshot is deleted once the clone is copied."""
+    deadline = time.time() + timeout
+    left: list[str] = []
+    while time.time() < deadline:
+        names = _kubectl_json(["get", "volumesnapshot", "-n", namespace, "-o", "jsonpath={.items[*].metadata.name}"])
+        left = [n for n in names.split() if n.startswith(f"{source}-fork-")]
+        if not left:
+            return
+        time.sleep(2)
+    raise AssertionError(f"auto fork snapshot(s) not released within {timeout}s: {left}")
+
+
 class TestQemuLonghornBackend:
     async def test_root_pvc_created(self, k7_core: K7Core, test_namespace: str):
         cfg = SandboxConfig(
             name="integ-ql",
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -141,7 +179,7 @@ class TestQemuLonghornBackend:
     async def test_runtime_class_kata_qemu(self, k7_core: K7Core, test_namespace: str):
         cfg = SandboxConfig(
             name="integ-ql-rt",
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -184,7 +222,7 @@ class TestQemuLonghornBackend:
         pod runs and the guest VM actually got the larger memory size."""
         cfg = SandboxConfig(
             name="integ-ql-mem",
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
             limits={"memory": "3Gi", "cpu": "1"},
@@ -216,7 +254,7 @@ class TestSnapshotPauseResumeFork:
         name = "integ-cold"
         cfg = SandboxConfig(
             name=name,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -236,7 +274,7 @@ class TestSnapshotPauseResumeFork:
         name = "integ-snap"
         cfg = SandboxConfig(
             name=name,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -273,7 +311,7 @@ class TestSnapshotPauseResumeFork:
         name = "integ-pr"
         cfg = SandboxConfig(
             name=name,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -345,7 +383,7 @@ class TestSnapshotPauseResumeFork:
         fork_name = "integ-fork-dst"
         cfg = SandboxConfig(
             name=source,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -361,17 +399,9 @@ class TestSnapshotPauseResumeFork:
             fork_result = await k7_core.fork_sandbox(source, fork_name, namespace=test_namespace)
             assert fork_result.success, f"fork failed: {fork_result.error}"
 
-            _wait_pod_ready(fork_name, test_namespace, timeout=600)
+            _wait_pod_ready(fork_name, test_namespace, timeout=_FORK_READY_TIMEOUT)
             fork_elapsed = time.time() - t0
             print(f"[timing] fork total in {fork_elapsed:.2f}s")
-            # 600s bound: on a 3-node Longhorn r=3 cluster the
-            # fork's cloned volume hydrates replicas on all nodes, and the
-            # very FIRST fork after a fresh install additionally pulls the
-            # Longhorn engine image on every node plus the sandbox image on
-            # the fork's node (>240s observed cold; ~150s warm). The guard
-            # still catches a pathological full-byte-copy restore path,
-            # which takes far longer on real volumes.
-            assert fork_elapsed < 600, f"fork took {fork_elapsed:.2f}s (>600s)"
 
             exec_result = await k7_core.exec_command(
                 fork_name,
@@ -384,13 +414,57 @@ class TestSnapshotPauseResumeFork:
             await k7_core.delete_sandbox(fork_name, namespace=test_namespace)
             await k7_core.delete_sandbox(source, namespace=test_namespace)
 
+    async def test_fork_returns_after_clone_copied_and_drops_auto_snapshot(self, k7_core: K7Core, test_namespace: str):
+        """fork_sandbox returns only once Longhorn finished copying the clone,
+        then deletes its auto-named snapshot (deleting it mid-copy corrupts the clone)."""
+        source, fork_name = "integ-clone-src", "integ-clone-dst"
+        cfg = SandboxConfig(name=source, image="alpine:3.20", namespace=test_namespace, backend="kata-qemu-longhorn")
+        result = await k7_core.create_sandbox(cfg)
+        assert result.success, f"create source failed: {result.error}"
+        try:
+            _wait_pod_ready(source, test_namespace)
+            fork_result = await k7_core.fork_sandbox(source, fork_name, namespace=test_namespace)
+            assert fork_result.success, f"fork failed: {fork_result.error}"
+            assert_clone_copied(k7_core._root_pvc_name(fork_name), test_namespace)
+            assert_fork_snapshot_released(source, test_namespace)
+            _wait_pod_ready(fork_name, test_namespace, timeout=_FORK_READY_TIMEOUT)
+        finally:
+            await k7_core.delete_sandbox(fork_name, namespace=test_namespace)
+            await k7_core.delete_sandbox(source, namespace=test_namespace)
+
+    async def test_public_snapshot_is_ready_when_create_returns(self, k7_core: K7Core, test_namespace: str):
+        """create_snapshot succeeds only once every VolumeSnapshot it made is readyToUse."""
+        name, snap = "integ-snap-ready", "integ-snap-ready-s1"
+        cfg = SandboxConfig(name=name, image="alpine:3.20", namespace=test_namespace, backend="kata-qemu-longhorn")
+        result = await k7_core.create_sandbox(cfg)
+        assert result.success, f"create failed: {result.error}"
+        try:
+            _wait_pod_ready(name, test_namespace)
+            created = await k7_core.create_snapshot(name, snap, namespace=test_namespace)
+            assert created.success, created.error
+            states = _kubectl_json(
+                [
+                    "get",
+                    "volumesnapshot",
+                    "-n",
+                    test_namespace,
+                    "-o",
+                    "jsonpath={range .items[*]}{.metadata.name}={.status.readyToUse} {end}",
+                ]
+            ).split()
+            mine = [s for s in states if s.startswith(snap)]
+            assert mine and all(s.endswith("=true") for s in mine), states
+        finally:
+            await k7_core.delete_snapshot(snap, namespace=test_namespace)
+            await k7_core.delete_sandbox(name, namespace=test_namespace)
+
     async def test_fork_independence(self, k7_core: K7Core, test_namespace: str):
         """Validates writes to fork don't affect source."""
         source = "integ-indep-src"
         fork_name = "integ-indep-dst"
         cfg = SandboxConfig(
             name=source,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -405,7 +479,7 @@ class TestSnapshotPauseResumeFork:
             fork_result = await k7_core.fork_sandbox(source, fork_name, namespace=test_namespace)
             assert fork_result.success, f"fork failed: {fork_result.error}"
 
-            _wait_pod_ready(fork_name, test_namespace, timeout=180)
+            _wait_pod_ready(fork_name, test_namespace, timeout=_FORK_READY_TIMEOUT)
 
             await k7_core.exec_command(
                 fork_name,
@@ -445,7 +519,7 @@ class TestSnapshotPauseResumeFork:
         name = "integ-leak"
         cfg = SandboxConfig(
             name=name,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -476,8 +550,7 @@ class TestSnapshotPauseResumeFork:
         while time.time() < deadline:
             pvc_check = subprocess.run(
                 [
-                    "k3s",
-                    "kubectl",
+                    *KUBECTL,
                     "get",
                     "pvc",
                     "-n",
@@ -492,8 +565,7 @@ class TestSnapshotPauseResumeFork:
             remaining_pvcs = [p for p in pvc_check.stdout.strip().split() if p.startswith(name)]
             snap_check = subprocess.run(
                 [
-                    "k3s",
-                    "kubectl",
+                    *KUBECTL,
                     "get",
                     "volumesnapshot",
                     "-n",
@@ -521,7 +593,7 @@ class TestSnapshotPauseResumeFork:
             for name in names:
                 cfg = SandboxConfig(
                     name=name,
-                    image="alpine:latest",
+                    image="alpine:3.20",
                     namespace=test_namespace,
                     backend="kata-qemu-longhorn",
                 )
@@ -545,8 +617,7 @@ class TestSnapshotPauseResumeFork:
         while time.time() < deadline:
             pvc_result = subprocess.run(
                 [
-                    "k3s",
-                    "kubectl",
+                    *KUBECTL,
                     "get",
                     "pvc",
                     "-n",
@@ -569,8 +640,7 @@ class TestSnapshotPauseResumeFork:
 
             snap_result = subprocess.run(
                 [
-                    "k3s",
-                    "kubectl",
+                    *KUBECTL,
                     "get",
                     "volumesnapshot",
                     "-n",
@@ -593,8 +663,7 @@ class TestSnapshotPauseResumeFork:
 
             lh_vol_result = subprocess.run(
                 [
-                    "k3s",
-                    "kubectl",
+                    *KUBECTL,
                     "get",
                     "volumes.longhorn.io",
                     "-n",
@@ -611,8 +680,7 @@ class TestSnapshotPauseResumeFork:
                 for vol in lh_vol_result.stdout.strip().split():
                     pv_check = subprocess.run(
                         [
-                            "k3s",
-                            "kubectl",
+                            *KUBECTL,
                             "get",
                             "pv",
                             vol,

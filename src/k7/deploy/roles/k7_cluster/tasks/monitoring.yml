@@ -1,0 +1,85 @@
+---
+# `k7 install --monitoring`: the pinned kube-prometheus-stack
+# plus K7's monitors, alert rules and dashboards. Opt-in, for single-box
+# installs; existing clusters use their own monitoring and the Helm chart.
+# The CLI sets --metrics-scraper to its Prometheus pods.
+- name: Create /etc/k7/observability on the first master
+  ansible.builtin.file:
+    path: /etc/k7/observability
+    state: directory
+    mode: '0755'
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'monitoring']
+
+- name: Stage the kube-prometheus-stack chart
+  vars:
+    kps: "kube-prometheus-stack-{{ kube_prometheus_stack_version }}"
+  ansible.builtin.get_url:
+    url: "https://github.com/prometheus-community/helm-charts/releases/download/{{ kps }}/{{ kps }}.tgz"
+    dest: "/etc/k7/observability/{{ kps }}.tgz"
+    checksum: "sha256:{{ kube_prometheus_stack_sha256 }}"
+    mode: '0644'
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'monitoring']
+
+- name: Copy K7 rules, dashboards, monitors and stack values
+  ansible.builtin.copy:
+    src: "{{ k7_deploy_dir }}/observability/{{ item }}"
+    dest: "/etc/k7/observability/{{ item }}"
+    mode: '0644'
+  loop:
+    - kube-prometheus-stack-values.yaml
+    - k7-monitors.yaml
+    - rules/
+    - dashboards/
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'monitoring']
+
+- name: Install kube-prometheus-stack (pinned)
+  ansible.builtin.command:
+    argv:
+      - helm
+      - upgrade
+      - --install
+      - kube-prometheus-stack
+      - "/etc/k7/observability/kube-prometheus-stack-{{ kube_prometheus_stack_version }}.tgz"
+      - --namespace
+      - monitoring
+      - --create-namespace
+      - --values
+      - /etc/k7/observability/kube-prometheus-stack-values.yaml
+      - --wait
+      - --timeout
+      - 10m
+  environment:
+    KUBECONFIG: "{{ k7_kubeconfig }}"
+  register: kps_install
+  changed_when: "'has been upgraded' in kps_install.stdout or 'STATUS: deployed' in kps_install.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'monitoring']
+
+# The rules file is a Prometheus rule file (promtool-tested); a
+# PrometheusRule's spec is the same document, so wrap it as text.
+- name: Apply K7 monitors, PrometheusRule and dashboard ConfigMaps
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cd /etc/k7/observability
+    {{ k7_kubectl }} apply -f k7-monitors.yaml
+    { printf 'apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: k7\n  namespace: kube-system\nspec:\n'
+      sed 's/^/  /' rules/k7.rules.yaml; } | {{ k7_kubectl }} apply -f -
+    for f in dashboards/*.json; do
+      name="$(basename "$f" .json)-dashboard"
+      {{ k7_kubectl }} -n monitoring create configmap "$name" --from-file="$f" --dry-run=client -o yaml |
+        {{ k7_kubectl }} label --local -f - grafana_dashboard=1 -o yaml | {{ k7_kubectl }} apply -f -
+    done
+  args:
+    executable: /bin/bash
+  register: k7_monitoring_apply
+  changed_when: "'created' in k7_monitoring_apply.stdout or 'configured' in k7_monitoring_apply.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'monitoring']

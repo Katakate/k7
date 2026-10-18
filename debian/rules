@@ -23,6 +23,7 @@ override_dh_auto_build:
 			echo "Docker not available; building via local Nuitka..."; \
 			python3 -m nuitka \
 				--standalone --onefile \
+				--no-deployment-flag=self-execution \
 				--include-module=yaml \
 				--include-module=rich \
 				--include-module=typer \

@@ -1,0 +1,188 @@
+---
+- name: Fail if the distro adapter has no kubectl for cluster resources
+  ansible.builtin.fail:
+    msg: >-
+      k7_distro={{ k7_distro }} has no k7_kubectl in its adapter; k7_cluster does not run
+      there (the Helm chart owns cluster resources). Use --node-prep-only.
+  when: k7_kubectl | length == 0
+  tags: ['always']
+
+# `--api-image local` imports k7-api with `k3s ctr`, and the manifests are
+# only validated on K3s.
+- name: Fail if the k7-api is requested on a distro other than K3s
+  ansible.builtin.fail:
+    msg: "k7_cluster deploys the k7-api only on k7_distro=k3s (got {{ k7_distro }}); pass k7_api_enabled=false."
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_distro != 'k3s'
+  tags: ['always']
+
+- name: Require k7_api_image to be `local` or pinned by digest
+  ansible.builtin.assert:
+    that:
+      - k7_api_image == 'local' or k7_api_image is match('^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$')
+    fail_msg: >-
+      k7_api_image='{{ k7_api_image }}' must be `local` or name@sha256:<digest>.
+      `k7 install` reads it from the release's images.lock.yaml or --api-image.
+  when: k7_api_enabled | default(true) | bool
+  tags: ['always']
+
+- name: Require the k7-api and a pinned installer image for remote install
+  ansible.builtin.assert:
+    that:
+      - k7_api_enabled | default(true) | bool
+      - k7_node_installer_image == 'local' or k7_node_installer_image is match('^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$')
+    fail_msg: >-
+      k7_api_remote_install needs the k7-api (no --no-api) and k7_node_installer_image='{{ k7_node_installer_image }}'
+      to be `local` or name@sha256:<digest>. `k7 install` reads it from images.lock.yaml or --node-installer-image.
+  when: k7_api_remote_install | bool
+  tags: ['always']
+
+# opt-in source-CIDR allowlist for the k7-api NodePort. Values
+# are validated by the CLI (`ipaddress.ip_network`) before we get here.
+- name: Normalise the k7-api source-CIDR allowlist
+  ansible.builtin.set_fact:
+    k7_api_allow_cidrs_list: >-
+      {{ (k7_api_allow_cidrs | default('')).split(',') | map('trim') | reject('equalto', '') | list }}
+  tags: ['always']
+
+- name: Fail if an API allowlist is requested without Cilium
+  ansible.builtin.fail:
+    msg: >-
+      Error: --api-allow-cidr requires the Cilium CNI (got --cni {{ k7_cni_effective }}).
+      The reserved host/remote-node/health/kube-apiserver peers the kubelet probes need
+      are not expressible in a v1 NetworkPolicy.
+  when:
+    - k7_api_allow_cidrs_list | length > 0
+    - k7_cni_effective != 'cilium'
+
+- name: Fail if --monitoring cannot scrape K7
+  ansible.builtin.fail:
+    msg: >-
+      Error: k7_monitoring needs the k7-api (k7_api_enabled) and
+      k7_metrics_scraper={{ k7_monitoring_scraper }}, the only pods let into port 9464
+      (got '{{ k7_metrics_scraper | default('') }}'). `k7 install --monitoring` sets both.
+  when:
+    - k7_monitoring | bool
+    - not (k7_api_enabled | default(true) | bool) or (k7_metrics_scraper | default('')) != k7_monitoring_scraper
+  tags: ['always']
+
+- name: Fail if Hubble requested without Cilium
+  ansible.builtin.fail:
+    msg: "Error: --hubble requires the Cilium CNI (got --cni {{ k7_cni_effective }})."
+  when:
+    - k7_hubble_enabled | default(false) | bool
+    - k7_cni_effective != 'cilium'
+
+# The CLI already refuses these combinations. Repeat the
+# check here so a direct ansible-playbook invocation fails loud too.
+- name: Fail if insecure HTTP is combined with a TLS cert source
+  ansible.builtin.fail:
+    msg: >-
+      Error: --api-insecure-http cannot be combined with --api-hostname
+      or --api-tls-cert/--api-tls-key.
+  when:
+    - k7_api_insecure_http | default(false) | bool
+    - (k7_api_hostname | default('') | length > 0) or (k7_api_tls_cert_src | default('') | length > 0)
+
+- name: Fail if --api-hostname is combined with operator certs
+  ansible.builtin.fail:
+    msg: "Error: --api-hostname cannot be combined with --api-tls-cert/--api-tls-key."
+  when:
+    - k7_api_hostname | default('') | length > 0
+    - k7_api_tls_cert_src | default('') | length > 0
+
+# K7-api reads these from ConfigMap k7-oidc (envFrom). All five
+# or none; none means OIDC off and the ConfigMap is deleted.
+- name: Collect the k7-api OIDC settings
+  ansible.builtin.set_fact:
+    k7_oidc_env: >-
+      {{ {
+        'K7_OIDC_ISSUER': k7_oidc_issuer | default('') | trim,
+        'K7_OIDC_AUDIENCE': k7_oidc_audience | default('') | trim,
+        'K7_OIDC_CLIENT_ID': k7_oidc_client_id | default('') | trim,
+        'K7_OIDC_GROUPS_CLAIM': k7_oidc_groups_claim | default('') | trim,
+        'K7_OIDC_USERNAME_CLAIM': k7_oidc_username_claim | default('') | trim,
+      } }}
+  tags: ['always']
+
+- name: Fail if OIDC is partially configured or the issuer is not https
+  ansible.builtin.assert:
+    that:
+      - (k7_oidc_env.values() | select | list | length) in [0, 5]
+      - >-
+        k7_oidc_env.K7_OIDC_ISSUER == '' or k7_oidc_env.K7_OIDC_ISSUER is match('^https://')
+        or (k7_oidc_allow_http_issuer | default(false) | bool)
+    fail_msg: "OIDC needs all five k7_oidc_* settings (or none) and an https:// issuer; got {{ k7_oidc_env }}"
+  tags: ['always']
+
+# k7.api.oidc.JWKS_TTL_SECONDS / REFRESH_SECONDS. Not one of the five
+# required settings: OIDC off ignores it, OIDC on publishes it.
+- name: Fail if the OIDC JWKS cache TTL is below the refresh rate limit
+  ansible.builtin.assert:
+    that:
+      - k7_oidc_jwks_ttl_seconds | string | trim is match('^[1-9][0-9]*$')
+      - (k7_oidc_jwks_ttl_seconds | string | trim | int) >= 10
+    fail_msg: >-
+      k7_oidc_jwks_ttl_seconds must be an integer >= 10 (oidc.REFRESH_SECONDS);
+      got {{ k7_oidc_jwks_ttl_seconds }}
+  tags: ['always']
+
+- name: Compute the k7-oidc ConfigMap data
+  ansible.builtin.set_fact:
+    k7_oidc_cm_data: >-
+      {{ {} if k7_oidc_env.K7_OIDC_ISSUER == '' else k7_oidc_env
+         | combine({'K7_OIDC_JWKS_TTL_SECONDS': k7_oidc_jwks_ttl_seconds | string | trim})
+         | combine({'K7_OIDC_ALLOW_HTTP_ISSUER': '1'} if (k7_oidc_allow_http_issuer | default(false) | bool) else {}) }}
+  tags: ['always']
+
+# The API mode has no default; `k7 install --api-mode` passes it.
+- name: Fail if the k7-api mode is missing or invalid
+  ansible.builtin.fail:
+    msg: >-
+      Error: k7_api_mode is required with the API (production or development;
+      there is no default). Re-run `k7 install --api-mode production|development`.
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_mode | default('') not in ['production', 'development']
+
+# `k7 install --metering-*` passes the whole k7-metering document.
+# k7-api and k7-agent validate every value at start and refuse to run on a bad one.
+- name: Fail if the metering settings are missing or malformed
+  ansible.builtin.assert:
+    that:
+      - k7_metering is defined and k7_metering is mapping
+      - (k7_metering.keys() | sort) == ['prometheusUrl', 'requireDelivery', 'sampleInterval', 'sinks', 'spool', 'storageInterval']
+    fail_msg: >-
+      k7_metering must be the k7-metering document with exactly sampleInterval, storageInterval,
+      spool, requireDelivery, prometheusUrl and sinks (`k7 install --metering-*` renders it);
+      got {{ k7_metering | default('unset') }}
+  when: k7_api_enabled | default(true) | bool
+  tags: ['always']
+
+- name: Fail if production mode is combined with insecure HTTP
+  ansible.builtin.fail:
+    msg: "Error: --api-mode production refuses --api-insecure-http (API keys would travel in cleartext)."
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_mode | default('') == 'production'
+    - k7_api_insecure_http | default(false) | bool
+
+- name: Fail if production mode is combined with remote install
+  ansible.builtin.fail:
+    msg: >-
+      Error: k7_api_mode=production refuses k7_api_remote_install=true (--api-mode production
+      with --api-remote-install); k7-api would exit at startup. Use --api-mode development
+      or drop --api-remote-install.
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_mode | default('') == 'production'
+    - k7_api_remote_install | bool
+  tags: ['always']
+
+- name: Compute k7-api TLS mode
+  ansible.builtin.set_fact:
+    k7_api_tls_enabled: "{{ not (k7_api_insecure_http | default(false) | bool) }}"
+    k7_api_tls_acme: "{{ (k7_api_hostname | default('') | length > 0) }}"
+    k7_api_tls_operator: "{{ (k7_api_tls_cert_src | default('') | length > 0) }}"
+  tags: ['always']

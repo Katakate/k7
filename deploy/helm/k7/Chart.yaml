@@ -1,0 +1,12 @@
+apiVersion: v2
+name: k7
+description: K7 VM sandboxes on an existing Kubernetes cluster (RKE2, kubeadm, EKS). Never installs Kubernetes, the CNI, the CSI driver or cert-manager.
+type: application
+# Both equal src/k7/__init__.py __version__ (tests/unit/test_helm_chart.py).
+version: 0.5.0
+appVersion: "0.5.0"
+kubeVersion: ">=1.32.0-0"
+home: https://github.com/Katakate/k7
+annotations:
+  # k7d the installer image installs (node_installer/artifacts.txt, playbook k7d_version).
+  katakate.org/k7d-version: "0.7.0"

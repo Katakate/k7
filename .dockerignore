@@ -8,6 +8,7 @@
 
 .git
 .gitignore
+.venv
 **/.DS_Store
 **/.vscode/
 **/.idea/

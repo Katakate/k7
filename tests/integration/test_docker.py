@@ -22,6 +22,9 @@ from k7.core.core import K7Core
 from k7.core.docker import VEHICLE_CONTAINER_NAME
 from k7.core.models import SandboxConfig
 
+from .cluster import KUBECTL
+from .test_qemu import assert_clone_copied, assert_fork_snapshot_released
+
 pytestmark = pytest.mark.integration
 
 _K7D_DISKS = Path("/var/lib/k7d/disks")
@@ -32,8 +35,7 @@ def _wait_all_containers_ready(sandbox_name: str, namespace: str, timeout: int =
     while time.time() < deadline:
         result = subprocess.run(
             [
-                "k3s",
-                "kubectl",
+                *KUBECTL,
                 "get",
                 "pods",
                 "-n",
@@ -164,8 +166,7 @@ async def _wait_k7d_docker_disks_gone(before: set[str], timeout: float = 60.0) -
 def _pod_annotations(name: str, namespace: str) -> dict[str, str]:
     result = subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "get",
             "pods",
             "-n",
@@ -368,7 +369,7 @@ class TestDockerK7dFc(TestDockerK7d):
     @pytest.fixture(autouse=True)
     def _require_k7_fc(self):
         result = subprocess.run(
-            ["k3s", "kubectl", "get", "runtimeclass", "k7-fc"],
+            [*KUBECTL, "get", "runtimeclass", "k7-fc"],
             capture_output=True,
             text=True,
             check=False,
@@ -379,7 +380,7 @@ class TestDockerK7dFc(TestDockerK7d):
 
 def _pod_json(name: str, namespace: str) -> dict:
     result = subprocess.run(
-        ["k3s", "kubectl", "get", "pods", "-n", namespace, "-l", f"app={name}", "-o", "json"],
+        [*KUBECTL, "get", "pods", "-n", namespace, "-l", f"app={name}", "-o", "json"],
         capture_output=True,
         text=True,
         check=False,
@@ -447,7 +448,7 @@ async def _assert_build_and_compose(k7_core: K7Core, name: str, namespace: str) 
 
 def _remaining_pvcs(namespace: str, prefix: str) -> list[str]:
     pvc_check = subprocess.run(
-        ["k3s", "kubectl", "get", "pvc", "-n", namespace, "-o", "jsonpath={.items[*].metadata.name}"],
+        [*KUBECTL, "get", "pvc", "-n", namespace, "-o", "jsonpath={.items[*].metadata.name}"],
         capture_output=True,
         text=True,
         check=False,
@@ -457,7 +458,7 @@ def _remaining_pvcs(namespace: str, prefix: str) -> list[str]:
 
 def _remaining_configmaps(namespace: str, prefix: str) -> list[str]:
     check = subprocess.run(
-        ["k3s", "kubectl", "get", "cm", "-n", namespace, "-o", "jsonpath={.items[*].metadata.name}"],
+        [*KUBECTL, "get", "cm", "-n", namespace, "-o", "jsonpath={.items[*].metadata.name}"],
         capture_output=True,
         text=True,
         check=False,
@@ -596,6 +597,9 @@ class TestDockerKQL(_DockerKataMixin):
             await _sh(k7_core, source, test_namespace, "docker pull alpine:3.21")
             fork = await k7_core.fork_sandbox(source, fork_name, namespace=test_namespace)
             assert fork.success, fork.error
+            assert_clone_copied(f"{fork_name}-root-lh", test_namespace)
+            assert_clone_copied(f"{fork_name}-docker-lh", test_namespace)
+            assert_fork_snapshot_released(source, test_namespace)
             # Same 600s bound as test_qemu.test_fork_clones_data: on HA
             # longhorn_replicas=3 the cloned volumes hydrate before first
             # attach ("not ready for workloads"). 240s is a false timeout.

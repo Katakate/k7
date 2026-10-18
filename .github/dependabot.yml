@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # Every directory with a Dockerfile (tests/unit/test_supply_chain.py checks).
+  - package-ecosystem: docker
+    directories:
+      - /src/k7/api
+      - /src/k7/cli
+      - /src/k7/deploy/node_installer
+    schedule:
+      interval: weekly

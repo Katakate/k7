@@ -1,0 +1,50 @@
+{{/* Same objects as roles/k7_cluster/tasks/nodes.yml; the selector is the label
+k7-node-installer sets only after a node is fully prepared. */}}
+{{- if .Values.backends.kfd.enabled }}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata
+handler: kata
+scheduling:
+  nodeSelector:
+    k7.katakate.org/backend-kata-firecracker-devmapper: "true"
+{{- end }}
+{{- if .Values.backends.kql.enabled }}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+handler: kata-qemu
+scheduling:
+  nodeSelector:
+    k7.katakate.org/backend-kata-qemu-longhorn: "true"
+{{- end }}
+{{- if include "k7.hasK7d" . }}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: k7
+handler: k7
+scheduling:
+  nodeSelector:
+    k7.katakate.org/backend-k7d: "true"
+{{- end }}
+{{- if .Values.backends.k7dFc.enabled }}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: k7-fc
+handler: k7-fc
+scheduling:
+  nodeSelector:
+    k7.katakate.org/backend-k7d-fc: "true"
+overhead:
+  podFixed:
+    cpu: 50m
+    memory: 32Mi
+{{- end }}

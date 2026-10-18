@@ -1,0 +1,189 @@
+# K7 on an existing cluster. values.schema.json rejects unknown
+# keys. Required, with no default on purpose:
+#   networkPolicy.provider   cilium | kubernetes | none
+#   tls.mode                 certManager | secret | insecureHTTP
+#   nodeInstaller.distro     k3s | rke2 | kubeadm | eks-al2023
+#   nodeInstaller.diskSource spare-disk | loopback | device:/dev/<disk>
+#   images.*.digest          sha256:<64 hex> (the release pipeline fills them)
+#   api.mode                 production | development
+#   metering.sampleInterval  5-60 s with api.mode=production
+#   at least one backends.*.enabled; kql also needs both storage classes.
+# The release namespace runs the privileged installer: label it
+# pod-security.kubernetes.io/enforce=privileged (the pre-install hook checks).
+
+images:
+  api:
+    repository: ghcr.io/katakate/k7-api
+    digest: ""
+  nodeInstaller:
+    repository: ghcr.io/katakate/k7-node-installer
+    digest: ""
+  # Same pin as k7_api_tls.CADDY_PIN (linux/amd64).
+  caddy:
+    repository: caddy
+    digest: sha256:d8c17a862962def15cde69863a3a463f25a2664942eafd7bdbf050e9c3116b83
+
+networkPolicy:
+  # cilium: FQDN + CIDR egress, sandbox→platform deny, agent ingress policy.
+  #   The pre-install hook requires Cilium's DNS proxy with
+  #   dnsProxy.dnsRejectResponseCode=nameError (FQDN sandboxes resolve only
+  #   allowlisted names; the rest get NXDOMAIN).
+  # kubernetes: v1 NetworkPolicy, CIDR egress only (domain egress → 400; a
+  #   CIDR containing the cluster DNS server → 400).
+  # none: no egress policy (any egress field → 400).
+  # provider:
+  # kubernetes/none have no equivalent of the cluster-wide sandbox→platform deny.
+  acknowledgeNoPlatformDeny: false
+  # none: sandboxes reach anything their node reaches.
+  acknowledgeNoEgressPolicy: false
+  # Namespaces whose pods sandboxes may not reach (cilium only; CoreDNS
+  # stays reachable). The release namespace is always added.
+  platformNamespaces: [kube-system, longhorn-system]
+  # Restrict k7-api ingress to these source CIDRs (cilium only).
+  apiAllowCIDRs: []
+
+tls:
+  # mode:
+  # secret: an existing kubernetes.io/tls Secret in the release namespace.
+  secretName: k7-api-tls
+  # certManager: a Certificate for this issuer, written to secretName.
+  certManager:
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+      group: cert-manager.io
+    dnsNames: []
+    ipAddresses: []
+
+api:
+  # production refuses unscoped keys and insecureHTTP; development is the
+  # pre-tenancy behaviour. Every response carries X-K7-Mode.
+  # mode:
+  replicas: 2
+  service:
+    # ClusterIP | NodePort | LoadBalancer
+    type: ClusterIP
+    # NodePort only; 0 lets Kubernetes pick.
+    nodePort: 0
+  tolerations: []
+  nodeSelector: {}
+  # POST /api/v1/install: cluster-wide admins label nodes k7.katakate.org/node-pool=true
+  # for the installer below (images.nodeInstaller, nodeInstaller.*). Setting it
+  # back to false drops the API's access and its node marker on the next upgrade;
+  # the nodes it added stay in the pool (k7-agent keeps serving them).
+  # Development mode only: rendering refuses it with api.mode=production.
+  remoteInstall: false
+
+backends:
+  kfd:
+    enabled: false
+  kql:
+    enabled: false
+    storageClass: ""
+    volumeSnapshotClass: ""
+  k7d:
+    enabled: false
+  k7dFc:
+    enabled: false
+
+# Prepares nodes labelled k7.katakate.org/node-pool=true and,
+# on helm uninstall, undoes it (pre-delete cleanup DaemonSet).
+nodeInstaller:
+  # distro:
+  # diskSource:
+  # e.g. 64G / 400G; empty keeps the installer's default.
+  k7dDisksImageSize: ""
+  kataThinpoolPvSize: ""
+  # K3s/RKE2 server nodes: the installer restarts containerd, which restarts
+  # the apiserver there. Refused unless true.
+  allowServerRestart: false
+  # Uninstall removes the thin pool / k7d image too. Default keeps disks.
+  wipeDisks: false
+  # Uninstall deletes running K7 sandbox pods instead of refusing.
+  forceCleanup: false
+
+# Taints of the sandbox node pool: the installer, cleanup and k7-agent
+# DaemonSets tolerate them.
+sandboxNodes:
+  tolerations: []
+
+# Bound on each hook (node cleanup on uninstall, helm test). Pass helm a
+# larger --timeout (e.g. --timeout 35m).
+hookTimeoutSeconds: 1800
+
+snapshotGC:
+  schedule: "*/10 * * * *"
+  keepForkForMinutes: 10
+
+# Every k7 pod logs JSON lines at logLevel.
+observability:
+  # /metrics on port 9464 of k7-api and k7-agent. Needs networkPolicy.provider
+  # cilium or kubernetes: only scraperSelector pods may reach the port.
+  metrics: true
+  # Required with metrics: true, e.g.
+  #   namespace: monitoring
+  #   podLabels: {app.kubernetes.io/name: prometheus}
+  scraperSelector: {}
+  # debug | info | warning | error
+  logLevel: info
+  # monitoring.coreos.com/v1 objects; the chart fails if their CRDs are missing.
+  serviceMonitor: false
+  prometheusRule: false
+  # Labels on the ServiceMonitor, PodMonitor and PrometheusRule, for a
+  # Prometheus that selects by label (e.g. release: kube-prometheus-stack).
+  monitorLabels: {}
+  # Dashboard ConfigMaps labelled grafana_dashboard: "1" (Grafana sidecar).
+  grafanaDashboards: false
+  # Alert thresholds (k7:threshold:* recording rules in the PrometheusRule).
+  thresholds:
+    apiErrorRatio: 0.05
+    keyStoreStaleSeconds: 60
+    thinpoolDataRatio: 0.8
+    thinpoolMetadataRatio: 0.7
+    k7dDisksRatio: 0.85
+    storageReportStaleSeconds: 90
+    tlsExpirySeconds: 1209600
+    # p95 budget per op (PERFORMANCE.md); K7OperationSlow fires at twice it.
+    opP95BudgetSeconds:
+      create: 25
+      delete: 2
+      fork: 10
+      pause: 2
+      resume: 10
+      snapshot: 10
+      restore: 25
+# OIDC login for humans and workloads. All five or none; the
+# issuer must be https. jwksTtlSeconds is how long k7-api trusts a cached
+# JWKS (minimum 10; the k7.api.oidc.JWKS_TTL_SECONDS pin). Bind
+# groups/users to roles with `k7 role-bindings apply`. Same as
+# `k7 install --oidc-*`.
+auth:
+  oidc:
+    issuer: ""
+    audience: ""
+    clientId: ""
+    groupsClaim: ""
+    usernameClaim: ""
+    jwksTtlSeconds: 3600
+# Usage metering; the same document as `k7 install --metering-*`
+# (ConfigMap k7-metering). See docs/METERING.md.
+metering:
+  # Node usage sample period, 5-60 s. Required with api.mode=production;
+  # unset in development means 15.
+  # sampleInterval:
+  # Disk and snapshot usage window, 30-600 s.
+  storageInterval: 60
+  spool:
+    # Per-node durable spool (/var/lib/k7/usage-spool). Past it the oldest
+    # segment is dropped and k7_usage_events_dropped_total counts the loss.
+    maxBytes: 1073741824
+    # requireDelivery refuses creates on a node whose spool is above this.
+    highWaterPercent: 80
+  requireDelivery: false
+  # Prometheus scraping K7, for `k7 usage` / GET /api/v1/usage; empty = 400.
+  prometheusUrl: ""
+  # e.g. - {name: openmeter, type: http, url: http://openmeter.openmeter.svc:8888,
+  #         preset: openmeter, mode: batch, batchSize: 100,
+  #         headersSecretRef: {name: k7-metering-headers, key: openmeter}}
+  #      - {name: logs, type: stdout}
+  sinks: []

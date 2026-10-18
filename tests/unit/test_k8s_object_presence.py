@@ -9,6 +9,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+from tests.unit.conftest import install_tree_text
+
 HELPER = Path(__file__).resolve().parents[2] / "src/k7/deploy/k8s-object-presence.sh"
 PLAYBOOK = Path(__file__).resolve().parents[2] / "src/k7/deploy/k7-install-node.yaml"
 
@@ -109,7 +111,7 @@ exit 0
 
 
 def test_playbook_installs_cilium_only_when_absent():
-    text = PLAYBOOK.read_text()
+    text = install_tree_text()
     assert "cilium_installed_check.rc != 0" not in text
     assert 'cilium_presence.stdout == "absent"' in text
     assert 'hubble_presence.stdout == "absent"' in text
@@ -117,7 +119,7 @@ def test_playbook_installs_cilium_only_when_absent():
 
 
 def test_playbook_does_not_fail_reinstall_on_status_warnings_alone():
-    text = PLAYBOOK.read_text()
+    text = install_tree_text()
     assert "Confirm Cilium agent is Ready (reinstall)" in text
     assert 'cilium_presence.stdout == "present"' in text
     # First-install wait is still the strict --wait path.

@@ -1,0 +1,15 @@
+---
+# K3s install/join and readiness. Requires the k7_node_prep facts.yml
+# contract. k7-install-node.yaml imports prep/install/ready separately so
+# node-prep's containerd handlers land before joining nodes first start.
+- name: Validate k7_dns_upstreams
+  ansible.builtin.import_tasks: dns_validate.yml
+
+- name: K3s host prep
+  ansible.builtin.import_tasks: prep.yml
+
+- name: K3s install / join
+  ansible.builtin.import_tasks: install.yml
+
+- name: K3s apiserver readiness
+  ansible.builtin.import_tasks: ready.yml

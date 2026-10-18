@@ -1,0 +1,8 @@
+---
+# Verified on RKE2 v1.36.5+rke2r1 (deploy/helm/k7/ci/rke2-hetzner.md).
+k7_containerd_socket: /run/k3s/containerd/containerd.sock
+k7_containerd_config_mode: k3s-template
+k7_containerd_config_path: /var/lib/rancher/rke2/agent/etc/containerd/config-v3.toml.tmpl
+k7_containerd_service: "{{ 'rke2-server' if k7_node_role == 'server' else 'rke2-agent' }}"
+k7_containerd_root: /var/lib/rancher/rke2/agent/containerd
+k7_kubectl: /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml

@@ -1,0 +1,217 @@
+---
+- name: Wait for cluster nodes to be Ready (run on first master)
+  ansible.builtin.shell: |
+    set -e
+    expected={{ (groups['k7_cluster'] | default([inventory_hostname])) | length }}
+    for i in $(seq 1 60); do
+      ready=$({{ k7_kubectl }} get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)
+      if [ "$ready" -ge "$expected" ]; then
+        echo "All $ready/$expected nodes Ready"
+        exit 0
+      fi
+      echo "Waiting for nodes Ready: $ready/$expected ($i/60)"
+      sleep 5
+    done
+    exit 1
+  register: stability_check
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k3s']
+
+# A pod's /etc/resolv.conf is fixed at creation: CoreDNS keeps its old
+# upstreams until it is recreated (k7_k3s dns.yml sets k7_dns_changed).
+- name: Restart CoreDNS onto the new k7_dns_upstreams
+  ansible.builtin.shell: |
+    set -e
+    {{ k7_kubectl }} -n kube-system rollout restart deployment/coredns
+    {{ k7_kubectl }} -n kube-system rollout status deployment/coredns --timeout=300s
+  when: >-
+    ansible_play_hosts | map('extract', hostvars) | map(attribute='k7_dns_changed', default=false)
+    | map('bool') | select | list | length > 0
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k3s', 'dns']
+
+# ------------------------------------------------------------------
+# Cluster-wide resources (RuntimeClass, Longhorn, k7-api)
+# ------------------------------------------------------------------
+# scheduling.nodeSelector repeats core's per-backend selector so a pod that
+# omits it still cannot land on a node the installer has not marked ready
+# (k7-node-installer removes the label on any failure).
+- name: Create RuntimeClass 'kata' (cluster-wide)
+  ansible.builtin.shell: |
+    cat <<'EOF' | {{ k7_kubectl }} apply -f -
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata:
+      name: kata
+    handler: kata
+    scheduling:
+      nodeSelector:
+        k7.katakate.org/backend-kata-firecracker-devmapper: "true"
+    EOF
+  args:
+    executable: /bin/bash
+  register: apply_kata
+  retries: 12
+  delay: 5
+  until: "'created' in apply_kata.stdout or 'configured' in apply_kata.stdout or 'unchanged' in apply_kata.stdout"
+  changed_when: "'unchanged' not in apply_kata.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['kata-firecracker-devmapper']) | length > 0
+  tags: ['kata', 'k3s']
+
+- name: Create RuntimeClass 'kata-qemu' (cluster-wide)
+  ansible.builtin.shell: |
+    cat <<'EOF' | {{ k7_kubectl }} apply -f -
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata:
+      name: kata-qemu
+    handler: kata-qemu
+    scheduling:
+      nodeSelector:
+        k7.katakate.org/backend-kata-qemu-longhorn: "true"
+    EOF
+  args:
+    executable: /bin/bash
+  register: apply_kata_qemu
+  retries: 12
+  delay: 5
+  until: "'created' in apply_kata_qemu.stdout or 'configured' in apply_kata_qemu.stdout or 'unchanged' in apply_kata_qemu.stdout"
+  changed_when: "'unchanged' not in apply_kata_qemu.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['kata-qemu-longhorn']) | length > 0
+  tags: ['kata', 'k3s']
+
+- name: Create RuntimeClass 'k7' (cluster-wide)
+  ansible.builtin.shell: |
+    cat <<'EOF' | {{ k7_kubectl }} apply -f -
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata:
+      name: k7
+    handler: k7
+    scheduling:
+      nodeSelector:
+        k7.katakate.org/backend-k7d: "true"
+    EOF
+  args:
+    executable: /bin/bash
+  register: apply_k7
+  retries: 12
+  delay: 5
+  until: "'created' in apply_k7.stdout or 'configured' in apply_k7.stdout or 'unchanged' in apply_k7.stdout"
+  changed_when: "'unchanged' not in apply_k7.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['k7d', 'k7d-fc']) | length > 0
+  tags: ['k7d', 'k3s']
+
+- name: Create RuntimeClass 'k7-fc' (cluster-wide)
+  ansible.builtin.shell: |
+    cat <<'EOF' | {{ k7_kubectl }} apply -f -
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata:
+      name: k7-fc
+    handler: k7-fc
+    scheduling:
+      nodeSelector:
+        k7.katakate.org/backend-k7d-fc: "true"
+    overhead:
+      podFixed:
+        cpu: 50m
+        memory: 32Mi
+    EOF
+  args:
+    executable: /bin/bash
+  register: apply_k7_fc
+  retries: 12
+  delay: 5
+  until: "'created' in apply_k7_fc.stdout or 'configured' in apply_k7_fc.stdout or 'unchanged' in apply_k7_fc.stdout"
+  changed_when: "'unchanged' not in apply_k7_fc.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: groups['k7_cluster'] | map('extract', hostvars, 'k7_backends_list') | flatten | unique | intersect(['k7d-fc']) | length > 0
+  tags: ['k7d', 'k7d-fc', 'k3s']
+
+# Not gated on k7_api_enabled: sandbox namespaces exist without the API too.
+- name: Apply the k7 runtime-annotations admission policy (cluster-wide)
+  ansible.builtin.command: "{{ k7_kubectl }} apply -f -"
+  args:
+    stdin: "{{ lookup('ansible.builtin.file', k7_deploy_dir ~ '/manifests/k7-runtime-annotations/admission-policy.yaml') }}"
+  register: apply_runtime_annotations
+  changed_when: "'created' in apply_runtime_annotations.stdout or 'configured' in apply_runtime_annotations.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'k3s']
+
+# ------------------------------------------------------------------
+# Per-node backend labels — each node labels itself via first master
+# ------------------------------------------------------------------
+- name: Wait for node object to register
+  ansible.builtin.command: "{{ k7_kubectl }} get node {{ k7_k8s_node_name }}"
+  register: node_check
+  retries: 30
+  delay: 5
+  until: node_check.rc == 0
+  changed_when: false
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['labels', 'k7d', 'k7d-fc']
+
+- name: Remove deprecated backend labels
+  ansible.builtin.command: >
+    {{ k7_kubectl }} label node {{ k7_k8s_node_name }}
+    k7.katakate.org/backend-firecracker-devmapper-
+    k7.katakate.org/backend-qemu-longhorn-
+    --overwrite
+  delegate_to: "{{ k7_first_master }}"
+  changed_when: true
+  failed_when: false
+  tags: ['labels']
+
+- name: Label node with supported backends
+  ansible.builtin.command: >
+    {{ k7_kubectl }} label node {{ k7_k8s_node_name }}
+    k7.katakate.org/backend-{{ item }}=true --overwrite
+  loop: "{{ k7_backends_list }}"
+  delegate_to: "{{ k7_first_master }}"
+  changed_when: true
+  tags: ['labels', 'k7d', 'k7d-fc']
+
+- name: Label native k7d selector when only k7d-fc was requested
+  ansible.builtin.command: >
+    {{ k7_kubectl }} label node {{ k7_k8s_node_name }}
+    k7.katakate.org/backend-k7d=true --overwrite
+  when: k7_has_k7d_fc and ('k7d' not in k7_backends_list)
+  delegate_to: "{{ k7_first_master }}"
+  changed_when: true
+  tags: ['labels', 'k7d', 'k7d-fc']
+
+- name: Label first master so the k7-api pod has a stable home
+  ansible.builtin.command: >
+    {{ k7_kubectl }} label node
+    {{ hostvars[k7_first_master].k7_k8s_node_name | default(k7_k8s_node_name) }}
+    k7.katakate.org/first-master=true --overwrite
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  changed_when: true
+  tags: ['labels']
+
+- name: Show K3s node status
+  ansible.builtin.command: "{{ k7_kubectl }} get nodes -o wide"
+  register: k3s_nodes
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k3s']
+
+- name: Debug K3s node status
+  ansible.builtin.debug:
+    msg: "{{ k3s_nodes.stdout_lines }}"
+  run_once: true
+  tags: ['k3s']

@@ -27,8 +27,8 @@ cluster:
 
 Rollback, if a run dies between apply and teardown::
 
-    k3s kubectl -n kube-system delete ciliumnetworkpolicy k7-api-ingress
-    k3s kubectl -n kube-system patch svc k7-api \
+    kubectl -n <system namespace> delete ciliumnetworkpolicy k7-api-ingress
+    kubectl -n <system namespace> patch svc k7-api \
         -p '{"spec":{"externalTrafficPolicy":"Cluster"}}'
 """
 
@@ -39,12 +39,12 @@ import uuid
 
 import pytest
 
+from .cluster import KUBECTL, system_ns
 from .test_api import _api_scheme, _tls_verify
 from .test_cilium import requires_cilium
 
 pytestmark = pytest.mark.integration
 
-_K3S = "/usr/local/bin/k3s"
 _POLICY = "k7-api-ingress"
 _PROBE_POD = "k7-api-ingress-probe"
 _PROBE_NS = "default"
@@ -56,7 +56,7 @@ _EXCLUDES_EVERYONE = "198.51.100.0/24"
 
 def _kubectl(*args: str, check: bool = True, stdin: str | None = None) -> str:
     result = subprocess.run(
-        [_K3S, "kubectl", *args],
+        [*KUBECTL, *args],
         input=stdin,
         capture_output=True,
         text=True,
@@ -75,7 +75,7 @@ def _policy_body(cidrs: list[str]) -> str:
         {
             "apiVersion": "cilium.io/v2",
             "kind": "CiliumNetworkPolicy",
-            "metadata": {"name": _POLICY, "namespace": "kube-system"},
+            "metadata": {"name": _POLICY, "namespace": system_ns()},
             "spec": {
                 "endpointSelector": {"matchLabels": {"app": "k7-api"}},
                 "ingress": [
@@ -88,9 +88,10 @@ def _policy_body(cidrs: list[str]) -> str:
 
 
 def _api_pod() -> dict:
-    pods = json.loads(_kubectl("-n", "kube-system", "get", "pod", "-l", "app=k7-api", "-o", "json"))["items"]
-    live = [p for p in pods if not p["metadata"].get("deletionTimestamp")]
-    assert len(live) == 1, f"expected exactly one live k7-api pod, got {[p['metadata']['name'] for p in live]}"
+    pods = json.loads(_kubectl("-n", system_ns(), "get", "pod", "-l", "app=k7-api", "-o", "json"))["items"]
+    live = sorted((p for p in pods if not p["metadata"].get("deletionTimestamp")), key=lambda p: p["metadata"]["name"])
+    assert live, "no live k7-api pod"
+    # Every replica carries the same endpointSelector policy; probe a stable one.
     return live[0]
 
 
@@ -104,7 +105,7 @@ def _restart_count(pod: dict) -> int:
 
 
 def _nodeport() -> str:
-    return _kubectl("-n", "kube-system", "get", "svc", "k7-api", "-o", "jsonpath={.spec.ports[0].nodePort}").strip()
+    return _kubectl("-n", system_ns(), "get", "svc", "k7-api", "-o", "jsonpath={.spec.ports[0].nodePort}").strip()
 
 
 def _nodeport_health_curl() -> list[str]:
@@ -117,13 +118,13 @@ def _nodeport_health_curl() -> list[str]:
 
 
 def _external_traffic_policy() -> str:
-    return _kubectl("-n", "kube-system", "get", "svc", "k7-api", "-o", "jsonpath={.spec.externalTrafficPolicy}").strip()
+    return _kubectl("-n", system_ns(), "get", "svc", "k7-api", "-o", "jsonpath={.spec.externalTrafficPolicy}").strip()
 
 
 def _set_external_traffic_policy(value: str) -> None:
     _kubectl(
         "-n",
-        "kube-system",
+        system_ns(),
         "patch",
         "svc",
         "k7-api",
@@ -132,13 +133,14 @@ def _set_external_traffic_policy(value: str) -> None:
     )
 
 
-def _probe_from_pod(url: str) -> str:
+def _probe_from_pod(url: str, request_id: str | None = None) -> str:
     """ "OK" / "BLOCKED" for an HTTP GET from the probe pod.
 
     A policy drop is a hang, not a refusal, hence the short timeout and the
     sentinel: "connection refused" would mean the packet got through and the
     listener is the problem.
     """
+    header = f"--header 'X-Request-ID: {request_id}' " if request_id else ""
     out = _kubectl(
         "-n",
         _PROBE_NS,
@@ -147,7 +149,7 @@ def _probe_from_pod(url: str) -> str:
         "--",
         "sh",
         "-c",
-        f"wget -q -T 6 -O /dev/null '{url}' && echo OK || echo BLOCKED",
+        f"wget -q -T 6 {header}-O /dev/null '{url}' && echo OK || echo BLOCKED",
         check=False,
     )
     lines = out.strip().splitlines()
@@ -155,17 +157,19 @@ def _probe_from_pod(url: str) -> str:
 
 
 def _observed_source_ip(token: str) -> str | None:
-    """The client IP uvicorn logged for the request carrying ``token``.
-
-    Access log lines look like::
-
-        INFO:     10.42.0.9:47118 - "GET /health?probe=<token> HTTP/1.1" 200 OK
-    """
-    logs = _kubectl("-n", "kube-system", "logs", f"pod/{_api_pod()['metadata']['name']}", "--tail=200")
+    """The ``client_ip`` of k7-api's JSON access line for the request whose
+    ``X-Request-ID`` is ``token`` (see ``_probe_api``)."""
+    logs = _kubectl("-n", system_ns(), "logs", f"pod/{_api_pod()['metadata']['name']}", "-c", "k7-api", "--tail=500")
     for line in logs.splitlines():
-        if token in line:
-            return line.split()[1].rsplit(":", 1)[0]
+        entry = json.loads(line)
+        if entry["request_id"] == token and entry["logger"] == "k7.api":
+            return entry["client_ip"]
     return None
+
+
+def _probe_api(token: str) -> str:
+    """GET k7-api's ``/`` (logged at INFO, unlike ``/health``) with ``token`` as its request id."""
+    return _probe_from_pod(f"http://{_api_pod()['status']['podIP']}:8000/", request_id=token)
 
 
 @pytest.fixture(scope="module")
@@ -214,7 +218,7 @@ def hardened():
     try:
         yield apply
     finally:
-        _kubectl("-n", "kube-system", "delete", "ciliumnetworkpolicy", _POLICY, "--ignore-not-found", check=False)
+        _kubectl("-n", system_ns(), "delete", "ciliumnetworkpolicy", _POLICY, "--ignore-not-found", check=False)
         _set_external_traffic_policy(previous)
 
 
@@ -222,7 +226,7 @@ class TestDefaultInstall:
     def test_no_policy_and_traffic_policy_is_cluster(self):
         """A default install (no --api-allow-cidr) is today's install, bit for bit."""
         out = _kubectl(
-            "-n", "kube-system", "get", "ciliumnetworkpolicy", _POLICY, "--ignore-not-found", check=False
+            "-n", system_ns(), "get", "ciliumnetworkpolicy", _POLICY, "--ignore-not-found", check=False
         ).strip()
         assert out == "", f"{_POLICY} exists on a cluster installed without --api-allow-cidr: {out}"
         assert _external_traffic_policy() == "Cluster"
@@ -245,7 +249,7 @@ class TestAllowlistPolicy:
         would say nothing about the CIDR list.
         """
         token = uuid.uuid4().hex
-        verdict = _probe_from_pod(f"http://{_api_pod()['status']['podIP']}:8000/health?probe={token}")
+        verdict = _probe_api(token)
         assert verdict == "OK", f"plain pod cannot reach k7-api with no policy applied: {verdict}"
         assert _observed_source_ip(token) == probe_pod, (
             f"k7-api observed {_observed_source_ip(token)!r}, not the probe pod IP {probe_pod!r} — "
@@ -254,12 +258,11 @@ class TestAllowlistPolicy:
 
     def test_pod_outside_the_allowlist_is_denied(self, probe_pod: str, hardened):
         hardened([_EXCLUDES_EVERYONE])
-        token = uuid.uuid4().hex
-        url = f"http://{_api_pod()['status']['podIP']}:8000/health?probe={token}"
         # The policy takes a moment to reach the endpoint's BPF maps.
         deadline = time.time() + 30
         while time.time() < deadline:
-            if _probe_from_pod(url) == "BLOCKED":
+            token = uuid.uuid4().hex
+            if _probe_api(token) == "BLOCKED":
                 break
             time.sleep(3)
         else:
@@ -309,7 +312,7 @@ class TestAllowlistPolicy:
     def test_rollback_restores_the_default_state(self, probe_pod: str, hardened):
         hardened([_EXCLUDES_EVERYONE])
         assert _external_traffic_policy() == "Local"
-        _kubectl("-n", "kube-system", "delete", "ciliumnetworkpolicy", _POLICY)
+        _kubectl("-n", system_ns(), "delete", "ciliumnetworkpolicy", _POLICY)
         _set_external_traffic_policy("Cluster")
         url = f"http://{_api_pod()['status']['podIP']}:8000/health"
         deadline = time.time() + 30

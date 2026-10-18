@@ -9,11 +9,11 @@ BUILD_SCRIPT := src/k7/cli/build.sh
 INSTALL_SCRIPT := src/k7/cli/install.sh
 
 # All shell scripts for linting
-SH_FILES := $(shell find src/ utils/ rootfs-build/ -name '*.sh' 2>/dev/null)
+SH_FILES := $(shell find src/ utils/ deploy/ rootfs-build/ -name '*.sh' 2>/dev/null)
 # Ansible playbooks
-ANSIBLE_PLAYBOOKS := src/k7/deploy/k7-install-node.yaml
+ANSIBLE_PLAYBOOKS := src/k7/deploy/k7-install-node.yaml src/k7/deploy/k7-node-cleanup.yaml
 
-.PHONY: help build install uninstall api-build-local \
+.PHONY: help build install uninstall api-build-local node-installer-image \
         lint lint-shell lint-ansible typecheck test test-integration test-integration-remote rsync-all check
 
 help: ## Show this help message
@@ -37,6 +37,10 @@ uninstall: ## Uninstall the k7 CLI
 api-build-local: ## Build the API container locally (dev tag)
 	@echo "Building local API image: k7-api:dev"
 	docker build -f src/k7/api/Dockerfile.api -t k7-api:dev .
+
+NODE_INSTALLER_IMAGE = ghcr.io/katakate/k7-node-installer:$(shell grep -Po '__version__\s*=\s*"\K[^"]+' src/k7/__init__.py)
+node-installer-image: ## Build the k7-node-installer image (on a Linux x86 node)
+	docker build -f src/k7/deploy/node_installer/Dockerfile -t $(NODE_INSTALLER_IMAGE) .
 
 # ── Lint ──────────────────────────────────────────────────────────
 lint: ## Lint & format-check Python code (ruff)
@@ -73,7 +77,7 @@ rsync-all: ## Rsync repo to all nodes (K7_NODE_IPS=ip1,ip2,ip3)
 		rsync -az --delete \
 			--exclude .venv --exclude .git --exclude __pycache__ \
 			--exclude '*.pyc' --exclude .ruff_cache --exclude .pytest_cache \
-			--exclude .mypy_cache --exclude .coverage --exclude uv.lock \
+			--exclude .mypy_cache --exclude .coverage \
 			-e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $${SSH_PRIVKEY:-$$HOME/.ssh/id_ed25519}" \
 			./ "$${K7_NODE_USER:-root}@$$ip:/root/k7/"; \
 	done

@@ -214,7 +214,13 @@ class TestBuildDefaultInventory:
             disk="/dev/nvme1n1",
             longhorn_extra_disk=None,
         )
-        assert "k7_devmapper_disk=/dev/nvme1n1" in inv
+        assert "k7_disk_source=device:/dev/nvme1n1" in inv
+
+    def test_disk_source_defaults_to_spare_disk(self):
+        inv = _build_default_inventory(
+            hosts=None, role="server", backends=["kata-firecracker-devmapper"], disk=None, longhorn_extra_disk=None
+        )
+        assert "k7_disk_source=spare-disk" in inv
 
     def test_disk_ignored_for_qemu_longhorn(self):
         inv = _build_default_inventory(
@@ -236,7 +242,7 @@ class TestBuildDefaultInventory:
             longhorn_extra_disk="/mnt/lh",
         )
         assert "k7_backends=kata-firecracker-devmapper,kata-qemu-longhorn" in inv
-        assert "k7_devmapper_disk=/dev/nvme1n1" in inv
+        assert "k7_disk_source=device:/dev/nvme1n1" in inv
         assert "longhorn_extra_disk=/mnt/lh" in inv
 
     def test_remote_hosts_as_server(self):

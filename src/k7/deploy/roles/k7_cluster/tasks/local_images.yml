@@ -1,0 +1,123 @@
+---
+# `--api-image local` / `--node-installer-image local` only (k7_local_images,
+# facts.yml): build on the first master with Docker, import into every
+# node's containerd. The CLI passes the cwd checkout as `k7_repo_root`;
+# direct runs from a checkout use the playbook-relative path.
+- name: Resolve k7 repo root for the local image builds
+  ansible.builtin.set_fact:
+    k7_repo_root_resolved: "{{ k7_repo_root | default(playbook_dir + '/../../..') }}"
+  when: k7_local_image_build | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Verify k7 repo root contains the Dockerfiles
+  ansible.builtin.stat:
+    path: "{{ k7_repo_root_resolved }}/{{ item.dockerfile }}"
+  loop: "{{ k7_local_images }}"
+  register: k7_local_dockerfiles
+  when: k7_local_image_build | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Fail when a Dockerfile is missing from the resolved repo root
+  ansible.builtin.fail:
+    msg: >-
+      Resolved k7_repo_root='{{ k7_repo_root_resolved }}' on
+      {{ k7_first_master }} does not contain {{ item.item.dockerfile }}.
+      A `local` image builds from the k7 checkout in the cwd; run `k7 install`
+      from one, or drop the flag to deploy the release's pinned image.
+  loop: "{{ k7_local_dockerfiles.results }}"
+  when: k7_local_image_build | bool and not item.stat.exists
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Build the local images
+  # ``--network=host`` works around a recurring DNS flake on Hetzner nodes
+  # where the default Docker bridge can't resolve pypi.org / registry-1
+  # mid-build. Host networking shares the node's already-working resolver
+  # (no functional downside for a build that just fetches packages).
+  ansible.builtin.command: "docker build --network=host -f {{ item.dockerfile }} -t {{ item.tag }} ."
+  args:
+    chdir: "{{ k7_repo_root_resolved }}"
+  loop: "{{ k7_local_images }}"
+  when: k7_local_image_build | bool
+  register: k7_local_builds
+  changed_when: k7_local_builds.rc == 0
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Read the local image IDs
+  ansible.builtin.command: "docker images --no-trunc -q {{ item.tag }}"
+  loop: "{{ k7_local_images }}"
+  register: k7_local_image_ids
+  changed_when: false
+  failed_when: k7_local_image_ids.stdout is not match('^sha256:[0-9a-f]{64}$')
+  when: k7_local_image_build | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Record the local image IDs by tag
+  ansible.builtin.set_fact:
+    k7_local_image_id: "{{ dict(k7_local_image_ids.results | map(attribute='item.tag') | zip(k7_local_image_ids.results | map(attribute='stdout'))) }}"
+  when: k7_local_image_build | bool
+  tags: ['k7', 'api']
+
+- name: Export the local images to tarballs  # noqa: no-changed-when
+  ansible.builtin.command: "docker save {{ item.tag }} -o /tmp/{{ item.tag | replace(':', '-') }}.tar"
+  loop: "{{ k7_local_images }}"
+  when: k7_local_image_build | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# fetch base64-encodes the whole file in memory (the installer image is ~2 GB):
+# only a multi-node cluster pays for it, and only for the other nodes.
+- name: Fetch the image tarballs from the first master to the controller
+  ansible.builtin.fetch:
+    src: "/tmp/{{ item.tag | replace(':', '-') }}.tar"
+    dest: "/tmp/{{ item.tag | replace(':', '-') }}.tar"
+    flat: true
+  loop: "{{ k7_local_images }}"
+  when: k7_local_image_build | bool and ansible_play_hosts_all | length > 1
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Distribute the image tarballs to the other nodes (local tags are never pulled)
+  ansible.builtin.copy:
+    src: "/tmp/{{ item.tag | replace(':', '-') }}.tar"
+    dest: "/tmp/{{ item.tag | replace(':', '-') }}.tar"
+    mode: '0644'
+  loop: "{{ k7_local_images }}"
+  when: k7_local_image_build | bool and inventory_hostname != k7_first_master
+  tags: ['k7', 'api']
+
+- name: Import the local images into k3s containerd on every node  # noqa: no-changed-when
+  ansible.builtin.command: "k3s ctr images import /tmp/{{ item.tag | replace(':', '-') }}.tar"
+  loop: "{{ k7_local_images }}"
+  when: k7_local_image_build | bool
+  tags: ['k7', 'api']
+
+- name: Clean up the image tarballs on nodes
+  ansible.builtin.file:
+    path: "/tmp/{{ item.tag | replace(':', '-') }}.tar"
+    state: absent
+  loop: "{{ k7_local_images }}"
+  when: k7_local_image_build | bool
+  tags: ['k7', 'api']
+
+- name: Clean up the image tarballs on the controller
+  ansible.builtin.file:
+    path: "/tmp/{{ item.tag | replace(':', '-') }}.tar"
+    state: absent
+  loop: "{{ k7_local_images }}"
+  when: k7_local_image_build | bool and ansible_play_hosts_all | length > 1
+  run_once: true
+  delegate_to: localhost
+  become: false
+  tags: ['k7', 'api']

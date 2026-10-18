@@ -1,0 +1,4 @@
+# Trivy waivers for the k7-api image. Every entry needs a reason and a
+# review date on the line above it, e.g.:
+#   # CVE-2099-0001: not reachable (no TLS in this binary). Review 2027-01-01.
+#   CVE-2099-0001

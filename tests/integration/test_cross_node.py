@@ -17,14 +17,14 @@ import pytest
 from k7.core.core import K7Core
 from k7.core.models import SandboxConfig
 
-pytestmark = [pytest.mark.integration, pytest.mark.qemu, pytest.mark.multinode]
+from .cluster import KUBECTL
 
-_K3S = "/usr/local/bin/k3s"
+pytestmark = [pytest.mark.integration, pytest.mark.qemu, pytest.mark.multinode]
 
 
 def _kubectl(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [_K3S, "kubectl", *args],
+        [*KUBECTL, *args],
         capture_output=True,
         text=True,
         check=check,
@@ -142,7 +142,7 @@ def cordoned_node() -> Iterator[list[str]]:
     finally:
         for node in cordoned:
             subprocess.run(
-                [_K3S, "kubectl", "uncordon", node],
+                [*KUBECTL, "uncordon", node],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -155,7 +155,7 @@ class TestCrossNodeReplication:
         name = "integ-xn-spread"
         cfg = SandboxConfig(
             name=name,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -186,7 +186,7 @@ class TestCrossNodeReplication:
         name = "integ-xn-migrate"
         cfg = SandboxConfig(
             name=name,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -261,7 +261,7 @@ class TestCrossNodeReplication:
         fork_name = "integ-xn-fork-dst"
         cfg = SandboxConfig(
             name=source,
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             backend="kata-qemu-longhorn",
         )
@@ -304,7 +304,7 @@ class TestCrossNodeReplication:
             for name in names:
                 cfg = SandboxConfig(
                     name=name,
-                    image="alpine:latest",
+                    image="alpine:3.20",
                     namespace=test_namespace,
                     backend="kata-qemu-longhorn",
                 )

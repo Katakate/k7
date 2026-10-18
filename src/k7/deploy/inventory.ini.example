@@ -22,7 +22,10 @@
 ;   ansible_host           : SSH target IP
 ;   ansible_user           : SSH user (defaults to root)
 ;   k7_backends            : comma-separated backend list, or none
-;   k7_devmapper_disk      : block device for FD thin-pool (e.g. /dev/nvme1n1)
+;   k7_disk_source         : spare-disk (default; auto-detect the empty non-root disk),
+;                            device:<path> (e.g. device:/dev/nvme1n1), or loopback
+;                            (XFS image only; no kfd thin-pool, so kfd is rejected).
+;                            Legacy k7_devmapper_disk=<path> still means device:<path>.
 ;   longhorn_extra_disk    : extra mount path to register with Longhorn
 ;   kata_thinpool_pv_size  : LVM PV size for the kfd thin-pool (default 100G)
 ;   k7d_disks_image_size   : sparse XFS image size for k7d volume pool (default 32G)
@@ -30,14 +33,18 @@
 ; Group vars (under [k7_cluster:vars]):
 ;   longhorn_replicas      : Longhorn replica count (defaults to min(3, node count))
 ;   longhorn_data_path     : Longhorn default data path (defaults to /var/lib/longhorn)
+;   k7_distro              : set by `k7 install` (k3s); selects roles/k7_node_prep/vars/<distro>.yml
+;   k3s_version            : pinned in the playbook; override with `k7 install --k3s-version`
+;   k7_dns_upstreams       : CoreDNS's upstream resolvers, 1-3 IPv4, comma-separated
+;                            (e.g. 1.1.1.1,9.9.9.9); default: the host's resolvers
 
 [k7_servers]
-node1 ansible_host=203.0.113.10 k7_backends=kata-qemu-longhorn,kata-firecracker-devmapper k7_devmapper_disk=/dev/nvme1n1
+node1 ansible_host=203.0.113.10 k7_backends=kata-qemu-longhorn,kata-firecracker-devmapper k7_disk_source=device:/dev/nvme1n1
 node2 ansible_host=203.0.113.11 k7_backends=kata-qemu-longhorn
 node3 ansible_host=203.0.113.12 k7_backends=kata-qemu-longhorn
 
 [k7_agents]
-node4 ansible_host=203.0.113.13 k7_backends=kata-firecracker-devmapper k7_devmapper_disk=/dev/nvme1n1
+node4 ansible_host=203.0.113.13 k7_backends=kata-firecracker-devmapper k7_disk_source=device:/dev/nvme1n1
 
 [k7_cluster:children]
 k7_servers
@@ -63,19 +70,17 @@ longhorn_replicas=2
 ;
 ; On dual-NVMe boxes (TWO_DISK=1 reset, or installimage with SWRAID 0 so
 ; the OS is on one NVMe and the other stays raw for the kfd thin-pool),
-; OMIT k7_devmapper_disk: NVMe enumeration (nvme0n1 vs nvme1n1) is NOT
+; OMIT k7_disk_source (spare-disk): NVMe enumeration (nvme0n1 vs nvme1n1) is NOT
 ; stable across reboots, so a hardcoded device can point at the OS disk
 ; after a reboot. The playbook auto-detects the empty non-root whole disk,
-; which is enumeration-proof. Set k7_devmapper_disk only when a node has
+; which is enumeration-proof. Set k7_disk_source=device:<path> only when a node has
 ; several spare disks and you must pick a specific one.
 ; See tutorials/k7_hetzner_node_setup.md (same file is in public Katakate/k7).
 ;
 ; 2-node, ALL backends, from the PPA CLI (no --ha — that needs 3+ servers).
 ; After TWO_DISK=1 so each box has a spare raw NVMe:
 ;
-;   # PPA and GitHub .deb are 0.4.0:
-;   git clone --branch v0.4.0 https://github.com/Katakate/k7.git && cd k7
-;   # run from that checkout so the playbook can build k7-api:local
+;   # PPA and GitHub .deb are 0.5.0 (signed GHCR k7-api; no checkout):
 ;   k7 install -i inventory.ini --k7d-version 0.7.0
 ;
 ; [k7_servers]

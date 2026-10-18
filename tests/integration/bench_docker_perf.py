@@ -67,6 +67,8 @@ import pytest
 from k7.core.core import K7Core, _is_k7d_family
 from k7.core.models import SandboxConfig
 
+from .cluster import KUBECTL
+
 pytestmark = pytest.mark.bench
 
 # How many reps per cell + warm-up. Override via env for ad-hoc shorter runs.
@@ -305,7 +307,7 @@ def _wait_all_containers_ready(name: str, namespace: str, timeout: int = 300) ->
     deadline = _now() + timeout
     while _now() < deadline:
         r = subprocess.run(
-            ["k3s", "kubectl", "get", "pods", "-n", namespace, "-l", f"app={name}", "-o", "json"],
+            [*KUBECTL, "get", "pods", "-n", namespace, "-l", f"app={name}", "-o", "json"],
             capture_output=True,
             text=True,
             check=False,
@@ -540,7 +542,7 @@ async def _bench_sandbox(
 
 
 def _kubectl(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["k3s", "kubectl", *args], capture_output=True, text=True, check=False)
+    return subprocess.run([*KUBECTL, *args], capture_output=True, text=True, check=False)
 
 
 def _sandbox_longhorn_volumes(namespace: str, sandbox: str) -> list[str]:
@@ -790,7 +792,7 @@ async def test_bench_k7d_fc(
     """k7d-fc --docker — same guest service, RuntimeClass k7-fc."""
     _maybe_skip("k7d-fc")
     present = subprocess.run(
-        ["k3s", "kubectl", "get", "runtimeclass", "k7-fc"],
+        [*KUBECTL, "get", "runtimeclass", "k7-fc"],
         capture_output=True,
         text=True,
         check=False,

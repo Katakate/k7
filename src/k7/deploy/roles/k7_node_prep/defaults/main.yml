@@ -1,0 +1,24 @@
+---
+# Distro adapter contract. Every vars/<distro>.yml defines
+# exactly these keys; tests/unit/test_playbook_distro_adapter.py enforces it.
+k7_adapter_distros: ['k3s', 'rke2', 'kubeadm', 'eks-al2023']
+k7_adapter_keys:
+  - k7_containerd_socket
+  - k7_containerd_config_mode
+  - k7_containerd_config_path
+  - k7_containerd_service
+  - k7_containerd_root
+  - k7_kubectl
+
+# k7-node-installer sets all three; `k7 install` leaves them empty.
+# k7_artifact_dir: controller directory of checksum-verified release
+# artifacts (src/k7/deploy/node_installer/artifacts.txt). When set, the role
+# downloads nothing. OS packages still come from the host's package repos.
+k7_artifact_dir: ""
+# k7_node_installer: the node runs a Kubernetes k7 does not drive over SSH —
+# no Docker install, no dist-upgrade, no host firewall changes, containerd
+# restarted only on a change.
+k7_node_installer: false
+# Controller-side path of the target's / (the installer mounts it at /host),
+# for lookups that run on the controller.
+k7_host_root: ""

@@ -1,0 +1,10 @@
+# Release artifacts baked into the k7-node-installer image, so the
+# installer never downloads at runtime. Fetched and sha256-verified at build
+# time by fetch-artifacts.sh. Versions must match the k7-install-node.yaml
+# vars and k7d-fc/pins.env (tests/unit/test_node_installer.py enforces it).
+# file sha256 url
+cni-plugins-linux-amd64-v1.9.0.tgz 58c03705426e929658f45a851df15a86d06ef680cacbf3f2dc127731ca265c28 https://github.com/containernetworking/plugins/releases/download/v1.9.0/cni-plugins-linux-amd64-v1.9.0.tgz
+firecracker-v1.14.0-x86_64.tgz b0c60364661f396b92e350cb9d03e2e0c2140c4c24b1e48830eb7f79eb73e153 https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.0/firecracker-v1.14.0-x86_64.tgz
+firecracker-v1.16.2-x86_64.tgz 32e3cdcd4081f91fe2b024a266f57dcb3b4e5fec5033e0cb22467ad7f7820bda https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.2/firecracker-v1.16.2-x86_64.tgz
+kata-static-3.24.0-amd64.tar.zst f05bbe8e41eb19e4e735baab90c73a9d9968e83356c281a871b6452aa6b06149 https://github.com/kata-containers/kata-containers/releases/download/3.24.0/kata-static-3.24.0-amd64.tar.zst
+k7d-v0.7.0-x86_64-linux.tar.gz 251fd59dd219b71e0bc01338b4d0828c5d0f48861efcd91de5d831be10306f1f https://github.com/katakate/k7d/releases/download/v0.7.0/k7d-v0.7.0-x86_64-linux.tar.gz

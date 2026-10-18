@@ -1,0 +1,48 @@
+{{- if .Values.backends.kql.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k7-snapshot-gc
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-snapshot-gc
+spec:
+  schedule: {{ .Values.snapshotGC.schedule | quote }}
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app: k7-snapshot-gc
+        spec:
+          serviceAccountName: k7-api
+          restartPolicy: OnFailure
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          containers:
+            - name: gc
+              image: {{ include "k7.image" .Values.images.api }}
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "k7.api.snapshot_gc"]
+              env:
+                {{- include "k7.logEnv" . | nindent 16 }}
+                - name: K7_GC_KEEP_FORK_FOR_MINUTES
+                  value: {{ .Values.snapshotGC.keepForkForMinutes | quote }}
+                - name: K7_GC_DRY_RUN
+                  value: "false"
+                {{- include "k7.coreEnv" . | nindent 16 }}
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: "500m"
+                  memory: 256Mi
+{{- end }}

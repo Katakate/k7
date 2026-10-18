@@ -1,0 +1,164 @@
+{{- $sock := include "k7.containerdSocket" . }}
+# No token and no RBAC: VM ops are crictl + k7d.sock only; Kubernetes writes stay on k7-api.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k7-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-agent
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k7-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-agent
+spec:
+  selector:
+    matchLabels:
+      app: k7-agent
+  template:
+    metadata:
+      labels:
+        app: k7-agent
+      annotations:
+        k7.katakate.org/metering-config: {{ include "k7.meteringJson" . | sha256sum | trunc 16 | quote }}
+        {{- include "k7.scrapeAnnotations" . | nindent 8 }}
+    spec:
+      serviceAccountName: k7-agent
+      automountServiceAccountToken: false
+      # The k7d group, pinned by node prep on every node (k7d_gid).
+      securityContext:
+        supplementalGroups: [770]
+      nodeSelector:
+        k7.katakate.org/node-pool: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        {{- with .Values.sandboxNodes.tolerations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: k7-agent
+          image: {{ include "k7.image" .Values.images.api }}
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn", "k7.api.agent:app", "--host", "0.0.0.0", "--port", "8000"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+            {{- include "k7.metricsPort" . | nindent 12 }}
+          env:
+            {{- include "k7.observabilityEnv" . | nindent 12 }}
+            - name: K7_AGENT
+              value: "1"
+            - name: K7_AGENT_TOKEN_FILE
+              value: /etc/k7/agent_token
+            - name: K7_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K7_SYSTEM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: K7_CONTAINERD_SOCKET
+              value: {{ $sock }}
+            {{- include "k7.meteringEnv" . | nindent 12 }}
+            - name: K7_USAGE_SPOOL_DIR
+              value: /var/lib/k7/usage-spool
+          volumeMounts:
+            - name: k7-config
+              mountPath: /etc/k7
+              readOnly: true
+            - name: k7d-run
+              mountPath: /run/k7d
+            - name: containerd-socket
+              mountPath: {{ dir $sock }}
+            - name: k7d-lib
+              mountPath: /var/lib/k7d
+              readOnly: true
+            - name: k7-run
+              mountPath: /run/k7
+              readOnly: true
+            - name: usage-spool
+              mountPath: /var/lib/k7/usage-spool
+            - name: metering-config
+              mountPath: /etc/k7-metering/config
+              readOnly: true
+            - name: metering-headers
+              mountPath: /etc/k7-metering/headers
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: k7-config
+          secret:
+            secretName: k7-agent-token
+            defaultMode: 0400
+        - name: k7d-run
+          hostPath:
+            path: /run/k7d
+            type: DirectoryOrCreate
+        - name: containerd-socket
+          hostPath:
+            path: {{ dir $sock }}
+            type: Directory
+        - name: k7d-lib
+          hostPath:
+            path: /var/lib/k7d
+            type: DirectoryOrCreate
+        - name: k7-run
+          hostPath:
+            path: /run/k7
+            type: DirectoryOrCreate
+        - name: usage-spool
+          hostPath:
+            path: /var/lib/k7/usage-spool
+            type: DirectoryOrCreate
+        - name: metering-config
+          configMap:
+            name: k7-metering
+        - name: metering-headers
+          secret:
+            secretName: k7-metering-headers
+            optional: true
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}

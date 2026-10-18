@@ -1,0 +1,26 @@
+# Base of the render matrix (ci/matrix.yaml). Placeholder digests: rendering only.
+images:
+  api:
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+  nodeInstaller:
+    digest: sha256:2222222222222222222222222222222222222222222222222222222222222222
+api:
+  mode: development
+tls:
+  mode: secret
+  certManager:
+    issuerRef:
+      name: k7-ca
+    dnsNames: [k7-api.example.com]
+backends:
+  kql:
+    storageClass: longhorn
+    volumeSnapshotClass: longhorn
+nodeInstaller:
+  distro: rke2
+  diskSource: spare-disk
+observability:
+  scraperSelector:
+    namespace: monitoring
+    podLabels:
+      app.kubernetes.io/name: prometheus

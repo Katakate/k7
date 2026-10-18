@@ -1,0 +1,378 @@
+---
+# ------------------------------------------------------------------
+# k7d backend: install the k7d daemon, containerd shim,
+# and guest artifacts from the release tarball; provision the host
+# prerequisites (vhost-vsock, erofs tools, reflink-capable XFS for
+# writable volume images) and run k7d as a systemd service.
+# ------------------------------------------------------------------
+- name: K7d — check /dev/kvm exists
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: k7d_kvm_dev
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — fail loudly when /dev/kvm is missing
+  ansible.builtin.fail:
+    msg: >-
+      /dev/kvm not found on {{ inventory_hostname }} — the k7d backend runs hardware-
+      accelerated microVMs and cannot work without KVM. Enable virtualization (VT-x/AMD-V)
+      or drop 'k7d' from k7_backends.
+  when:
+    - k7_has_k7d
+    - not k7d_kvm_dev.stat.exists
+  tags: ['k7d']
+
+- name: K7d — install host prerequisites (erofs, xfs, virtiofsd)
+  ansible.builtin.apt:
+    name:
+      - erofs-utils
+      - xfsprogs
+      - virtiofsd
+    state: present
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — verify /usr/libexec/virtiofsd is executable
+  ansible.builtin.stat:
+    path: /usr/libexec/virtiofsd
+  register: k7d_virtiofsd
+  failed_when: not (k7d_virtiofsd.stat.exists and k7d_virtiofsd.stat.executable)
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — configure vhost-vsock + tun modules to load at boot
+  ansible.builtin.lineinfile:
+    path: /etc/modules-load.d/k7d.conf
+    line: "{{ item }}"
+    create: true
+    mode: '0644'
+  loop:
+    - vhost_vsock
+    - tun
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — load vhost-vsock + tun modules now
+  ansible.builtin.command: modprobe {{ item }}
+  loop:
+    - vhost_vsock
+    - tun
+  when: k7_has_k7d
+  changed_when: false
+  tags: ['k7d']
+
+- name: K7d — fail loudly when /dev/vhost-vsock is missing
+  ansible.builtin.stat:
+    path: /dev/vhost-vsock
+  register: k7d_vhost_vsock
+  failed_when: not k7d_vhost_vsock.stat.exists
+  when: k7_has_k7d
+  tags: ['k7d']
+
+# Writable k7d volume images are raw ext4 files that warm forks clone
+# with FICLONE reflinks; the root FS is usually ext4 (no reflink), so
+# provision a sparse XFS (reflink=1) image loop-mounted at
+# /var/lib/k7d/disks, persisted via /etc/fstab.
+- name: K7d — create /var/lib/k7d directory
+  ansible.builtin.file:
+    path: /var/lib/k7d
+    state: directory
+    mode: '0755'
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — check whether /var/lib/k7d/disks is already mounted
+  ansible.builtin.command: mountpoint -q /var/lib/k7d/disks
+  register: k7d_disks_mounted
+  changed_when: false
+  failed_when: false
+  when: k7_has_k7d
+  tags: ['k7d', 'first-boot']
+
+- name: K7d — create sparse XFS image for /var/lib/k7d/disks
+  ansible.builtin.command: truncate -s {{ k7d_disks_image_size }} /var/lib/k7d/disks.img
+  args:
+    creates: /var/lib/k7d/disks.img
+  when:
+    - k7_has_k7d
+    - k7d_disks_mounted.rc != 0
+  tags: ['k7d', 'first-boot']
+
+- name: K7d — format the disks image as XFS with reflink=1
+  ansible.builtin.command: mkfs.xfs -q -m reflink=1 /var/lib/k7d/disks.img
+  when:
+    - k7_has_k7d
+    - k7d_disks_mounted.rc != 0
+  register: k7d_mkfs
+  changed_when: k7d_mkfs.rc == 0
+  failed_when: k7d_mkfs.rc != 0 and 'appears to contain an existing filesystem' not in k7d_mkfs.stderr
+  tags: ['k7d', 'first-boot']
+
+- name: K7d — persist /var/lib/k7d/disks in /etc/fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    line: "/var/lib/k7d/disks.img /var/lib/k7d/disks xfs loop,nofail 0 0"
+    create: true
+    mode: '0644'
+  when: k7_has_k7d
+  tags: ['k7d', 'first-boot']
+
+- name: K7d — mount /var/lib/k7d/disks
+  ansible.builtin.shell: |
+    set -eu
+    mkdir -p /var/lib/k7d/disks
+    mountpoint -q /var/lib/k7d/disks || mount /var/lib/k7d/disks
+  when: k7_has_k7d
+  changed_when: false
+  tags: ['k7d', 'first-boot']
+
+- name: K7d — verify /var/lib/k7d/disks is reflink-capable
+  ansible.builtin.shell: |
+    set -eu
+    echo probe > /var/lib/k7d/disks/.reflink-probe-src
+    cp --reflink=always /var/lib/k7d/disks/.reflink-probe-src /var/lib/k7d/disks/.reflink-probe-dst
+    rm -f /var/lib/k7d/disks/.reflink-probe-src /var/lib/k7d/disks/.reflink-probe-dst
+  when: k7_has_k7d
+  changed_when: false
+  tags: ['k7d', 'first-boot']
+
+# ---- Release artifacts: tarball → /opt/k7d, installed via the
+# bundled install.sh (binaries → /usr/local/bin, guest assets →
+# /usr/local/share/k7d, k7d.service unit + socket wait). k3s
+# registration is NOT delegated to install.sh — the playbook's
+# merged containerd template + RuntimeClass tasks own that.
+- name: K7d — create /opt/k7d directory
+  ansible.builtin.file:
+    path: /opt/k7d
+    state: directory
+    mode: '0755'
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — copy release tarball from controller (k7d_artifact_local_path or k7_artifact_dir)
+  ansible.builtin.copy:
+    src: "{{ k7d_artifact_local_path if k7d_artifact_local_path | length > 0 else k7_artifact_dir ~ '/k7d-v' ~ k7d_version ~ '-x86_64-linux.tar.gz' }}"
+    dest: /tmp/k7d-release.tar.gz
+    mode: '0644'
+  when:
+    - k7_has_k7d
+    - (k7d_artifact_local_path | length > 0) or (k7_artifact_dir | length > 0)
+  tags: ['k7d']
+
+- name: K7d — require a pinned sha256 for k7d {{ k7d_version }}
+  ansible.builtin.assert:
+    that: k7d_sha256 is defined or k7d_version in k7d_sha256s
+    fail_msg: >-
+      No sha256 pinned for k7d {{ k7d_version }}. Add it to k7d_sha256s (from the
+      release's SHA256SUMS) or pass -e k7d_sha256=<hex>.
+  when:
+    - k7_has_k7d
+    - k7d_artifact_local_path | length == 0
+  tags: ['k7d']
+
+- name: K7d — download release tarball ({{ k7d_artifact_url }})
+  ansible.builtin.get_url:
+    url: "{{ k7d_artifact_url }}"
+    dest: /tmp/k7d-release.tar.gz
+    checksum: "sha256:{{ k7d_sha256 | default(k7d_sha256s[k7d_version]) }}"
+    mode: '0644'
+    timeout: 120
+  register: k7d_dl
+  retries: 5
+  delay: 10
+  until: k7d_dl is success
+  when:
+    - k7_has_k7d
+    - k7d_artifact_local_path | length == 0
+    - k7_artifact_dir | length == 0
+  tags: ['k7d']
+
+- name: K7d — extract release tarball to /opt/k7d
+  ansible.builtin.unarchive:
+    src: /tmp/k7d-release.tar.gz
+    dest: /opt/k7d
+    remote_src: true
+  register: k7d_extracted
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — verify release artifacts are complete
+  ansible.builtin.stat:
+    path: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/{{ item }}"
+  register: k7d_artifact_stat
+  failed_when: not k7d_artifact_stat.stat.exists
+  loop:
+    - install.sh
+    - k7d
+    - containerd-shim-k7-v1
+    - vmlinux
+    - initramfs.cpio.gz
+  when: k7_has_k7d
+  tags: ['k7d']
+
+# install.sh runs `groupadd --system k7d` only when the group is missing.
+- name: K7d — read the k7d group
+  ansible.builtin.command: getent group k7d
+  register: k7d_group
+  changed_when: false
+  failed_when: k7d_group.rc not in [0, 2]
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — fail loud when the k7d group has another gid than k7d_gid
+  ansible.builtin.fail:
+    msg: >-
+      The k7d group on {{ inventory_hostname }} has gid {{ k7d_group.stdout.split(':')[2] }}, but the
+      k7-agent DaemonSet runs with the pinned k7d_gid {{ k7d_gid }} and could not open
+      /run/k7d/k7d.sock. Migrate the node (stop k7d.service, `groupmod -g {{ k7d_gid }} k7d`,
+      `find /var/lib/k7d /run/k7d -gid {{ k7d_group.stdout.split(':')[2] }} -exec chgrp -h k7d {} +`,
+      start k7d.service) or reinstall it, then re-run.
+  when:
+    - k7_has_k7d
+    - k7d_group.rc == 0
+    - k7d_group.stdout.split(':')[2] | int != k7d_gid | int
+  tags: ['k7d']
+
+- name: K7d — create the k7d group with the pinned gid
+  ansible.builtin.group:
+    name: k7d
+    gid: "{{ k7d_gid }}"
+    system: true
+  when:
+    - k7_has_k7d
+    - k7d_group.rc == 2
+  tags: ['k7d']
+
+- name: K7d — check whether the k7d control socket already exists
+  ansible.builtin.stat:
+    path: /run/k7d/k7d.sock
+  register: k7d_socket_stat
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — run the release install.sh (binaries, guest assets, k7d.service)
+  ansible.builtin.command: ./install.sh
+  args:
+    chdir: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux"
+  when:
+    - k7_has_k7d
+    - k7d_extracted.changed or not k7d_socket_stat.stat.exists
+  changed_when: true
+  tags: ['k7d']
+
+# The static runc rides into every k7d guest on the shim's "tools"
+# erofs image; the shim looks for it at /opt/k7d/runc.amd64 (release
+# install) before falling back to a host runc. A node with neither
+# cannot start containers — fail here, not at first pod.
+- name: K7d — check for bundled static runc in the release
+  ansible.builtin.stat:
+    path: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/runc.amd64"
+  register: k7d_runc_bundled
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — install bundled static runc to /opt/k7d/runc.amd64
+  ansible.builtin.copy:
+    src: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/runc.amd64"
+    dest: /opt/k7d/runc.amd64
+    mode: '0755'
+    remote_src: true
+  when:
+    - k7_has_k7d
+    - k7d_runc_bundled.stat.exists
+  tags: ['k7d']
+
+- name: K7d — verify a static runc is available for the guest tools image
+  ansible.builtin.shell: |
+    set -eu
+    test -x /opt/k7d/runc.amd64 || test -x /usr/bin/runc || test -x /usr/sbin/runc
+  when: k7_has_k7d
+  changed_when: false
+  tags: ['k7d']
+
+- name: K7d — check for a docker payload in the release tarball
+  ansible.builtin.stat:
+    path: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/docker/bin/dockerd"
+  register: k7d_docker_payload
+  when: k7_has_k7d
+  tags: ['k7d']
+
+- name: K7d — install docker payload to /usr/local/share/k7d/docker
+  ansible.builtin.copy:
+    src: "/opt/k7d/k7d-v{{ k7d_version }}-x86_64-linux/docker/"
+    dest: /usr/local/share/k7d/docker/
+    mode: '0755'
+    remote_src: true
+  when:
+    - k7_has_k7d
+    - k7d_docker_payload.stat.exists
+  tags: ['k7d']
+
+- name: K7d — wait for the control socket /run/k7d/k7d.sock
+  ansible.builtin.wait_for:
+    path: /run/k7d/k7d.sock
+    state: present
+    timeout: 30
+  when: k7_has_k7d
+  tags: ['k7d']
+
+# k7d-fc: pinned upstream Firecracker + jailer (NOT Kata's
+# /opt/kata/bin firecracker). Sha mismatch is fatal.
+- name: K7d-fc — create /opt/k7d-fc and /etc/k7d
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /opt/k7d-fc
+    - /etc/k7d
+    - /var/cache/k7d-firecracker
+  when: k7_has_k7d_fc
+  tags: ['k7d', 'k7d-fc']
+
+# The CLI writes this playbook to a tempfile, so playbook_dir-relative
+# `k7d-fc/install-firecracker.sh` cannot work (same trap as the API
+# manifests). Copy from the controller's packaged deploy dir.
+- name: K7d-fc — stage install-firecracker.sh and pins
+  ansible.builtin.copy:
+    src: "{{ k7_deploy_dir }}/k7d-fc/{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: install-firecracker.sh, dest: /opt/k7d-fc/install-firecracker.sh, mode: '0755' }
+    - { src: pins.env, dest: /opt/k7d-fc/pins.env, mode: '0644' }
+  loop_control:
+    label: "{{ item.dest }}"
+  when: k7_has_k7d_fc
+  tags: ['k7d', 'k7d-fc']
+
+# install-firecracker.sh skips its download when its cache holds a tarball
+# with the pinned sha256; the script still verifies it.
+- name: K7d-fc — stage the pinned Firecracker tarball from k7_artifact_dir
+  vars:
+    k7d_fc_version: "{{ lookup('ansible.builtin.ini', 'FIRECRACKER_VERSION', type='properties', file=k7_deploy_dir ~ '/k7d-fc/pins.env') }}"
+  ansible.builtin.copy:
+    src: "{{ k7_artifact_dir }}/firecracker-{{ k7d_fc_version }}-x86_64.tgz"
+    dest: "/var/cache/k7d-firecracker/firecracker-{{ k7d_fc_version }}-x86_64.tgz"
+    mode: '0644'
+  when:
+    - k7_has_k7d_fc
+    - k7_artifact_dir | length > 0
+  tags: ['k7d', 'k7d-fc']
+
+- name: K7d-fc — install pinned Firecracker + jailer (sha verified)
+  ansible.builtin.command: /opt/k7d-fc/install-firecracker.sh
+  register: k7d_fc_install
+  changed_when: "'already' not in (k7d_fc_install.stdout | default(''))"
+  when: k7_has_k7d_fc
+  tags: ['k7d', 'k7d-fc']
+
+- name: K7d-fc — write shim ConfigPath toml
+  ansible.builtin.copy:
+    dest: /etc/k7d/shim-k7-fc.toml
+    content: |
+      backend = "firecracker"
+    mode: '0644'
+  when: k7_has_k7d_fc
+  tags: ['k7d', 'k7d-fc']

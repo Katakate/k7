@@ -1,0 +1,19 @@
+# One config for every opted-in node (k7.katakate.org/node-pool=true).
+# Keys (entrypoint.validate_config rejects anything else):
+#   distro              k3s | rke2 | kubeadm | eks-al2023 (k3s and rke2 are proven)
+#   backends            non-empty list of kfd, kql, k7d, k7d-fc
+#   diskSource          spare-disk | loopback | device:/dev/<disk> (loopback: no kfd)
+#   k7dDisksImageSize   optional, e.g. 64G (k7d XFS reflink image)
+#   kataThinpoolPvSize  optional, e.g. 400G (kfd LVM PV)
+#   allowServerRestart  optional, default false: refuse K3s/RKE2 server nodes
+#   wipeDisks           optional, default false: cleanup mode removes disk state
+# The installer watches the mounted file: a change re-applies node prep and
+# relabels within about a minute (kubelet refresh + 30s poll).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k7-node-installer
+  namespace: k7-system
+data:
+  config.json: |
+    {"distro": "k3s", "backends": ["k7d"], "diskSource": "loopback"}

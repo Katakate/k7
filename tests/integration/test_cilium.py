@@ -14,15 +14,16 @@ import pytest
 from k7.core.core import K7Core
 from k7.core.models import SandboxConfig
 
-pytestmark = pytest.mark.integration
+from .cluster import KUBECONFIG, KUBECTL
+from .netprobe import reachable
 
-_K3S = "/usr/local/bin/k3s"
+pytestmark = pytest.mark.integration
 
 
 def _cilium_crd_present() -> bool:
     try:
         result = subprocess.run(
-            [_K3S, "kubectl", "get", "crd", "ciliumnetworkpolicies.cilium.io"],
+            [*KUBECTL, "get", "crd", "ciliumnetworkpolicies.cilium.io"],
             capture_output=True,
             text=True,
         )
@@ -155,15 +156,9 @@ class TestCiliumFqdnEgress:
             assert allowed.exit_code == 0
             assert allowed.stdout.strip().startswith("2") or allowed.stdout.strip().startswith("3")
 
-            blocked = await k7_core.exec_command(
-                "integ-fqdn-net",
-                "curl -sS -o /dev/null --max-time 8 https://www.iana.org/ && echo OK || echo BLOCKED",
-                namespace=test_namespace,
-            )
-            assert "BLOCKED" in blocked.stdout, (
-                f"Expected non-whitelisted domain to be blocked, got stdout={blocked.stdout!r} "
-                f"stderr={blocked.stderr!r}"
-            )
+            assert not await reachable(
+                k7_core, "integ-fqdn-net", "curl -sS -o /dev/null --max-time 8 https://www.iana.org/", test_namespace
+            ), "Expected non-whitelisted domain to be blocked"
         finally:
             await k7_core.delete_sandbox("integ-fqdn-net", namespace=test_namespace)
 
@@ -208,14 +203,13 @@ class TestCiliumFqdnEgress:
             await k7_core.delete_sandbox(name, namespace=test_namespace)
 
 
-_KUBECONFIG = "/etc/rancher/k3s/k3s.yaml"
 _HUBBLE = "/usr/local/bin/hubble"
 _CILIUM = "/usr/local/bin/cilium"
 
 
 def _hubble_env() -> dict[str, str]:
     env = os.environ.copy()
-    env["KUBECONFIG"] = _KUBECONFIG
+    env["KUBECONFIG"] = KUBECONFIG
     return env
 
 
@@ -223,8 +217,7 @@ def _hubble_relay_ready() -> bool:
     try:
         result = subprocess.run(
             [
-                _K3S,
-                "kubectl",
+                *KUBECTL,
                 "-n",
                 "kube-system",
                 "get",
@@ -310,15 +303,9 @@ class TestHubbleObserveDropped:
         pf = None
         try:
             await _wait_ready(k7_core, name, test_namespace)
-            blocked = await k7_core.exec_command(
-                name,
-                "curl -sS -o /dev/null --max-time 8 https://www.iana.org/ && echo OK || echo BLOCKED",
-                namespace=test_namespace,
-            )
-            assert "BLOCKED" in blocked.stdout, (
-                f"Expected non-whitelisted domain to be blocked, got stdout={blocked.stdout!r} "
-                f"stderr={blocked.stderr!r}"
-            )
+            assert not await reachable(
+                k7_core, name, "curl -sS -o /dev/null --max-time 8 https://www.iana.org/", test_namespace
+            ), "Expected non-whitelisted domain to be blocked"
 
             pf = _start_hubble_port_forward()
             deadline = time.time() + 45

@@ -1,0 +1,118 @@
+---
+- name: K3s resolver file (k7_dns_upstreams)
+  ansible.builtin.import_tasks: dns.yml
+
+# ------------------------------------------------------------------
+# K3s install (role-aware) — server-init / server-join / agent
+# ------------------------------------------------------------------
+- name: Compute K3s install env
+  ansible.builtin.set_fact:
+    k3s_common_exec: >-
+      --write-kubeconfig-mode 644
+      --cluster-cidr=10.42.0.0/16
+      --service-cidr=10.43.0.0/16
+      {{ '--flannel-backend=none --disable-network-policy --disable-kube-proxy' if k7_cni_is_cilium else '' }}
+
+# get.k3s.io serves whatever is newest; fetch install.sh from a pinned tag
+# instead. It verifies the k3s binary against the release's sha256sum.
+- name: Download pinned K3s install script
+  ansible.builtin.get_url:
+    url: "https://raw.githubusercontent.com/k3s-io/k3s/{{ k3s_install_sh_ref | urlencode }}/install.sh"
+    dest: /tmp/k3s-install.sh
+    checksum: "sha256:{{ k3s_install_sh_sha256 }}"
+    mode: '0755'
+    timeout: 60
+  register: k3s_script_dl
+  retries: 5
+  delay: 10
+  until: k3s_script_dl is success
+  tags: ['k3s']
+
+- name: Install K3s on first master (cluster-init)  # noqa: command-instead-of-module
+  ansible.builtin.shell: |
+    INSTALL_K3S_VERSION='{{ k3s_version }}' \
+      INSTALL_K3S_SKIP_START=true \
+      K3S_RESOLV_CONF={{ k3s_resolv_conf }} \
+      INSTALL_K3S_EXEC='server --cluster-init --disable=traefik {{ k3s_common_exec }}' \
+      sh /tmp/k3s-install.sh
+  args:
+    creates: /usr/local/bin/k3s
+  register: k3s_init
+  retries: 5
+  delay: 10
+  until: k3s_init is success
+  when:
+    - k7_node_role == 'server'
+    - inventory_hostname == k7_first_master
+  tags: ['k3s']
+
+# First-master needs to boot once so the join token exists for other masters/agents.
+- name: Start K3s on first master to initialise cluster (one-shot)
+  ansible.builtin.systemd:
+    name: k3s
+    state: started
+    enabled: true
+  when:
+    - k7_node_role == 'server'
+    - inventory_hostname == k7_first_master
+  tags: ['k3s']
+
+- name: Wait for K3s server token on first master
+  ansible.builtin.wait_for:
+    path: /var/lib/rancher/k3s/server/node-token
+    timeout: 180
+  when:
+    - k7_node_role == 'server'
+    - inventory_hostname == k7_first_master
+  tags: ['k3s']
+
+- name: Read K3s token on first master
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: k3s_token_b64
+  when:
+    - k7_node_role == 'server'
+    - inventory_hostname == k7_first_master
+  tags: ['k3s']
+
+- name: Distribute K3s token + master URL to all hosts
+  ansible.builtin.set_fact:
+    k3s_token: "{{ hostvars[k7_first_master]['k3s_token_b64']['content'] | b64decode | trim }}"
+    k3s_url: "https://{{ hostvars[k7_first_master]['ansible_host'] | default(k7_first_master) }}:6443"
+  tags: ['k3s']
+
+- name: Install K3s on additional master nodes (server join)  # noqa: command-instead-of-module
+  ansible.builtin.shell: |
+    INSTALL_K3S_VERSION='{{ k3s_version }}' \
+      INSTALL_K3S_SKIP_START=true \
+      K3S_TOKEN='{{ k3s_token }}' \
+      K3S_RESOLV_CONF={{ k3s_resolv_conf }} \
+      INSTALL_K3S_EXEC='server --server {{ k3s_url }} --disable=traefik {{ k3s_common_exec }}' \
+      sh /tmp/k3s-install.sh
+  args:
+    creates: /usr/local/bin/k3s
+  register: k3s_join
+  retries: 5
+  delay: 10
+  until: k3s_join is success
+  when:
+    - k7_node_role == 'server'
+    - inventory_hostname != k7_first_master
+  tags: ['k3s']
+
+- name: Install K3s on agent nodes  # noqa: command-instead-of-module
+  ansible.builtin.shell: |
+    INSTALL_K3S_VERSION='{{ k3s_version }}' \
+      INSTALL_K3S_SKIP_START=true \
+      K3S_URL='{{ k3s_url }}' \
+      K3S_TOKEN='{{ k3s_token }}' \
+      K3S_RESOLV_CONF={{ k3s_resolv_conf }} \
+      sh /tmp/k3s-install.sh
+  args:
+    creates: /usr/local/bin/k3s
+  register: k3s_agent
+  retries: 5
+  delay: 10
+  until: k3s_agent is success
+  when: k7_node_role == 'agent'
+  tags: ['k3s']

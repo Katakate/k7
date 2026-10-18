@@ -6,8 +6,10 @@ Where **K7** is headed — for contributors and operators.
 
 ## Current focus
 
-Release engineering: keep the apt/PPA, GHCR `k7-api`, and PyPI `k7-sdk`
-pipelines current with `main` (PPA, GitHub `.deb`, and PyPI `k7-sdk` are **0.4.0**).
+Release engineering: keep the apt/PPA and PyPI `k7-sdk` pipelines current
+with `main` (PPA, GitHub `.deb`, and PyPI `k7-sdk` are **0.5.0**). The
+published CLI deploys the signed GHCR `k7-api` by digest; a source checkout
+uses `k7 install --api-image local`.
 
 ---
 
@@ -34,7 +36,10 @@ pipelines current with `main` (PPA, GitHub `.deb`, and PyPI `k7-sdk` are **0.4.0
 
 ## Next goals
 
-- [x] PPA / GHCR / PyPI cut of the unreleased work (HTTPS, `--docker`, `k7d-fc`)
+- [x] PPA / PyPI cut of the unreleased work (HTTPS, `--docker`, `k7d-fc`)
+- [ ] GHCR `k7-api` image, signed, installed by digest without a checkout
+  (checked only after a tagged release installs from GHCR on a
+  clean node)
 - [ ] Optional macOS CLI artifacts (tarball / Homebrew) — after the above
 
 ---
@@ -59,4 +64,4 @@ pipelines current with `main` (PPA, GitHub `.deb`, and PyPI `k7-sdk` are **0.4.0
 
 ---
 
-*Last updated: September 2026*
+*Last updated: October 2026*

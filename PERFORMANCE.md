@@ -1,5 +1,23 @@
 # Performance
 
+## Quota lease latency — 2026-10-10
+
+Single AMD node (k7d-ci-01, 12 threads, 62 GiB), k3s v1.36.5, two
+k7-api replicas, from the `⏱️  Quota lease` lines in the k7-api logs
+during `tests/integration/test_tenancy.py`. "Acquire" is the wait for
+`k7-quota-<tenant>`; "held" is usage computed plus the Deployment
+created under it.
+
+| Load | n | acquire p50 | acquire p90 | acquire max | held p50 | held p90 | held max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| sequential creates (boundary tests) | 18 | 5.0 ms | 8.8 ms | 10.5 ms | 12.3 ms | 25.4 ms | 111 ms |
+| 20 concurrent creates, both replicas (races) | 113 | 739 ms | 1590 ms | 1963 ms | 70.9 ms | 94.3 ms | 142 ms |
+
+Uncontended, a quota adds about 20 ms to a create (two Lease round trips
+plus listing the tenant's sandboxes). Under a 20-way burst the creates
+queue on the Lease: the worst wait was 2.0 s against the 5 s
+`QuotaLockTimeout`, and every race landed exactly on its quota.
+
 ## Show HN cut — 2026-08-18 (apt `k7` 0.2.1, two-node, all backends)
 
 Two Hetzner AX41-1-LTD boxes (k7-node-01 + k7-node-02). The third box

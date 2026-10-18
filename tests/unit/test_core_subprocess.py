@@ -268,7 +268,7 @@ class TestGetRegistryImageConfig:
         image_config = {"config": {"Entrypoint": ["/ep"]}}
 
         async def mock_get(url, **kwargs):
-            if "/manifests/latest" in url:
+            if "/manifests/v1" in url:
                 return _mock_httpx_response(index)
             if "/manifests/sha256:amd" in url:
                 return _mock_httpx_response(inner_manifest)
@@ -276,7 +276,7 @@ class TestGetRegistryImageConfig:
 
         p = _patch_httpx(mock_get)
         try:
-            result = await core._get_registry_image_config("ghcr.io/org/repo:latest")
+            result = await core._get_registry_image_config("ghcr.io/org/repo:v1")
         finally:
             p.stop()
 
@@ -299,7 +299,7 @@ class TestGetRegistryImageConfig:
         p = _patch_httpx(mock_get)
         try:
             with _pytest.raises(ValueError, match="No linux/amd64"):
-                await core._get_registry_image_config("ghcr.io/org/repo:latest")
+                await core._get_registry_image_config("ghcr.io/org/repo:v1")
         finally:
             p.stop()
 

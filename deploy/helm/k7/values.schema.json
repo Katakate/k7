@@ -1,0 +1,624 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "images",
+    "networkPolicy",
+    "tls",
+    "api",
+    "backends",
+    "nodeInstaller",
+    "sandboxNodes",
+    "hookTimeoutSeconds",
+    "snapshotGC",
+    "observability",
+    "auth",
+    "metering"
+  ],
+  "definitions": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "digest"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._/:-]*$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "ratio": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1
+    }
+  },
+  "properties": {
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api",
+        "nodeInstaller",
+        "caddy"
+      ],
+      "properties": {
+        "api": {
+          "$ref": "#/definitions/image"
+        },
+        "nodeInstaller": {
+          "$ref": "#/definitions/image"
+        },
+        "caddy": {
+          "$ref": "#/definitions/image"
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "acknowledgeNoPlatformDeny",
+        "acknowledgeNoEgressPolicy",
+        "platformNamespaces",
+        "apiAllowCIDRs"
+      ],
+      "properties": {
+        "provider": {
+          "enum": [
+            "cilium",
+            "kubernetes",
+            "none"
+          ]
+        },
+        "acknowledgeNoPlatformDeny": {
+          "type": "boolean"
+        },
+        "acknowledgeNoEgressPolicy": {
+          "type": "boolean"
+        },
+        "platformNamespaces": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "apiAllowCIDRs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$"
+          }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "secretName",
+        "certManager"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "certManager",
+            "secret",
+            "insecureHTTP"
+          ]
+        },
+        "secretName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "certManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "issuerRef",
+            "dnsNames",
+            "ipAddresses"
+          ],
+          "properties": {
+            "issuerRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "kind",
+                "group"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "Issuer",
+                    "ClusterIssuer"
+                  ]
+                },
+                "group": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "dnsNames": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "ipAddresses": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "replicas",
+        "service",
+        "tolerations",
+        "nodeSelector",
+        "remoteInstall"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "production",
+            "development"
+          ]
+        },
+        "replicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "nodePort"
+          ],
+          "properties": {
+            "type": {
+              "enum": [
+                "ClusterIP",
+                "NodePort",
+                "LoadBalancer"
+              ]
+            },
+            "nodePort": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            }
+          }
+        },
+        "tolerations": {
+          "$ref": "#/definitions/tolerations"
+        },
+        "nodeSelector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "remoteInstall": {
+          "type": "boolean"
+        }
+      }
+    },
+    "backends": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kfd",
+        "kql",
+        "k7d",
+        "k7dFc"
+      ],
+      "properties": {
+        "kfd": {
+          "$ref": "#/definitions/backend"
+        },
+        "kql": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "storageClass",
+            "volumeSnapshotClass"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "storageClass": {
+              "type": "string"
+            },
+            "volumeSnapshotClass": {
+              "type": "string"
+            }
+          }
+        },
+        "k7d": {
+          "$ref": "#/definitions/backend"
+        },
+        "k7dFc": {
+          "$ref": "#/definitions/backend"
+        }
+      }
+    },
+    "nodeInstaller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "distro",
+        "diskSource",
+        "k7dDisksImageSize",
+        "kataThinpoolPvSize",
+        "allowServerRestart",
+        "wipeDisks",
+        "forceCleanup"
+      ],
+      "properties": {
+        "distro": {
+          "enum": [
+            "k3s",
+            "rke2",
+            "kubeadm",
+            "eks-al2023"
+          ]
+        },
+        "diskSource": {
+          "type": "string",
+          "pattern": "^(spare-disk|loopback|device:/dev/\\S+)$"
+        },
+        "k7dDisksImageSize": {
+          "type": "string",
+          "pattern": "^([0-9]+[KMGT])?$"
+        },
+        "kataThinpoolPvSize": {
+          "type": "string",
+          "pattern": "^([0-9]+[KMGT])?$"
+        },
+        "allowServerRestart": {
+          "type": "boolean"
+        },
+        "wipeDisks": {
+          "type": "boolean"
+        },
+        "forceCleanup": {
+          "type": "boolean"
+        }
+      }
+    },
+    "sandboxNodes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tolerations"
+      ],
+      "properties": {
+        "tolerations": {
+          "$ref": "#/definitions/tolerations"
+        }
+      }
+    },
+    "hookTimeoutSeconds": {
+      "type": "integer",
+      "minimum": 60
+    },
+    "snapshotGC": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schedule",
+        "keepForkForMinutes"
+      ],
+      "properties": {
+        "schedule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "keepForkForMinutes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metrics",
+        "scraperSelector",
+        "logLevel",
+        "serviceMonitor",
+        "prometheusRule",
+        "monitorLabels",
+        "grafanaDashboards",
+        "thresholds"
+      ],
+      "properties": {
+        "metrics": {
+          "type": "boolean"
+        },
+        "scraperSelector": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            },
+            "podLabels": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "logLevel": {
+          "enum": [
+            "debug",
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "serviceMonitor": {
+          "type": "boolean"
+        },
+        "prometheusRule": {
+          "type": "boolean"
+        },
+        "monitorLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "grafanaDashboards": {
+          "type": "boolean"
+        },
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "apiErrorRatio",
+            "keyStoreStaleSeconds",
+            "thinpoolDataRatio",
+            "thinpoolMetadataRatio",
+            "k7dDisksRatio",
+            "storageReportStaleSeconds",
+            "tlsExpirySeconds",
+            "opP95BudgetSeconds"
+          ],
+          "properties": {
+            "apiErrorRatio": {
+              "$ref": "#/definitions/ratio"
+            },
+            "keyStoreStaleSeconds": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "thinpoolDataRatio": {
+              "$ref": "#/definitions/ratio"
+            },
+            "thinpoolMetadataRatio": {
+              "$ref": "#/definitions/ratio"
+            },
+            "k7dDisksRatio": {
+              "$ref": "#/definitions/ratio"
+            },
+            "storageReportStaleSeconds": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "tlsExpirySeconds": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "opP95BudgetSeconds": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "create",
+                "delete",
+                "fork",
+                "pause",
+                "resume",
+                "snapshot",
+                "restore"
+              ],
+              "properties": {
+                "create": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "delete": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "fork": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "pause": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "resume": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "snapshot": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                },
+                "restore": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "oidc"
+      ],
+      "properties": {
+        "oidc": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "issuer",
+            "audience",
+            "clientId",
+            "groupsClaim",
+            "usernameClaim",
+            "jwksTtlSeconds"
+          ],
+          "properties": {
+            "issuer": {
+              "type": "string",
+              "pattern": "^(https://.+)?$"
+            },
+            "audience": {
+              "type": "string"
+            },
+            "clientId": {
+              "type": "string"
+            },
+            "groupsClaim": {
+              "type": "string"
+            },
+            "usernameClaim": {
+              "type": "string"
+            },
+            "jwksTtlSeconds": {
+              "type": "integer",
+              "minimum": 10
+            }
+          }
+        }
+      }
+    },
+    "metering": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "storageInterval",
+        "spool",
+        "requireDelivery",
+        "prometheusUrl",
+        "sinks"
+      ],
+      "properties": {
+        "sampleInterval": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 60
+        },
+        "storageInterval": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 600
+        },
+        "spool": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "maxBytes",
+            "highWaterPercent"
+          ],
+          "properties": {
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 16777216
+            },
+            "highWaterPercent": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 99
+            }
+          }
+        },
+        "requireDelivery": {
+          "type": "boolean"
+        },
+        "prometheusUrl": {
+          "type": "string",
+          "pattern": "^(https?://.+)?$"
+        },
+        "sinks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "http",
+                  "stdout"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

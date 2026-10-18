@@ -1,0 +1,8 @@
+---
+# UNVERIFIED until the Helm chart runs a kubeadm cluster. Do not advertise support.
+k7_containerd_socket: /run/containerd/containerd.sock
+k7_containerd_config_mode: drop-in
+k7_containerd_config_path: /etc/containerd/conf.d/k7.toml
+k7_containerd_service: containerd
+k7_containerd_root: /var/lib/containerd
+k7_kubectl: kubectl

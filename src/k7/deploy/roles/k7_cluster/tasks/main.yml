@@ -1,0 +1,8 @@
+---
+# Cluster-wide resources via the adapter's k7_kubectl. Requires the
+# k7_node_prep facts.yml contract and a k7_kubeconfig fact (set by k7_k3s).
+- name: Validate cluster and API options
+  ansible.builtin.import_tasks: validate.yml
+
+- name: Cluster resources
+  ansible.builtin.import_tasks: resources.yml

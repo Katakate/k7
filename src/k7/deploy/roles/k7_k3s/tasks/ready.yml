@@ -1,0 +1,12 @@
+---
+# HA note: joining servers may spend minutes as etcd learners before
+# the local apiserver goes Ready (only one learner can join at a time
+# when several masters restart together) — hence the generous retries.
+- name: Wait for kube-api /readyz (servers only)
+  ansible.builtin.command: k3s kubectl get --raw /readyz
+  register: readyz
+  retries: 60
+  delay: 5
+  until: readyz.rc == 0
+  changed_when: false
+  when: k7_node_role == 'server'

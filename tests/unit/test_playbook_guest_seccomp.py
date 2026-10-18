@@ -2,11 +2,13 @@
 
 from pathlib import Path
 
+from tests.unit.conftest import install_tree_text
+
 PLAYBOOK = Path(__file__).resolve().parents[2] / "src/k7/deploy/k7-install-node.yaml"
 
 
 def test_playbook_disables_guest_seccomp_bypass_on_both_kata_configs():
-    text = PLAYBOOK.read_text()
+    text = install_tree_text()
     assert "path: /opt/kata/share/defaults/kata-containers/configuration-qemu.toml" in text
     assert "path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml" in text
     assert "regexp: '^#?\\s*disable_guest_seccomp\\s*='" in text
@@ -26,5 +28,5 @@ def test_playbook_disables_guest_seccomp_bypass_on_both_kata_configs():
 
 def test_playbook_does_not_regress_virtiofsd_thread_pool():
     """CHALLENGES.md #10: single-threaded virtiofsd wedges the kata agent."""
-    text = PLAYBOOK.read_text()
+    text = install_tree_text()
     assert 'virtio_fs_extra_args = ["--thread-pool-size=16", "--announce-submounts"]' in text

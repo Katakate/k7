@@ -1,0 +1,22 @@
+# `k7 install --monitoring`: kube-prometheus-stack 92.3.0 for a
+# single-box install. Grafana keeps the chart defaults: a random admin
+# password and a sidecar that loads grafana_dashboard=1 ConfigMaps from
+# every namespace.
+prometheus:
+  prometheusSpec:
+    # Select K7's ServiceMonitor, PodMonitor and PrometheusRule (kube-system),
+    # which carry no Helm release label.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    retention: 7d
+# K3s runs these in the k3s process: no scrape endpoints, so their default
+# alerts would fire forever.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false

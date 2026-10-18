@@ -1,0 +1,10 @@
+# k7-node-installer cleanup mode: undo k7_node_prep on a node.
+# Required: k7_distro, k7_cleanup_wipe_disks (the installer entrypoint passes both).
+- name: Remove K7 node preparation
+  hosts: k7_cluster
+  become: true
+  tasks:
+    - name: Node prep — cleanup
+      ansible.builtin.import_role:
+        name: k7_node_prep
+        tasks_from: cleanup

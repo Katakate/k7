@@ -1,0 +1,61 @@
+# helm test: one sandbox per enabled backend — create, exec, fork (kql, k7d,
+# k7d-fc), delete — through K7Core with the k7-api ServiceAccount and env.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: k7-test-sandboxes
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-helm-test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  serviceAccountName: k7-api
+  restartPolicy: Never
+  activeDeadlineSeconds: {{ add .Values.hookTimeoutSeconds 120 }}
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: test
+      image: {{ include "k7.image" .Values.images.api }}
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-m", "k7.api.chart_hooks", "test"]
+      env:
+        - name: K7_HOOK_BACKENDS
+          value: {{ include "k7.backends" . | fromJsonArray | join "," }}
+        - name: K7_HOOK_TIMEOUT_S
+          value: {{ .Values.hookTimeoutSeconds | quote }}
+        - name: K7_K7D_REMOTE_ONLY
+          value: "1"
+        {{- include "k7.coreEnv" . | nindent 8 }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: k7-config
+          mountPath: /etc/k7
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: k7-config
+      projected:
+        defaultMode: 0440
+        sources:
+          - configMap:
+              name: k7-host-config
+          - secret:
+              name: k7-agent-token
+    - name: tmp
+      emptyDir: {}

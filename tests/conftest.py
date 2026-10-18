@@ -1,7 +1,8 @@
-import shutil
 import subprocess
 
 import pytest
+
+from tests.integration.cluster import HAS_CLUSTER, KUBECTL
 
 
 def _detect_backends() -> set[str]:
@@ -10,14 +11,13 @@ def _detect_backends() -> set[str]:
     Sources, in order of preference:
     1. `k7.katakate.org/backend-<name>=true` labels on the cluster's nodes.
     2. `/etc/k7/backend` (legacy, single primary backend) — fallback for
-       hosts where k3s isn't reachable.
+       hosts where the cluster isn't reachable.
     """
-    if shutil.which("k3s"):
+    if HAS_CLUSTER:
         try:
             result = subprocess.run(
                 [
-                    "k3s",
-                    "kubectl",
+                    *KUBECTL,
                     "get",
                     "nodes",
                     "-o",
@@ -66,12 +66,12 @@ def _detect_backends() -> set[str]:
 
 
 def _detect_node_count() -> int:
-    """Count Ready k3s nodes; 0 when k3s is unavailable (e.g. local Mac)."""
-    if not shutil.which("k3s"):
+    """Count Ready nodes; 0 without a cluster (e.g. local Mac)."""
+    if not HAS_CLUSTER:
         return 0
     try:
         result = subprocess.run(
-            ["k3s", "kubectl", "get", "nodes", "--no-headers"],
+            [*KUBECTL, "get", "nodes", "--no-headers"],
             capture_output=True,
             text=True,
             check=False,

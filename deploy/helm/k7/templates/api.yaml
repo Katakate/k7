@@ -1,0 +1,453 @@
+{{- include "k7.validate" . }}
+{{- $tls := include "k7.tls" . }}
+{{- $caddyfile := "{\n    auto_https off\n}\n\n:8443 {\n    tls /certs/tls.crt /certs/tls.key\n    reverse_proxy 127.0.0.1:8000\n}\n" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k7-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-api
+---
+# Same rules as src/k7/deploy/manifests/k7-api/clusterrole.yaml (unit-tested).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k7-api
+  labels:
+    app: k7-api
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "pods/log", "configmaps", "persistentvolumeclaims", "namespaces", "nodes", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots", "volumesnapshotcontents", "volumesnapshotclasses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["longhorn.io"]
+    resources: ["volumes"]
+    verbs: ["get"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get"]
+  - apiGroups: ["k7.katakate.org"]
+    resources: ["tenants"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["k7.katakate.org"]
+    resources: ["tenants/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k7-api
+  labels:
+    app: k7-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k7-api
+subjects:
+  - kind: ServiceAccount
+    name: k7-api
+    namespace: {{ .Release.Namespace }}
+---
+# The pre-install hook creates both key Secrets (k7.api.chart_hooks).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k7-api-keys
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-api
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["k7-api-keys"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["k7-api-keys-usage"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k7-api-keys
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k7-api-keys
+subjects:
+  - kind: ServiceAccount
+    name: k7-api
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.api.remoteInstall }}
+---
+# Same rules as src/k7/deploy/manifests/k7-node-installer/k7-api-access/rbac.yaml (unit-tested).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k7-api-remote-install
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["k7-node-installer"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k7-api-remote-install
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k7-api-remote-install
+subjects:
+  - kind: ServiceAccount
+    name: k7-api
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+---
+# What the playbook copies from the first master's /etc/k7 (backend = first enabled).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k7-host-config
+  namespace: {{ .Release.Namespace }}
+data:
+  backend: {{ include "k7.defaultBackend" . }}
+  {{- if include "k7.hasK7d" . }}
+  k7d_version: {{ printf "%s\n" (index .Chart.Annotations "katakate.org/k7d-version") | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k7-metering
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-api
+data:
+  metering.json: {{ include "k7.meteringJson" . | quote }}
+{{- with include "k7.oidcData" . }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k7-oidc
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app: k7-api
+data:
+  {{- . | nindent 2 }}
+{{- end }}
+{{- if $tls }}
+---
+# k7_api_tls.render_caddyfile(acme=False), unit-tested.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k7-api-caddyfile
+  namespace: {{ .Release.Namespace }}
+data:
+  Caddyfile: {{ $caddyfile | quote }}
+{{- end }}
+{{- if eq .Values.tls.mode "certManager" }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: k7-api
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: {{ .Values.tls.secretName }}
+  issuerRef:
+    {{- toYaml .Values.tls.certManager.issuerRef | nindent 4 }}
+  {{- with .Values.tls.certManager.dnsNames }}
+  dnsNames:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tls.certManager.ipAddresses }}
+  ipAddresses:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k7-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-api
+spec:
+  # Stateless (keys in Secret k7-api-keys): no node pin, PDB minAvailable 1.
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app: k7-api
+  template:
+    metadata:
+      labels:
+        app: k7-api
+      annotations:
+        k7.katakate.org/oidc-config: {{ include "k7.oidcData" . | sha256sum | trunc 16 | quote }}
+        k7.katakate.org/metering-config: {{ include "k7.meteringJson" . | sha256sum | trunc 16 | quote }}
+        {{- if $tls }}
+        k7.katakate.org/caddyfile-sha256: {{ sha256sum $caddyfile | quote }}
+        {{- end }}
+        {{- include "k7.scrapeAnnotations" . | nindent 8 }}
+    spec:
+      serviceAccountName: k7-api
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: k7-api
+      {{- with .Values.api.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        {{- with .Values.api.tolerations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      securityContext:
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: k7-api
+          image: {{ include "k7.image" .Values.images.api }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+            {{- include "k7.metricsPort" . | nindent 12 }}
+          env:
+            {{- if $tls }}
+            - name: K7_TLS_CERT_SOURCE
+              value: {{ .Values.tls.mode }}
+            - name: K7_TLS_SNI
+              value: ""
+            {{- end }}
+            {{- include "k7.observabilityEnv" . | nindent 12 }}
+            - name: K7_API_KEY_STORE
+              value: secret
+            - name: K7_K7D_REMOTE_ONLY
+              value: "1"
+            - name: K7_API_MODE
+              value: {{ .Values.api.mode }}
+            - name: K7_API_TRANSPORT
+              value: {{ if $tls }}https{{ else }}insecure-http{{ end }}
+            {{- include "k7.coreEnv" . | nindent 12 }}
+            - name: K7_API_ENABLE_REMOTE_INSTALL
+              value: {{ ternary "1" "0" .Values.api.remoteInstall | quote }}
+            - name: K7_NODE_INSTALLER_IMAGE
+              value: {{ ternary (include "k7.image" .Values.images.nodeInstaller) "" .Values.api.remoteInstall | quote }}
+            - name: K7_NODE_INSTALLER_NAMESPACE
+              value: {{ ternary .Release.Namespace "" .Values.api.remoteInstall | quote }}
+            - name: K7_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- include "k7.meteringEnv" . | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: k7-oidc
+                optional: true
+          volumeMounts:
+            - name: k7-config
+              mountPath: /etc/k7
+              readOnly: true
+            - name: metering-config
+              mountPath: /etc/k7-metering/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+        {{- if $tls }}
+        - name: caddy
+          image: {{ include "k7.image" .Values.images.caddy }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+          ports:
+            - containerPort: 8443
+              protocol: TCP
+          volumeMounts:
+            - name: caddy-data
+              mountPath: /data
+            - name: caddyfile
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+            - name: tls-certs
+              mountPath: /certs
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+        {{- end }}
+      volumes:
+        - name: k7-config
+          projected:
+            defaultMode: 0440
+            sources:
+              - configMap:
+                  name: k7-host-config
+              - secret:
+                  name: k7-agent-token
+        - name: metering-config
+          configMap:
+            name: k7-metering
+        - name: tmp
+          emptyDir: {}
+        {{- if $tls }}
+        - name: caddy-data
+          emptyDir: {}
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        - name: caddyfile
+          configMap:
+            name: k7-api-caddyfile
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k7-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-api
+spec:
+  type: {{ .Values.api.service.type }}
+  {{- if .Values.networkPolicy.apiAllowCIDRs }}
+  # The allowlist needs the client's source IP.
+  externalTrafficPolicy: Local
+  {{- end }}
+  selector:
+    app: k7-api
+  ports:
+    - port: 8000
+      targetPort: {{ if $tls }}8443{{ else }}8000{{ end }}
+      protocol: TCP
+      {{- if .Values.api.service.nodePort }}
+      nodePort: {{ .Values.api.service.nodePort }}
+      {{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: k7-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: k7-api
+spec:
+  {{- if gt (int .Values.api.replicas) 1 }}
+  minAvailable: 1
+  {{- else }}
+  # One replica: minAvailable 1 would block every node drain.
+  maxUnavailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      app: k7-api

@@ -1,0 +1,152 @@
+{{/* Hook RBAC exists only while a hook phase runs (before-hook-creation,hook-succeeded). */}}
+{{- $ns := .Release.Namespace }}
+{{- $phases := "pre-install,pre-upgrade,pre-delete" }}
+{{- $del := "before-hook-creation,hook-succeeded" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k7-hook
+  namespace: {{ $ns }}
+  annotations:
+    helm.sh/hook: {{ $phases }}
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: {{ $del }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k7-hook
+  annotations:
+    helm.sh/hook: {{ $phases }}
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: {{ $del }}
+rules:
+  # Preflight: CNI, policy engine, storage, Pod Security of the namespace.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cilium-config"]
+    verbs: ["get"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: [{{ $ns | quote }}]
+    verbs: ["get"]
+  # Uninstall: which nodes are opted in / still labelled ready. Install with
+  # api.remoteInstall off: unlabel the nodes POST /api/v1/install added.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k7-hook
+  annotations:
+    helm.sh/hook: {{ $phases }}
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: {{ $del }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k7-hook
+subjects:
+  - kind: ServiceAccount
+    name: k7-hook
+    namespace: {{ $ns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k7-hook
+  namespace: {{ $ns }}
+  annotations:
+    helm.sh/hook: {{ $phases }}
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: {{ $del }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["k7-agent-token", "k7-api-keys", "k7-api-keys-usage"]
+    verbs: ["get", "delete"]
+  # k7-cluster-id: created once, never deleted.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["k7-cluster-id"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["k7-node-installer", "k7-node-cleanup"]
+    verbs: ["get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  # POST /api/v1/install operation records, dropped when api.remoteInstall is off.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k7-hook
+  namespace: {{ $ns }}
+  annotations:
+    helm.sh/hook: {{ $phases }}
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: {{ $del }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k7-hook
+subjects:
+  - kind: ServiceAccount
+    name: k7-hook
+    namespace: {{ $ns }}
+---
+{{ include "k7.hookJob" (dict "ctx" . "name" "k7-preflight" "command" "install" "hook" "pre-install,pre-upgrade" "weight" "0") }}
+---
+{{ include "k7.hookJob" (dict "ctx" . "name" "k7-uninstall-stop" "command" "uninstall-stop" "hook" "pre-delete" "weight" "-10") }}
+---
+# The installer is gone (k7-uninstall-stop); each pod undoes node prep on its
+# node and then sleeps, Ready. k7-uninstall-wait waits for all of them.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k7-node-cleanup
+  namespace: {{ $ns }}
+  labels:
+    app: k7-node-cleanup
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: {{ $del }}
+spec:
+  selector:
+    matchLabels:
+      app: k7-node-cleanup
+  template:
+    metadata:
+      labels:
+        app: k7-node-cleanup
+    spec:
+      {{- $args := ternary (list "cleanup" "--force") (list "cleanup") .Values.nodeInstaller.forceCleanup }}
+      {{- include "k7.installerPodSpec" (dict "ctx" . "sa" "k7-node-cleanup" "name" "cleanup" "args" $args) | nindent 6 }}
+---
+{{ include "k7.hookJob" (dict "ctx" . "name" "k7-uninstall-wait" "command" "uninstall-wait" "hook" "pre-delete" "weight" "10") }}

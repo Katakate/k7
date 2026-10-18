@@ -1,0 +1,75 @@
+# k7-node-installer (kata-deploy pattern): prepares each opted-in
+# node, labels it k7.katakate.org/node-ready=<version> only after full
+# success, then sleeps. CrashLoopBackOff is the loud failure signal.
+# The image is a placeholder: apply the release's k7-node-installer.yaml
+# (this directory with the signed image digest, images.py), not this tree.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k7-node-installer
+  namespace: k7-system
+  labels:
+    app: k7-node-installer
+spec:
+  selector:
+    matchLabels:
+      app: k7-node-installer
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: k7-node-installer
+    spec:
+      serviceAccountName: k7-node-installer
+      hostPID: true
+      priorityClassName: system-node-critical
+      # Operators opt nodes in; never every node by default.
+      nodeSelector:
+        k7.katakate.org/node-pool: "true"
+      # Empty on purpose: add the taints of your sandbox node pool.
+      tolerations: []
+      containers:
+        - name: installer
+          image: __K7_NODE_INSTALLER_IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["install"]
+          env:
+            - name: K7_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K7_INSTALLER_CONFIG
+              value: /etc/k7-node-installer/config.json
+          # Root on the host by design: Ansible runs in PID 1's namespaces
+          # (nsenter) and moves files through /host.
+          securityContext:
+            privileged: true
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/k7-node-installer-ready"]
+            periodSeconds: 10
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+            # Whole directory, not subPath: the installer watches it for changes.
+            - name: config
+              mountPath: /etc/k7-node-installer
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        - name: config
+          configMap:
+            name: k7-node-installer

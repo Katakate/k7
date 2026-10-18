@@ -14,7 +14,7 @@ class TestSandboxLifecycle:
     async def test_create_exec_delete(self, k7_core: K7Core, test_namespace: str):
         cfg = SandboxConfig(
             name="integ-basic",
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
         )
         result = await k7_core.create_sandbox(cfg)
@@ -36,7 +36,7 @@ class TestSandboxLifecycle:
     async def test_before_script(self, k7_core: K7Core, test_namespace: str):
         cfg = SandboxConfig(
             name="integ-before",
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             before_script="touch /tmp/marker",
         )
@@ -61,7 +61,7 @@ class TestSandboxLifecycle:
     async def test_resource_limits(self, k7_core: K7Core, test_namespace: str):
         cfg = SandboxConfig(
             name="integ-limits",
-            image="alpine:latest",
+            image="alpine:3.20",
             namespace=test_namespace,
             limits={"cpu": "250m", "memory": "256Mi"},
         )

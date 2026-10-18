@@ -3,25 +3,28 @@
 The static ``manifests/k7-api/{deployment,service}.yaml`` stay the HTTP
 NodePort (``--api-insecure-http``). When TLS is on, the playbook copies
 those files and this module overwrites them with a Caddy sidecar on
-``:8443``. The k7-api container and its HTTP probes are unchanged.
+``:8443``. The k7-api container and its HTTP probes are unchanged. The
+Caddyfile reaches the pod as ConfigMap ``k7-api-caddyfile`` (the playbook
+creates it from ``/etc/k7/caddy/Caddyfile``), so files-mode replicas can
+run on any node. ACME keeps certificate state in a first-master hostPath
+and binds hostPort 80, so it pins one replica there.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 
-# linux/amd64 digest for caddy:2.10.2 (Docker Hub, 2026-02-11). The
-# playbook pulls CADDY_PIN; the pod spec uses CADDY_IMAGE (the tag).
-# kubelet imagePullPolicy=Never does not resolve tag@digest to a
-# locally imported tag (measured: ErrImageNeverPull).
+# linux/amd64 digest for caddy:2.10.2 (Docker Hub, 2026-02-11). The pod
+# spec uses CADDY_PIN; the node's containerd pulls it by digest.
 CADDY_IMAGE = "caddy:2.10.2"
 CADDY_DIGEST = "sha256:d8c17a862962def15cde69863a3a463f25a2664942eafd7bdbf050e9c3116b83"
 CADDY_PIN = f"{CADDY_IMAGE}@{CADDY_DIGEST}"
 
 _CADDY_CONTAINER_FILES = f"""        - name: caddy
-          image: {CADDY_IMAGE}
-          imagePullPolicy: Never
+          image: {CADDY_PIN}
+          imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -45,6 +48,10 @@ _CADDY_CONTAINER_FILES = f"""        - name: caddy
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           livenessProbe:
             tcpSocket:
               port: 8443
@@ -62,8 +69,8 @@ _CADDY_CONTAINER_FILES = f"""        - name: caddy
 """
 
 _CADDY_CONTAINER_ACME = f"""        - name: caddy
-          image: {CADDY_IMAGE}
-          imagePullPolicy: Never
+          image: {CADDY_PIN}
+          imagePullPolicy: IfNotPresent
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -87,6 +94,10 @@ _CADDY_CONTAINER_ACME = f"""        - name: caddy
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 12
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           livenessProbe:
             tcpSocket:
               port: 8443
@@ -103,46 +114,71 @@ _CADDY_CONTAINER_ACME = f"""        - name: caddy
               memory: 128Mi
 """
 
-_API_TLS_HIDE_MOUNT = """            - name: tls-hide
-              mountPath: /etc/k7/tls
+_CADDYFILE_VOLUME = """        - name: caddyfile
+          configMap:
+            name: k7-api-caddyfile
 """
 
-_VOLUMES_FILES = """        - name: caddy-data
-          hostPath:
-            path: /etc/k7/caddy
-            type: DirectoryOrCreate
-        - name: caddyfile
-          hostPath:
-            path: /etc/k7/caddy
-            type: Directory
+_VOLUMES_FILES = (
+    """        - name: caddy-data
+          emptyDir: {}
         - name: tls-certs
           secret:
             secretName: k7-api-tls
-        - name: tls-hide
-          emptyDir: {}
 """
+    + _CADDYFILE_VOLUME
+)
 
-_VOLUMES_ACME = """        - name: caddy-data
+_VOLUMES_ACME = (
+    """        - name: caddy-data
           hostPath:
             path: /etc/k7/caddy
             type: DirectoryOrCreate
-        - name: caddyfile
-          hostPath:
-            path: /etc/k7/caddy
-            type: Directory
-        - name: tls-hide
-          emptyDir: {}
+"""
+    + _CADDYFILE_VOLUME
+)
+
+_ACME_PIN = """      nodeSelector:
+        k7.katakate.org/first-master: "true"
 """
 
 
-def render_deployment(http_yaml: str, *, acme: bool) -> str:
-    """Insert the Caddy sidecar and hide ``/etc/k7/tls`` from the API container."""
+def _replace_once(text: str, old: str, new: str, what: str) -> str:
+    if old not in text:
+        raise ValueError(f"deployment.yaml is missing {what}")
+    return text.replace(old, new, 1)
+
+
+def render_deployment(http_yaml: str, *, acme: bool, caddyfile: str = "", hostname: str = "") -> str:
+    """Insert the Caddy sidecar; ACME also pins one replica to the first master.
+
+    The Caddyfile hash goes on the pod template so a Caddyfile change rolls the pods.
+    k7-api reads the served certificate's expiry back through the sidecar, so it is
+    told the source and the SNI to send (the hostname for ACME, none for files).
+    """
     if "name: caddy" in http_yaml:
         raise ValueError("deployment.yaml already has a caddy container")
-    hide_at = "            - name: k3s-containerd\n              mountPath: /run/k3s/containerd\n"
-    if hide_at not in http_yaml:
-        raise ValueError("deployment.yaml is missing the k3s-containerd mount; cannot hide /etc/k7/tls")
-    yaml = http_yaml.replace(hide_at, hide_at + _API_TLS_HIDE_MOUNT, 1)
+    annotations = "    metadata:\n      labels:\n        app: k7-api\n      annotations:\n"
+    digest = hashlib.sha256(caddyfile.encode()).hexdigest()
+    yaml = _replace_once(
+        http_yaml,
+        annotations,
+        annotations + f'        k7.katakate.org/caddyfile-sha256: "{digest}"\n',
+        "the pod template annotations",
+    )
+    env = "          env:\n"
+    yaml = _replace_once(
+        yaml,
+        env,
+        env
+        + f"            - name: K7_TLS_CERT_SOURCE\n              value: {'acme' if acme else 'files'}\n"
+        + f'            - name: K7_TLS_SNI\n              value: "{hostname if acme else ""}"\n',
+        "the k7-api env",
+    )
+    if acme:
+        yaml = _replace_once(yaml, "  replicas: 2\n", "  replicas: 1\n", "replicas: 2")
+        sa = "      serviceAccountName: k7-api\n"
+        yaml = _replace_once(yaml, sa, sa + _ACME_PIN, "serviceAccountName: k7-api")
     volumes_at = "      volumes:\n"
     if volumes_at not in yaml:
         raise ValueError("deployment.yaml is missing the volumes: block")
@@ -152,6 +188,11 @@ def render_deployment(http_yaml: str, *, acme: bool) -> str:
     if not yaml.endswith("\n"):
         yaml += "\n"
     return yaml + extra
+
+
+def render_pdb(pdb_yaml: str) -> str:
+    """One ACME replica: a minAvailable: 1 PDB would block every node drain."""
+    return _replace_once(pdb_yaml, "  minAvailable: 1\n", "  maxUnavailable: 1\n", "minAvailable: 1")
 
 
 def render_service(http_yaml: str) -> str:
@@ -193,10 +234,14 @@ def write_tls_manifests(
 ) -> None:
     dep = manifest_dir / "deployment.yaml"
     svc = manifest_dir / "service.yaml"
-    dep.write_text(render_deployment(dep.read_text(), acme=acme))
+    caddyfile = render_caddyfile(acme=acme, hostname=hostname, staging=staging)
+    dep.write_text(render_deployment(dep.read_text(), acme=acme, caddyfile=caddyfile, hostname=hostname))
     svc.write_text(render_service(svc.read_text()))
+    if acme:
+        pdb = manifest_dir / "pdb.yaml"
+        pdb.write_text(render_pdb(pdb.read_text()))
     caddy_dir.mkdir(parents=True, exist_ok=True)
-    (caddy_dir / "Caddyfile").write_text(render_caddyfile(acme=acme, hostname=hostname, staging=staging))
+    (caddy_dir / "Caddyfile").write_text(caddyfile)
 
 
 def main(argv: list[str] | None = None) -> int:

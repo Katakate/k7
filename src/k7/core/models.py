@@ -18,11 +18,14 @@ class SandboxConfig:
     image: str
     namespace: str = "default"
     runtime_class_name: str | None = None
-    root_disk_size: str | None = "10Gi"
+    root_disk_size: str | None = None  # kql root PVC; unset = tenant defaultSize.disk, else 10Gi
     backend: str | None = None  # "kata-firecracker-devmapper", "kata-qemu-longhorn", "k7d", or "k7d-fc"
     env_file: str | None = None
     egress_whitelist: list[str] | None = None
     limits: dict[str, str] | None = None
+    # Per-VM bandwidth caps in bits/s (``egressBps`` / ``ingressBps``, e.g. "500M");
+    # may only lower a tenant's limits.network. kfd/kql only.
+    network_limits: dict[str, str] | None = None
     before_script: str = ""
     entrypoint: list[str] | None = None
     cmd: list[str] | None = None
@@ -107,12 +110,18 @@ class ExecResult:
         return asdict(self)
 
 
+class RegistryUnresolvableError(ValueError):
+    """An allowlisted registry host did not resolve: the cluster's DNS is failing, not the request."""
+
+
 @dataclass
 class OperationResult:
     success: bool
     message: str = ""
     error: str = ""
     data: Any = None
+    # The failure is a dependency outage (e.g. DNS); the same request may succeed later.
+    transient: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -168,7 +177,7 @@ class SnapshotInfo:
     creation_timestamp: str  # RFC3339 string (kept verbatim from the API)
     age: str  # human-readable, computed from creation_timestamp
     size_bytes: int = 0  # 0 when restoreSize is unknown / not yet set
-    snapshot_class: str = "longhorn"
+    snapshot_class: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

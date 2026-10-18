@@ -1,0 +1,17 @@
+# version = 3
+{{ template "base" . }}
+
+
+
+# k7d runtime: containerd resolves the shim binary from runtime_type
+# (io.containerd.k7.v1 -> containerd-shim-k7-v1). Do NOT add an
+# [options] BinaryName — it leaks into the cgroup path and breaks
+# shim startup. pod_annotations forwards only the k7d annotations
+# k7 sets into the sandbox OCI spec; the shim acts on others too
+# (cluster-id skips the pod netns, tree-* adopt/fork VMs).
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7]
+  runtime_type  = "io.containerd.k7.v1"
+  pod_annotations = ["k7d.katakate.org/docker", "k7d.katakate.org/docker-disk", "k7d.katakate.org/fork-source-cluster", "k7d.katakate.org/fork-source-vm"]
+  privileged_without_host_devices = true
+  snapshotter   = "overlayfs"
+

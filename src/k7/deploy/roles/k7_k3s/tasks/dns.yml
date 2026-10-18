@@ -1,0 +1,76 @@
+---
+# k3s's --resolv-conf (K3S_RESOLV_CONF) is the file the kubelet copies into
+# dnsPolicy=Default pods at creation, CoreDNS included, and the k3s Corefile
+# forwards `.` to that /etc/resolv.conf. k7_dns_upstreams (dns_validate.yml)
+# replaces it with a k7-owned file; unset keeps the host's resolvers. Already
+# installed nodes are converged through the unit's env file (install.sh only
+# writes it once); the k3s restart in containerd.yml applies it and
+# nodes.yml restarts CoreDNS when k7_dns_changed.
+- name: Set k3s resolver file paths
+  ansible.builtin.set_fact:
+    k7_dns_resolv_path: /etc/k7/resolv.conf
+    k7_k3s_env_file: "/etc/systemd/system/{{ 'k3s' if k7_node_role == 'server' else 'k3s-agent' }}.service.env"
+  tags: ['dns']
+
+- name: Detect systemd-resolved resolv.conf
+  ansible.builtin.stat:
+    path: /run/systemd/resolve/resolv.conf
+  register: resolved_resolv
+  tags: ['dns']
+
+- name: Set k3s resolv.conf path
+  ansible.builtin.set_fact:
+    k3s_resolv_conf: >-
+      {{ k7_dns_resolv_path if k7_dns_upstreams_list | length > 0
+         else resolved_resolv.stat.exists | ternary('/run/systemd/resolve/resolv.conf', '/etc/resolv.conf') }}
+  tags: ['dns']
+
+- name: Ensure the k7 config directory exists
+  ansible.builtin.file:
+    path: "{{ k7_dns_resolv_path | dirname }}"
+    state: directory
+    mode: '0755'
+  when: k7_dns_upstreams_list | length > 0
+  tags: ['dns']
+
+- name: Write the k3s resolv.conf from k7_dns_upstreams
+  ansible.builtin.copy:
+    dest: "{{ k7_dns_resolv_path }}"
+    content: |
+      # Managed by k7 (k7_dns_upstreams): k3s --resolv-conf, i.e. CoreDNS's upstreams.
+      {% for ip in k7_dns_upstreams_list %}
+      nameserver {{ ip }}
+      {% endfor %}
+    mode: '0644'
+  register: k7_dns_resolv_file
+  when: k7_dns_upstreams_list | length > 0
+  tags: ['dns']
+
+- name: Check for an installed k3s unit env file
+  ansible.builtin.stat:
+    path: "{{ k7_k3s_env_file }}"
+  register: k7_k3s_env_stat
+  tags: ['dns']
+
+# Same quoting as install.sh's `sh -c export`, so a fresh install is unchanged.
+- name: Point the installed k3s unit at k3s_resolv_conf
+  ansible.builtin.lineinfile:
+    path: "{{ k7_k3s_env_file }}"
+    regexp: '^K3S_RESOLV_CONF='
+    line: "K3S_RESOLV_CONF='{{ k3s_resolv_conf }}'"
+  register: k7_dns_env
+  when: k7_k3s_env_stat.stat.exists
+  tags: ['dns']
+
+- name: Remove the k7_dns_upstreams resolv.conf when unset
+  ansible.builtin.file:
+    path: "{{ k7_dns_resolv_path }}"
+    state: absent
+  register: k7_dns_resolv_removed
+  when: k7_dns_upstreams_list | length == 0
+  tags: ['dns']
+
+- name: Record whether CoreDNS needs a restart for new upstreams
+  ansible.builtin.set_fact:
+    k7_dns_changed: "{{ k7_dns_resolv_file is changed or k7_dns_env is changed or k7_dns_resolv_removed is changed }}"
+  tags: ['dns']

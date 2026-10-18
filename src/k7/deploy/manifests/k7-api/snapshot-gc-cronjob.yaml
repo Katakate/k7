@@ -30,14 +30,26 @@ spec:
               effect: NoSchedule
           containers:
             - name: gc
-              image: k7-api:local
-              imagePullPolicy: Never
+              image: __K7_API_IMAGE__
+              imagePullPolicy: __K7_API_IMAGE_PULL_POLICY__
               command: ["python", "-m", "k7.api.snapshot_gc"]
               env:
+                - name: K7_LOG_FORMAT
+                  value: json
+                - name: K7_LOG_LEVEL
+                  value: info
                 - name: K7_GC_KEEP_FORK_FOR_MINUTES
                   value: "10"
                 - name: K7_GC_DRY_RUN
                   value: "false"
+                - name: K7_SYSTEM_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: K7_KQL_STORAGE_CLASS
+                  value: longhorn
+                - name: K7_KQL_SNAPSHOT_CLASS
+                  value: longhorn
               resources:
                 requests:
                   cpu: 50m

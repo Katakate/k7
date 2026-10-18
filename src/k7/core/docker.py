@@ -37,14 +37,28 @@ DOCKER_HOST_URL = "unix:///run/k7/docker/docker.sock"
 KATA_DAEMON_ARGS = "--host=unix:///run/k7/docker/docker.sock --tls=false --storage-driver=overlay2"
 GRAPH_DEVICE_PATH = "/dev/k7docker"
 KATA_GRAPH_MOUNT = "/var/lib/docker"
-# alpine dind has no fsfreeze; ubuntu sandbox does. Stage via the shared /tmp
-# emptyDir, then exec from the vehicle's own rootfs (emptyDir may be noexec).
-FSFREEZE_STAGED = "/tmp/k7-fsfreeze"
-FSFREEZE_VEHICLE = "/usr/local/bin/k7-fsfreeze"
+# alpine dind has no fsfreeze (nor xfs_freeze); the sandbox image does. Stage
+# it via the shared /tmp emptyDir, then exec from the vehicle's own rootfs
+# (emptyDir may be noexec). The sandbox's fsfreeze is usually glibc and the
+# vehicle is musl, so its libraries and ELF loader travel with it and `run`
+# starts it through that loader.
+FSFREEZE_STAGED = "/tmp/k7-fsfreeze.d"
+FSFREEZE_VEHICLE_DIR = "/usr/local/lib/k7-fsfreeze.d"
+FSFREEZE_VEHICLE = f"{FSFREEZE_VEHICLE_DIR}/run"
+_FSFREEZE_RUN = """#!/bin/sh
+d=$(dirname "$0")
+for ld in "$d"/ld-*; do [ -e "$ld" ] && exec "$ld" --library-path "$d" "$d/fsfreeze" "$@"; done
+exec "$d/fsfreeze" "$@"
+"""
 STAGE_FSFREEZE_CMD = (
-    f"if [ -x /usr/sbin/fsfreeze ]; then cp /usr/sbin/fsfreeze {FSFREEZE_STAGED}; "
-    f"elif [ -x /sbin/fsfreeze ]; then cp /sbin/fsfreeze {FSFREEZE_STAGED}; "
-    "else echo 'fsfreeze not found in sandbox image (need util-linux)' >&2; exit 1; fi"
+    "set -e\n"
+    "f=$(command -v fsfreeze || ls /usr/sbin/fsfreeze /sbin/fsfreeze 2>/dev/null | head -n1)\n"
+    "[ -n \"$f\" ] || { echo 'fsfreeze not found in sandbox image (need util-linux)' >&2; exit 1; }\n"
+    f'd={FSFREEZE_STAGED}; rm -rf $d; mkdir -p $d; cp -L "$f" $d/fsfreeze\n'
+    # Static binaries make ldd fail: nothing to bundle.
+    'if libs=$(ldd "$f" 2>/dev/null); then for l in $(echo "$libs" | grep -o \'/[^ ]*\'); do cp -L "$l" $d/; done; fi\n'
+    f"cat > $d/run <<'EOF'\n{_FSFREEZE_RUN}EOF\n"
+    "chmod 755 $d/run $d/*"
 )
 VEHICLE_CONTAINER_NAME = "docker-vehicle"
 KFD_DOCKER_STORAGE_CLASS = "k7-docker-lvm"
@@ -62,12 +76,6 @@ ANN_DOCKER_PVC = "k7.katakate.org/docker-pvc-name"
 KATA_FORK_GRAPH_REJECT = (
     "k7 fork of a kfd --docker sandbox is not supported: the docker graph cannot be cloned (ephemeral LV)"
 )
-KFD_FORK_REJECT = (
-    "k7 fork is not supported on the kfd (kata-firecracker-devmapper) backend: "
-    "there is no persistent PVC to clone (and a --docker graph cannot be cloned — ephemeral LV). "
-    "Use kql for disk-level fork, or k7d / k7d-fc for warm VM fork."
-)
-
 # Playbook records the installed k7d version here. Guest dockerd
 # and k7-fc shipped in public k7d 0.6.0; a node whose recorded version
 # is older, or that has no docker payload, fails loud.

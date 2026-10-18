@@ -1,0 +1,197 @@
+---
+- name: Gather facts (ensures ansible_distribution_release is available)
+  ansible.builtin.setup:
+  tags: ['always']
+
+- name: Set k7-api image ref and pull policy
+  ansible.builtin.set_fact:
+    k7_api_image_ref: "{{ 'k7-api:local' if k7_api_image == 'local' else k7_api_image }}"
+    k7_api_image_pull_policy: "{{ 'Never' if k7_api_image == 'local' else 'IfNotPresent' }}"
+    k7_api_image_local: "{{ k7_api_image == 'local' }}"
+    k7_node_installer_local: "{{ k7_api_remote_install | bool and k7_node_installer_image == 'local' }}"
+    k7_node_installer_image_ref: "{{ 'k7-node-installer:local' if k7_node_installer_image == 'local' else k7_node_installer_image }}"
+  tags: ['always']
+
+# Images built on the first master with Docker; empty on a release install.
+- name: Set the local image builds
+  ansible.builtin.set_fact:
+    k7_local_images: >-
+      {{ ([{'tag': 'k7-api:local', 'dockerfile': 'src/k7/api/Dockerfile.api'}]
+          if (k7_api_enabled | default(true) | bool) and k7_api_image_local | bool else [])
+         + ([{'tag': 'k7-node-installer:local', 'dockerfile': 'src/k7/deploy/node_installer/Dockerfile'}]
+          if k7_node_installer_local | bool else []) }}
+  tags: ['always']
+
+- name: Set whether anything is built locally
+  ansible.builtin.set_fact:
+    k7_local_image_build: "{{ k7_local_images | length > 0 }}"
+  tags: ['always']
+
+# ──────────────────────────────────────────────────────────────────────
+# Compute per-host backend set + cluster role
+# ──────────────────────────────────────────────────────────────────────
+- name: Require k7_backends on every host
+  ansible.builtin.fail:
+    msg: >-
+      k7_backends is not set on {{ inventory_hostname }} (empty/omitted is not
+      'none'). Set it on the host or a group vars section ([k7_servers:vars] /
+      [k7_agents:vars]). Allowed: kfd, kql, k7d, k7d-fc, or none (no sandbox
+      runtime on this node).
+  when: k7_backends is not defined or (k7_backends | string | trim | length) == 0
+  tags: ['always']
+
+- name: Compute per-host backend list (raw)
+  ansible.builtin.set_fact:
+    k7_backends_raw: "{{ (k7_backends | string).split(',') | map('trim') | reject('equalto', '') | list }}"
+  tags: ['always']
+
+- name: Reject none mixed with other backends
+  ansible.builtin.fail:
+    msg: >-
+      k7_backends={{ k7_backends }} on {{ inventory_hostname }} mixes 'none'
+      with other backends. Use only none, or a list of runtimes.
+  when:
+    - (k7_backends_raw | map('lower') | list | select('equalto', 'none') | list | length) > 0
+    - (k7_backends_raw | length) > 1
+  tags: ['always']
+
+- name: Normalize deprecated backend aliases
+  ansible.builtin.set_fact:
+    k7_backends_list: >-
+      {{
+        [] if (k7_backends_raw | map('lower') | list == ['none'])
+        else (
+          k7_backends_raw
+          | map('regex_replace', '^(fd|kfd|firecracker-devmapper)$', 'kata-firecracker-devmapper')
+          | map('regex_replace', '^(ql|kql|qemu-longhorn)$', 'kata-qemu-longhorn')
+          | map('regex_replace', '^k7$', 'k7d')
+          | map('regex_replace', '^k7-fc$', 'k7d-fc')
+          | unique
+          | list
+        )
+      }}
+  tags: ['always']
+
+- name: Warn on deprecated backend names
+  ansible.builtin.debug:
+    msg: >-
+      Deprecated backend name(s) in inventory were remapped:
+      {{ k7_backends_raw }} → {{ k7_backends_list }}.
+      Prefer kata-firecracker-devmapper (kfd) / kata-qemu-longhorn (kql).
+  when: k7_backends_list | length > 0 and k7_backends_raw != k7_backends_list
+  tags: ['always']
+
+- name: Validate backends list
+  ansible.builtin.fail:
+    msg: "Unknown backend(s) in k7_backends={{ k7_backends_list }}; allowed: kata-firecracker-devmapper, kata-qemu-longhorn, k7d, k7d-fc, or none"
+  when: k7_backends_list | difference(['kata-firecracker-devmapper', 'kata-qemu-longhorn', 'k7d', 'k7d-fc']) | length > 0
+  tags: ['always']
+
+- name: Normalize CNI selection
+  ansible.builtin.set_fact:
+    k7_cni_effective: "{{ (k7_cni | default(k7_cni_default)) | lower }}"
+  tags: ['always']
+
+- name: Validate CNI selection
+  ansible.builtin.fail:
+    msg: "Unknown CNI '{{ k7_cni_effective }}'; allowed: cilium, flannel"
+  when: k7_cni_effective not in ['cilium', 'flannel']
+  tags: ['always']
+
+# The Kubernetes node object is named after the machine hostname, not
+# the Ansible inventory alias — `k7 install` (no hosts) runs against
+# `localhost`, which is never a valid node name on a host with a real
+# hostname. Resolve the actual node name once and use it for every
+# node get/label in roles/k7_cluster.
+- name: Resolve Kubernetes node name (hostname when installing via localhost)
+  ansible.builtin.set_fact:
+    k7_k8s_node_name: >-
+      {{ ansible_hostname if inventory_hostname in ['localhost', '127.0.0.1'] else inventory_hostname }}
+  tags: ['always']
+
+- name: Compute cluster role and shortcuts
+  ansible.builtin.set_fact:
+    k7_servers_group: "{{ groups['k7_servers'] | default([]) }}"
+    k7_agents_group: "{{ groups['k7_agents'] | default([]) }}"
+    k7_node_role: "{{ 'server' if inventory_hostname in (groups['k7_servers'] | default([])) else 'agent' }}"
+    k7_first_master: "{{ (groups['k7_servers'] | default([inventory_hostname]))[0] }}"
+    longhorn_replicas_effective: "{{ longhorn_replicas | default([3, ((groups['k7_cluster'] | default([inventory_hostname])) | length)] | min) }}"
+    k7_has_devmapper: "{{ 'kata-firecracker-devmapper' in k7_backends_list }}"
+    k7_has_longhorn: "{{ 'kata-qemu-longhorn' in k7_backends_list }}"
+    k7_has_k7d: "{{ 'k7d' in k7_backends_list or 'k7d-fc' in k7_backends_list }}"
+    k7_has_k7d_fc: "{{ 'k7d-fc' in k7_backends_list }}"
+    k7_cni_is_cilium: "{{ k7_cni_effective == 'cilium' }}"
+  tags: ['always']
+
+# Distro adapter: vars/<k7_distro>.yml defines exactly k7_adapter_keys.
+# No detection, no fallback — an unknown distro or a missing key fails here.
+- name: Require a supported k7_distro
+  ansible.builtin.fail:
+    msg: >-
+      k7_distro={{ k7_distro | default('<unset>') }} is not supported. Set k7_distro to one
+      of {{ k7_adapter_distros }} (`k7 install` passes k3s).
+  when: k7_distro is not defined or k7_distro not in k7_adapter_distros
+  tags: ['always']
+
+- name: Load the distro adapter for k7_distro={{ k7_distro }}
+  ansible.builtin.include_vars:
+    file: "{{ k7_distro }}.yml"
+  tags: ['always']
+
+- name: Fail if the distro adapter is missing a contract key
+  ansible.builtin.fail:
+    msg: "roles/k7_node_prep/vars/{{ k7_distro }}.yml does not define {{ item }} (contract: {{ k7_adapter_keys }})."
+  loop: "{{ k7_adapter_keys }}"
+  when: item not in hostvars[inventory_hostname]
+  tags: ['always']
+
+# Disk source: spare-disk (auto-select an empty whole disk), device:<path>
+# (operator-chosen disk), or loopback (XFS image only, no kfd thin pool).
+# k7_devmapper_disk / k7_disk are the legacy spelling of device:<path>.
+- name: Read the legacy disk override (k7_devmapper_disk / k7_disk)
+  ansible.builtin.set_fact:
+    k7_legacy_disk: "{{ k7_devmapper_disk | default(k7_disk | default('')) | default('', true) }}"
+  tags: ['always']
+
+- name: Fail if k7_disk_source is combined with a legacy disk override
+  ansible.builtin.fail:
+    msg: >-
+      k7_disk_source={{ k7_disk_source }} and k7_devmapper_disk/k7_disk={{ k7_legacy_disk }}
+      are both set on {{ inventory_hostname }}. Keep only k7_disk_source=device:<path>.
+  when:
+    - k7_disk_source | default('') | length > 0
+    - k7_legacy_disk | length > 0
+  tags: ['always']
+
+- name: Resolve the disk source
+  ansible.builtin.set_fact:
+    k7_disk_source_effective: >-
+      {{ k7_disk_source if (k7_disk_source | default('') | length > 0)
+         else ('device:' ~ k7_legacy_disk) if (k7_legacy_disk | length > 0)
+         else 'spare-disk' }}
+  tags: ['always']
+
+- name: Validate the disk source
+  ansible.builtin.fail:
+    msg: "k7_disk_source={{ k7_disk_source_effective }} on {{ inventory_hostname }}; allowed: spare-disk, device:<path>, loopback"
+  when: not (k7_disk_source_effective in ['spare-disk', 'loopback'] or k7_disk_source_effective is match('^device:\S+$'))
+  tags: ['always']
+
+- name: Fail if loopback disk source is combined with kfd
+  ansible.builtin.fail:
+    msg: >-
+      k7_disk_source=loopback on {{ inventory_hostname }} provisions no LVM thin pool, and
+      kata-firecracker-devmapper (kfd) needs one. Drop kfd from k7_backends, or use
+      k7_disk_source=spare-disk / device:<path>.
+  when:
+    - k7_disk_source_effective == 'loopback'
+    - k7_has_devmapper
+  tags: ['always']
+
+- name: Show node configuration
+  ansible.builtin.debug:
+    msg: >-
+      host={{ inventory_hostname }} role={{ k7_node_role }}
+      backends={{ k7_backends_list }} first_master={{ k7_first_master }}
+      distro={{ k7_distro }} disk_source={{ k7_disk_source_effective }}
+      hubble={{ k7_hubble_enabled | default(false) | bool }}

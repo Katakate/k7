@@ -1,0 +1,163 @@
+{{- /* The 9464 policies match src/k7/deploy/k7_metrics_policy.py (unit-tested). */ -}}
+{{- include "k7.validate" . }}
+{{- $o := .Values.observability -}}
+{{- $ns := .Release.Namespace -}}
+{{- if $o.metrics }}
+{{- $sel := $o.scraperSelector }}
+{{- if eq .Values.networkPolicy.provider "cilium" }}
+{{- $nsKey := "k8s:io.kubernetes.pod.namespace" }}
+{{- $port := list (dict "ports" (list (dict "port" "9464" "protocol" "TCP"))) }}
+{{- $others := list (dict "matchExpressions" (list (dict "key" $nsKey "operator" "NotIn" "values" (list $sel.namespace)))) }}
+{{- range $k, $v := $sel.podLabels }}
+{{- $others = append $others (dict "matchLabels" (dict $nsKey $sel.namespace) "matchExpressions" (list (dict "key" $k "operator" "NotIn" "values" (list $v)))) }}
+{{- end }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: k7-metrics
+  namespace: {{ $ns }}
+spec:
+  description: "Only the metrics scraper reaches k7-api / k7-agent :9464"
+  endpointSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [k7-api, k7-agent]
+  enableDefaultDeny:
+    ingress: false
+  ingressDeny:
+    - fromEntities: [world, host, remote-node, kube-apiserver, ingress, health, unmanaged, init]
+      toPorts: {{ toJson $port }}
+    - fromEndpoints: {{ toJson $others }}
+      toPorts: {{ toJson $port }}
+  ingress:
+    - fromEndpoints:
+        - matchLabels: {{ merge (dict $nsKey $sel.namespace) $sel.podLabels | toJson }}
+      toPorts: {{ toJson $port }}
+{{- else }}
+{{- range $app, $ports := dict "k7-api" (list 8000 8443) "k7-agent" (list 8000) }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $app }}-metrics
+  namespace: {{ $ns }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ $app }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        {{- range $ports }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $sel.namespace }}
+          podSelector:
+            matchLabels: {{ toJson $sel.podLabels }}
+      ports:
+        - port: 9464
+          protocol: TCP
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $o.serviceMonitor }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k7-api-metrics
+  namespace: {{ $ns }}
+  labels:
+    app: k7-api
+    k7.katakate.org/metrics: "true"
+spec:
+  clusterIP: None
+  selector:
+    app: k7-api
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: k7-api
+  namespace: {{ $ns }}
+  {{- with $o.monitorLabels }}
+  labels: {{ toJson . }}
+  {{- end }}
+spec:
+  jobLabel: app
+  selector:
+    matchLabels:
+      k7.katakate.org/metrics: "true"
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: k7-agent
+  namespace: {{ $ns }}
+  {{- with $o.monitorLabels }}
+  labels: {{ toJson . }}
+  {{- end }}
+spec:
+  jobLabel: app
+  selector:
+    matchLabels:
+      app: k7-agent
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+{{- end }}
+{{- if $o.prometheusRule }}
+{{- $t := $o.thresholds }}
+{{- $th := list }}
+{{- range $name, $v := dict "api_error_ratio" $t.apiErrorRatio "key_store_stale_seconds" $t.keyStoreStaleSeconds "thinpool_data_ratio" $t.thinpoolDataRatio "thinpool_metadata_ratio" $t.thinpoolMetadataRatio "k7d_disks_ratio" $t.k7dDisksRatio "storage_report_stale_seconds" $t.storageReportStaleSeconds "tls_expiry_seconds" $t.tlsExpirySeconds }}
+{{- $th = append $th (dict "record" (printf "k7:threshold:%s" $name) "expr" (printf "vector(%v)" $v)) }}
+{{- end }}
+{{- range $op, $v := $t.opP95BudgetSeconds }}
+{{- $th = append $th (dict "record" "k7:threshold:op_p95_budget_seconds" "expr" (printf "vector(%v)" $v) "labels" (dict "op" $op)) }}
+{{- end }}
+{{- $alerts := list }}
+{{- range (.Files.Get "files/observability/rules/k7.rules.yaml" | fromYaml).groups }}
+{{- if eq .name "k7.alerts" }}{{ $alerts = append $alerts . }}{{ end }}
+{{- end }}
+{{- if ne (len $alerts) 1 }}{{ fail "files/observability/rules/k7.rules.yaml has no k7.alerts group" }}{{ end }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: k7
+  namespace: {{ $ns }}
+  {{- with $o.monitorLabels }}
+  labels: {{ toJson . }}
+  {{- end }}
+spec:
+  groups: {{ prepend $alerts (dict "name" "k7.thresholds" "rules" $th) | toJson }}
+{{- end }}
+{{- if $o.grafanaDashboards }}
+{{- range $path, $_ := .Files.Glob "files/observability/dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ base $path | trimSuffix ".json" }}-dashboard
+  namespace: {{ $ns }}
+  labels:
+    grafana_dashboard: "1"
+data: {{- ($.Files.Glob $path).AsConfig | nindent 2 }}
+{{- end }}
+{{- end }}

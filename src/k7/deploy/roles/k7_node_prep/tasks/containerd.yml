@@ -1,0 +1,154 @@
+---
+- name: Ensure K7 config directory exists
+  ansible.builtin.file:
+    path: /etc/k7
+    state: directory
+    mode: '0755'
+  tags: ['k7', 'config']
+
+- name: Store K7 backend configuration (primary backend = first in list)
+  ansible.builtin.copy:
+    dest: /etc/k7/backend
+    content: "{{ k7_backends_list[0] if k7_backends_list | length > 0 else 'none' }}"
+    mode: '0644'
+  tags: ['k7', 'config']
+
+- name: Record installed k7d version for --docker capability checks
+  ansible.builtin.copy:
+    dest: /etc/k7/k7d_version
+    content: "{{ k7d_version }}\n"
+    mode: '0644'
+  when: k7_has_k7d
+  tags: ['k7', 'config', 'k7d']
+
+- name: Ensure Longhorn data path exists on each longhorn-capable host
+  ansible.builtin.file:
+    path: "{{ longhorn_data_path | default('/var/lib/longhorn') }}"
+    state: directory
+    mode: '0755'
+  when: k7_has_longhorn
+  tags: ['longhorn']
+
+- name: Ensure Longhorn extra disk path exists (per-host)
+  ansible.builtin.file:
+    path: "{{ longhorn_extra_disk }}"
+    state: directory
+    mode: '0755'
+  when:
+    - k7_has_longhorn
+    - longhorn_extra_disk is defined
+    - longhorn_extra_disk | length > 0
+  tags: ['longhorn']
+
+# Read by `k7 --core` and the integration suite on the node (K7_CONTAINERD_SOCKET).
+- name: Record the containerd socket path for host-side k7 tooling
+  ansible.builtin.copy:
+    dest: /etc/k7/containerd_socket
+    content: "{{ k7_containerd_socket }}\n"
+    mode: '0644'
+  tags: ['k7', 'config', 'containerd']
+
+- name: Ensure containerd template directory exists
+  ansible.builtin.file:
+    path: "{{ k7_containerd_config_path | dirname }}"
+    state: directory
+    mode: '0755'
+  tags: ['kata', 'devmapper', 'containerd']
+
+# ------------------------------------------------------------------
+# Containerd runtime handlers — merged based on per-host backend set.
+# k3s-template: the distro's Go template wraps templates/k7-runtimes.toml.j2.
+# drop-in: conf.d file only; the distro's main config.toml is never edited
+# (nodeadm regenerates it on EKS; on kubeadm it belongs to the operator).
+# ------------------------------------------------------------------
+- name: Validate the containerd config mode
+  ansible.builtin.fail:
+    msg: "k7_containerd_config_mode={{ k7_containerd_config_mode }}; allowed: k3s-template, drop-in"
+  when: k7_containerd_config_mode not in ['k3s-template', 'drop-in']
+  tags: ['kata', 'containerd', 'k7d']
+
+- name: Read the containerd version (drop-in mode)
+  ansible.builtin.command: containerd --version
+  register: k7_containerd_version
+  changed_when: false
+  when: k7_containerd_config_mode == 'drop-in'
+  tags: ['kata', 'containerd', 'k7d']
+
+- name: Fail if containerd is not 2.x (drop-in mode)
+  ansible.builtin.fail:
+    msg: >-
+      {{ k7_containerd_version.stdout | trim }} on {{ inventory_hostname }}: the k7 runtime
+      handlers use containerd 2.x plugin IDs (io.containerd.cri.v1.runtime). Upgrade
+      containerd to 2.x; containerd 1.x is not supported.
+  when:
+    - k7_containerd_config_mode == 'drop-in'
+    - k7_containerd_version.stdout is not search('\\sv?2\\.\\d+')
+  tags: ['kata', 'containerd', 'k7d']
+
+- name: Read the main containerd config (drop-in mode)
+  ansible.builtin.slurp:
+    src: "{{ k7_containerd_config_path | dirname | dirname }}/config.toml"
+  register: k7_containerd_main_config
+  when: k7_containerd_config_mode == 'drop-in'
+  tags: ['kata', 'containerd', 'k7d']
+
+- name: Fail if the main containerd config does not import the drop-in directory
+  ansible.builtin.fail:
+    msg: >-
+      {{ k7_containerd_config_path | dirname | dirname }}/config.toml has no `imports` line
+      covering {{ k7_containerd_config_path | dirname }}/*.toml. Add
+      `imports = ["{{ k7_containerd_config_path | dirname }}/*.toml"]` at the top level of that
+      file (k7 never edits it) and re-run.
+  when:
+    - k7_containerd_config_mode == 'drop-in'
+    - (k7_containerd_main_config.content | b64decode) is not search(k7_containerd_imports_re)
+  vars:
+    k7_containerd_imports_re: "(?m)^\\s*imports\\s*=.*{{ ((k7_containerd_config_path | dirname) ~ '/*.toml') | regex_escape }}"
+  tags: ['kata', 'containerd', 'k7d']
+
+- name: Render containerd config template (per-host backend mix)
+  ansible.builtin.template:
+    src: "containerd-{{ k7_containerd_config_mode }}.toml.j2"
+    dest: "{{ k7_containerd_config_path }}"
+    mode: '0644'
+    owner: root
+  register: k7_containerd_config
+  tags: ['kata', 'containerd', 'k7d']
+
+# ── restart containerd and wait for its socket ───────────────────
+# On K3s this is the k3s/k3s-agent unit, and the first start of joining
+# masters/agents (installed with INSTALL_K3S_SKIP_START). Keep async: HA
+# masters restart together and k7_k3s waits for /readyz afterwards.
+# The installer restarts only on a config change: on K3s/RKE2 the unit is
+# the whole kubelet (and apiserver on servers).
+- name: Restart the containerd service to apply runtime handlers (async)
+  ansible.builtin.systemd:
+    name: "{{ k7_containerd_service }}"
+    state: restarted
+    enabled: true
+  async: 300
+  poll: 0
+  register: k7_containerd_restart
+  when: not (k7_node_installer | bool) or k7_containerd_config.changed
+  tags: ['devmapper', 'k3s']
+
+# The installer labels the node right after this role: the restart must be
+# over (the old socket would satisfy the wait below).
+- name: Wait for the containerd service restart to finish (installer)
+  ansible.builtin.async_status:
+    jid: "{{ k7_containerd_restart.ansible_job_id }}"
+  register: k7_containerd_restart_job
+  until: k7_containerd_restart_job is finished
+  retries: 60
+  delay: 5
+  when:
+    - k7_node_installer | bool
+    - k7_containerd_restart is not skipped
+  tags: ['devmapper', 'k3s']
+
+- name: Wait for the containerd socket to appear
+  ansible.builtin.wait_for:
+    path: "{{ k7_containerd_socket }}"
+    state: present
+    timeout: 120
+  tags: ['kata']

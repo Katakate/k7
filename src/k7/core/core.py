@@ -1,8 +1,10 @@
 import asyncio
+import base64
 import copy
 import inspect
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
@@ -12,10 +14,12 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from importlib import resources
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import httpx
 import yaml
@@ -23,6 +27,11 @@ from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client.exceptions import ApiException
 from kubernetes_asyncio.stream import WsApiClient
 
+from .. import logging as k7_logging
+from .. import metrics
+from ..metering import MEMORY_ANN, SANDBOX_UID_ANN, VCPU_ANN, delivery, pauses
+from ..metrics import observed
+from . import cluster_config, tenancy
 from .docker import (
     ANN_DOCKER_PVC,
     ANN_K7_DOCKER,
@@ -37,11 +46,11 @@ from .docker import (
     DOCKER_UNSUPPORTED_K7D,
     FSFREEZE_STAGED,
     FSFREEZE_VEHICLE,
+    FSFREEZE_VEHICLE_DIR,
     GRAPH_DEVICE_PATH,
     KATA_GRAPH_MOUNT,
     KATA_SOCKET_DIR,
     KFD_DOCKER_STORAGE_CLASS,
-    KFD_FORK_REJECT,
     STAGE_FSFREEZE_CMD,
     VEHICLE_CONTAINER_NAME,
     k7d_supports_docker,
@@ -53,12 +62,43 @@ from .models import (
     SNAPSHOT_KIND_PAUSE,
     ExecResult,
     OperationResult,
+    RegistryUnresolvableError,
     SandboxConfig,
     SandboxConfigOverrides,
     SandboxInfo,
     SnapshotInfo,
 )
 from .sidecar import SIDECAR_REGISTRY
+
+# Exec websocket subprotocol. kubernetes_asyncio defaults to v4, which the
+# apiserver passes through to containerd's websocket server; that server hands
+# the runtime a stdin stream even for stdin=False, so CRI closes it right after
+# start, and the Kata Go shim's close-stdin also marks its shared stdout/stderr
+# stream closed: output is cut short and the status still says Success. v5
+# (K8s >= 1.30, what kubectl uses) is translated by the apiserver to SPDY,
+# which opens only the requested streams.
+EXEC_WS_PROTOCOL = "v5.channel.k8s.io"
+# Exec stream channels (same in v4 and v5).
+STDOUT_CHANNEL, STDERR_CHANNEL, ERROR_CHANNEL = 1, 2, 3
+# ExecResult.exit_code when the command's own status is unknown (exec could not
+# start, or the stream ended without a status frame). Never a real exit code.
+EXEC_NO_STATUS = -1
+
+
+def _exec_ws_client() -> WsApiClient:
+    return WsApiClient(header_name="sec-websocket-protocol", header_value=EXEC_WS_PROTOCOL)
+
+
+def _exec_exit_code(status: bytes) -> tuple[int, str]:
+    """(exit code, error) from an exec status frame (a metav1.Status JSON)."""
+    s = json.loads(status)
+    if s.get("status") == "Success":
+        return 0, ""
+    for cause in (s.get("details") or {}).get("causes") or []:
+        if cause.get("reason") == "ExitCode":
+            return int(cause["message"]), ""
+    return EXEC_NO_STATUS, s.get("message") or status.decode("utf-8", errors="replace")
+
 
 # k7d backend: pod-level annotations the k7d containerd shim
 # understands. `fork-source-*` boot a pod as a warm (CoW disk+memory) fork
@@ -71,13 +111,20 @@ K7D_ANN_PAUSED = "k7.katakate.org/k7d-paused"
 # Tenant isolation: label is the join key (nodeSelector), matching taint is
 # the lock (NoSchedule). Same family as the backend labels.
 K7_TENANT_LABEL = "k7.katakate.org/tenant"
-# Message pointing users at k7d's native VM snapshot trees for the verbs
-# that intentionally do NOT map onto the k7d backend.
+# Backend rejections for snapshot / fork verbs, checked before any K8s write.
 K7D_SNAPSHOT_UNSUPPORTED = (
-    "named disk snapshots/restore are a Longhorn feature of the kata-qemu-longhorn (kql) "
-    "backend. k7d sandboxes support live warm fork (`k7 fork`) and VM pause/resume instead; "
-    "VM-level snapshot trees (fork/rollback/suspend of whole VM states) are available through "
-    "the k7d daemon API — see https://github.com/katakate/k7d"
+    "K7 does not expose k7d / k7d-fc snapshots yet; named disk snapshots and restore "
+    "are kata-qemu-longhorn (kql) only. k7d sandboxes support warm fork (`k7 fork`) "
+    "and in-place pause/resume (`k7 pause` / `k7 resume`)."
+)
+KFD_SNAPSHOT_REJECT = (
+    "kfd (kata-firecracker-devmapper) sandboxes have a node-local devmapper root and no "
+    "snapshot support; use kql for durable disk snapshots or k7d/k7d-fc for VM snapshots."
+)
+KFD_FORK_REJECT = (
+    "k7 fork is not supported on the kfd (kata-firecracker-devmapper) backend: "
+    "there is no persistent PVC to clone (and a --docker graph cannot be cloned — ephemeral LV). "
+    "Use kql for disk-level fork, or k7d / k7d-fc for warm VM fork."
 )
 # hostPath/PVC on k7d-fc has no virtiofs. Same text the
 # k7d shim emits, so a CLI refusal matches `kubectl describe`.
@@ -94,9 +141,32 @@ _ALLOWED_BACKENDS = (
 _K7D_FAMILY = frozenset({"k7d", "k7d-fc"})
 # Kata refuses hypervisor memory below this (shim: "minimum required 256").
 KATA_MIN_HYPERVISOR_MEMORY_MIB = 256
+CONTAINERD_SOCKET_FILE = Path("/etc/k7/containerd_socket")
+LONGHORN_PROVISIONER = "driver.longhorn.io"
 # CRDs (VolumeSnapshotContent) and PVC finalizer lists ignore strategic-merge
 # patches. kubectl --type=merge works; the Python client must say so too.
 _K8S_MERGE_PATCH = "application/merge-patch+json"
+
+
+log = logging.getLogger("k7.core")
+
+
+def _count_kube_api_errors(api_client: client.ApiClient) -> client.ApiClient:
+    """Count failed calls of this client in ``k7_kube_api_errors_total``."""
+    request = api_client.request
+
+    async def counted(method, url, *args, **kwargs):
+        try:
+            return await request(method, url, *args, **kwargs)
+        except ApiException as e:
+            metrics.kube_api_error(method, url, e.status)
+            raise
+        except Exception:
+            metrics.kube_api_error(method, url, None)
+            raise
+
+    api_client.request = cast(Any, counted)
+    return api_client
 
 
 def _is_k7d_family(backend: str | None) -> bool:
@@ -143,6 +213,73 @@ def _classify_egress_entries(entries: list[str]) -> tuple[list[str], list[str]]:
     return cidrs, fqdns
 
 
+def _fqdn_matchers(fqdns: list[str]) -> list[dict]:
+    """Cilium FQDN selectors for an allowlist: ``matchName`` for exact names, ``matchPattern`` for wildcards.
+
+    Cilium matchPattern semantics trap: ``*`` matches DNS characters within a
+    SINGLE label, it never crosses dots. ``*.docker.com`` therefore does NOT
+    match ``production.cloudfront.docker.com``, which silently breaks
+    CDN-backed registries (Docker Hub blobs). k7 promises "any subdomain", so a
+    leading ``*.`` becomes Cilium's multi-label subdomain wildcard ``**.``.
+    """
+    matchers: list[dict] = []
+    for fqdn in fqdns:
+        if "*" not in fqdn:
+            matchers.append({"matchName": fqdn})
+        elif fqdn.startswith("*.") and not fqdn.startswith("**"):
+            matchers.append({"matchPattern": "*" + fqdn})
+        else:
+            matchers.append({"matchPattern": fqdn})
+    return matchers
+
+
+def _cilium_egress_spec(sandbox_name: str, cidrs: list[str], fqdns: list[str]) -> dict:
+    """Spec of the ``{name}-egress`` CiliumNetworkPolicy for an FQDN (± CIDR) allowlist.
+
+    The DNS rule to kube-dns carries the same matchers as ``toFQDNs``: Cilium's
+    DNS proxy forwards only allowlisted names and answers every other query
+    itself (NXDOMAIN, ``dnsProxy.dnsRejectResponseCode=nameError``), so a
+    sandbox cannot tunnel data out through queries for names it may not reach.
+    """
+    if not fqdns:
+        raise ValueError(f"{sandbox_name}: a CiliumNetworkPolicy egress spec needs at least one FQDN")
+    matchers = _fqdn_matchers(fqdns)
+    dns_rule = {
+        "toEndpoints": [{"matchLabels": {"k8s:io.kubernetes.pod.namespace": "kube-system", "k8s:k8s-app": "kube-dns"}}],
+        "toPorts": [
+            {
+                "ports": [{"port": "53", "protocol": "UDP"}, {"port": "53", "protocol": "TCP"}],
+                "rules": {"dns": matchers},
+            }
+        ],
+    }
+    egress: list[dict] = [dns_rule, {"toFQDNs": matchers}]
+    if cidrs:
+        egress.append({"toCIDR": cidrs})
+    return {"endpointSelector": {"matchLabels": {"katakate.org/sandbox": sandbox_name}}, "egress": egress}
+
+
+def _whitelist_from_cnp(cnp: dict) -> list[str]:
+    """The egress entries a ``{name}-egress`` policy was rendered from (``**.`` maps back to ``*.``)."""
+    entries: list[str] = []
+    for rule in (cnp.get("spec") or {}).get("egress") or []:
+        for matcher in rule.get("toFQDNs") or []:
+            fqdn = matcher.get("matchName") or matcher.get("matchPattern")
+            if fqdn:
+                entries.append(fqdn[1:] if fqdn.startswith("**.") else fqdn)
+        entries.extend(rule.get("toCIDR") or [])
+    return entries
+
+
+def _cnp_dns_matchers(cnp: dict) -> list[dict]:
+    return [
+        m
+        for rule in (cnp.get("spec") or {}).get("egress") or []
+        for port in rule.get("toPorts") or []
+        for m in (port.get("rules") or {}).get("dns") or []
+    ]
+
+
 # Ingress source that means "any sandbox in this namespace" — the deliberate
 # default when ports are opened without an explicit source.
 _INGRESS_ANY_SANDBOX_KEY = "katakate.org/sandbox"
@@ -186,6 +323,20 @@ def _classify_ingress_sources(entries: list[str]) -> list[Any]:
     return peers
 
 
+def _stamp_metering(dep: Any) -> None:
+    """A fresh sandbox uid and the sandbox container's reserved size, which the node sampler reads."""
+    sandbox = next((c for c in dep.spec.template.spec.containers or [] if c.name == "sandbox"), None)
+    lim = (sandbox.resources.limits or {}) if sandbox is not None and sandbox.resources else {}
+    stamped = {SANDBOX_UID_ANN: str(uuid.uuid4())}
+    if "cpu" in lim:
+        stamped[VCPU_ANN] = format(tenancy.quantity(lim["cpu"]).normalize(), "f")
+    if "memory" in lim:
+        stamped[MEMORY_ANN] = str(int(tenancy.quantity(lim["memory"])))
+    for meta in (dep.metadata, dep.spec.template.metadata):
+        kept = {k: v for k, v in (meta.annotations or {}).items() if k not in (VCPU_ANN, MEMORY_ANN)}
+        meta.annotations = {**kept, **stamped}
+
+
 class K7Core:
     """Core business logic for sandbox management"""
 
@@ -200,6 +351,25 @@ class K7Core:
         self._apiextensions_v1_client = None
         self._config_loaded = False
         self._api_client = None
+        # Set per request by k7-api: tenant policy, quotas and identity labels.
+        # None (CLI --core, snapshot-gc) means no tenancy checks.
+        self.admission: tenancy.Admission | None = None
+
+    def _identity_labels(self) -> dict[str, str]:
+        return self.admission.labels() if self.admission else {}
+
+    async def _create_sandbox_deployment(self, namespace: str, body: Any) -> Any:
+        """Every sandbox Deployment (create, fork, restore) is created here, under admission."""
+        apps_v1 = await self._get_apps_v1_client()
+        _stamp_metering(body)
+
+        async def create() -> Any:
+            return await apps_v1.create_namespaced_deployment(namespace=namespace, body=body)
+
+        if self.admission is None:
+            return await create()
+        await delivery.require(self, body, self.admission.tenant)
+        return await tenancy.admit_deployment(self, self.admission, namespace, body, create)
 
     async def _load_k3s_config(self):
         """Load k3s kubeconfig with fallback to standard locations.
@@ -219,7 +389,10 @@ class K7Core:
             except config.ConfigException:
                 pass
 
-        k3s_config_path = self.kubeconfig_path or "/etc/rancher/k3s/k3s.yaml"
+        explicit = self.kubeconfig_path or os.environ.get("K7_KUBECONFIG")
+        if explicit and not os.path.exists(explicit):
+            raise RuntimeError(f"kubeconfig {explicit} (K7_KUBECONFIG / kubeconfig_path) does not exist")
+        k3s_config_path = explicit or "/etc/rancher/k3s/k3s.yaml"
 
         try:
             if os.path.exists(k3s_config_path):
@@ -238,7 +411,7 @@ class K7Core:
         """One kubernetes_asyncio ApiClient (aiohttp session) per K7Core."""
         if self._api_client is None:
             await self._load_k3s_config()
-            self._api_client = client.ApiClient()
+            self._api_client = _count_kube_api_errors(client.ApiClient())
         return self._api_client
 
     async def aclose(self) -> None:
@@ -420,9 +593,9 @@ class K7Core:
         try:
             infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
         except socket.gaierror as e:
-            raise ValueError(f"Cannot resolve registry host {hostname}: {e}") from e
+            raise RegistryUnresolvableError(f"Cannot resolve registry host {hostname}: {e}") from e
         if not infos:
-            raise ValueError(f"Cannot resolve registry host {hostname}: no addresses")
+            raise RegistryUnresolvableError(f"Cannot resolve registry host {hostname}: no addresses")
 
         for info in infos:
             ip_str = info[4][0]
@@ -689,9 +862,10 @@ class K7Core:
     ) -> OperationResult:
         """Poll the sandbox pod for FailedScheduling events tied to the backend selector.
 
-        Returns success when no scheduling failure is detected within `timeout_seconds`,
-        or when the pod is already running. Returns an explanatory error when the
-        node selector does not match any node.
+        Returns success as soon as the pod is bound to a node (a bound pod stays
+        Pending while its volumes attach, which is not a scheduling question), or when
+        no scheduling failure is detected within `timeout_seconds`. Returns an
+        explanatory error when the node selector does not match any node.
         """
         v1 = await self._get_core_v1_client()
         selector_label = f"k7.katakate.org/backend-{backend}"
@@ -701,7 +875,7 @@ class K7Core:
             if pods.items:
                 pod = pods.items[0]
                 phase = (pod.status.phase if pod.status else None) or "Pending"
-                if phase != "Pending":
+                if phase != "Pending" or (pod.spec and pod.spec.node_name):
                     return OperationResult(success=True)
                 try:
                     events = await v1.list_namespaced_event(
@@ -784,6 +958,20 @@ class K7Core:
         }
         return legacy.get(backend, backend)
 
+    async def _existing_backend(self, sandbox_name: str, namespace: str) -> str | None:
+        """Backend of an existing sandbox, or None when its Deployment is missing.
+
+        ``_detect_backend`` falls back to the node default for a missing sandbox,
+        which would turn "not found" into that backend's rejection.
+        """
+        try:
+            await (await self._get_apps_v1_client()).read_namespaced_deployment(sandbox_name, namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+        return await self._detect_backend(sandbox_name, namespace)
+
     async def _detect_backend(self, sandbox_name: str | None = None, namespace: str = "default") -> str:
         """Detect backend with priority: deployment annotation > /etc/k7/backend > kfd.
 
@@ -865,9 +1053,17 @@ class K7Core:
                 raise RuntimeError("k7d daemon closed the control connection without a response")
             return json.loads(buf.decode())
 
-        resp = await asyncio.to_thread(_call)
-        if resp.get("status") == "error":
-            raise RuntimeError(f"k7d daemon error for op={payload.get('op')}: {resp.get('message')}")
+        op = str(payload.get("op"))
+        start = time.monotonic()
+        try:
+            resp = await asyncio.to_thread(_call)
+            if resp.get("status") == "error":
+                raise RuntimeError(f"k7d daemon error for op={op}: {resp.get('message')}")
+        except Exception:
+            metrics.K7D_RPC_ERRORS.labels(op).inc()
+            raise
+        finally:
+            metrics.K7D_RPC_DURATION.labels(op).observe(time.monotonic() - start)
         return resp
 
     async def _k7d_running_pod(self, sandbox_name: str, namespace: str):
@@ -894,11 +1090,22 @@ class K7Core:
 
     async def _k7d_cri_sandbox_id(self, pod_name: str, namespace: str) -> str:
         """Resolve a pod to its CRI (containerd) sandbox id via crictl."""
+        # Pods get the env from the manifests; host-side callers (`k7 --core`,
+        # integration tests) read the file `k7 install` writes from the adapter.
+        containerd_socket = os.environ.get("K7_CONTAINERD_SOCKET")
+        if not containerd_socket and CONTAINERD_SOCKET_FILE.is_file():
+            containerd_socket = CONTAINERD_SOCKET_FILE.read_text().strip()
+        if not containerd_socket:
+            raise RuntimeError(
+                f"K7_CONTAINERD_SOCKET is not set and {CONTAINERD_SOCKET_FILE} is missing or empty: "
+                "k7d VM operations need the node's containerd socket (`k7 install` writes the file; "
+                "the k7-api/k7-agent manifests set the env)."
+            )
         crictl = shutil.which("crictl") or "/usr/local/bin/crictl"
         cmd = [
             crictl,
             "--runtime-endpoint",
-            "unix:///run/k3s/containerd/containerd.sock",
+            f"unix://{containerd_socket}",
             "pods",
             "--name",
             pod_name,
@@ -946,6 +1153,11 @@ class K7Core:
         # inject the real node via the downward API (K7_NODE_NAME).
         return os.environ.get("K7_NODE_NAME") or os.uname().nodename
 
+    def _k7d_is_local(self, node_name: str) -> bool:
+        """k7-api sets K7_K7D_REMOTE_ONLY=1: it has no host sockets, so every
+        VM op goes to the k7-agent on the sandbox's node (including its own)."""
+        return os.environ.get("K7_K7D_REMOTE_ONLY") != "1" and node_name == self._k7d_local_node()
+
     @staticmethod
     def _k7d_agent_token() -> str:
         path = os.environ.get("K7_AGENT_TOKEN_FILE", "/etc/k7/agent_token")
@@ -984,8 +1196,9 @@ class K7Core:
     async def _k7d_agent_base_url(self, node_name: str) -> str:
         """Resolve the Ready k7-agent pod on ``node_name`` to its pod IP."""
         v1 = await self._get_core_v1_client()
+        ns = cluster_config.system_namespace()
         pods = await v1.list_namespaced_pod(
-            namespace="kube-system",
+            namespace=ns,
             label_selector="app=k7-agent",
             field_selector=f"spec.nodeName={node_name}",
         )
@@ -995,8 +1208,8 @@ class K7Core:
                 return f"http://{p.status.pod_ip}:{self.K7_AGENT_PORT}"
         raise RuntimeError(
             f"no Ready k7-agent pod on node {node_name} — k7d VM operations for sandboxes on "
-            "another node need the k7-agent DaemonSet (deployed by `k7 install`); check "
-            "`kubectl -n kube-system get pods -l app=k7-agent -o wide`"
+            "another node need the k7-agent DaemonSet (deployed by `k7 install` or the Helm chart); check "
+            f"`kubectl -n {ns} get pods -l app=k7-agent -o wide`"
         )
 
     async def _k7d_forward_vm_op(self, node_name: str, op: str, body: dict, timeout: float) -> OperationResult:
@@ -1005,13 +1218,7 @@ class K7Core:
                 f"k7-agent on {self._k7d_local_node()} received op={op} for a sandbox on node "
                 f"{node_name} — refusing to re-forward (the caller resolved the wrong agent)"
             )
-        base = await self._k7d_agent_base_url(node_name)
-        token = self._k7d_agent_token()
-        async with httpx.AsyncClient(timeout=timeout) as http:
-            resp = await http.post(f"{base}/agent/v1/vm/{op}", json=body, headers={"X-K7-Agent-Token": token})
-        if resp.status_code != 200:
-            raise RuntimeError(f"k7-agent on {node_name} failed op={op}: HTTP {resp.status_code}: {resp.text}")
-        data = resp.json()
+        data = await self._k7d_agent_post(node_name, op, body, timeout)
         return OperationResult(
             success=bool(data.get("success")),
             message=data.get("message") or "",
@@ -1023,19 +1230,66 @@ class K7Core:
         """Resolve a k7d sandbox to its daemon VM record, forwarding to the
         per-node agent when the sandbox lives on another node."""
         node, pod_name = await self._k7d_sandbox_placement(sandbox_name, namespace)
-        if node != self._k7d_local_node():
-            base = await self._k7d_agent_base_url(node)
-            token = self._k7d_agent_token()
-            async with httpx.AsyncClient(timeout=60) as http:
-                resp = await http.post(
-                    f"{base}/agent/v1/vm/lookup",
-                    json={"name": sandbox_name, "namespace": namespace, "pod_name": pod_name},
-                    headers={"X-K7-Agent-Token": token},
-                )
-            if resp.status_code != 200:
-                raise RuntimeError(f"k7-agent on {node} failed op=lookup: HTTP {resp.status_code}: {resp.text}")
-            return resp.json()
+        if not self._k7d_is_local(node):
+            body = {"name": sandbox_name, "namespace": namespace, "pod_name": pod_name}
+            return await self._k7d_agent_post(node, "lookup", body, timeout=60)
         return await self._k7d_vm_for_sandbox(sandbox_name, namespace)
+
+    @staticmethod
+    def _agent_headers(token: str) -> dict[str, str]:
+        """Agent auth, plus this request's id so one id follows a remote VM op."""
+        rid = k7_logging.request_id()
+        return {"X-K7-Agent-Token": token, **({k7_logging.REQUEST_ID_HEADER: rid} if rid else {})}
+
+    async def _k7d_agent_post(self, node_name: str, op: str, body: dict, timeout: float) -> dict:
+        base = await self._k7d_agent_base_url(node_name)
+        token = self._k7d_agent_token()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10)) as http:
+                resp = await http.post(f"{base}/agent/v1/vm/{op}", json=body, headers=self._agent_headers(token))
+        except httpx.TransportError as e:
+            # Cilium's k7-agent-ingress admits k7-api pods and the local host only, so a
+            # host-side `k7 --core` caller cannot reach another node's agent.
+            raise RuntimeError(
+                f"cannot reach k7-agent on {node_name} at {base} for op={op} ({type(e).__name__}). "
+                "Agents on other nodes accept only k7-api: run this through k7-api (without --core), "
+                "or on the sandbox's node."
+            ) from e
+        if resp.status_code != 200:
+            raise RuntimeError(f"k7-agent on {node_name} failed op={op}: HTTP {resp.status_code}: {resp.text}")
+        return resp.json()
+
+    async def read_secret_data(self, name: str, namespace: str) -> dict[str, str] | None:
+        """Decoded ``data`` of a Secret; ``None`` when it does not exist."""
+        v1 = await self._get_core_v1_client()
+        try:
+            secret = await v1.read_namespaced_secret(name=name, namespace=namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+        return {k: base64.b64decode(v).decode() for k, v in (secret.data or {}).items()}
+
+    async def patch_secret_data(self, name: str, namespace: str, data: Mapping[str, str | None]) -> None:
+        """Merge-patch ``data``; ``None`` deletes a key."""
+        v1 = await self._get_core_v1_client()
+        body = {"data": {k: None if v is None else base64.b64encode(v.encode()).decode() for k, v in data.items()}}
+        await v1.patch_namespaced_secret(name=name, namespace=namespace, body=body)
+
+    async def _agent_request(
+        self, node_name: str, method: str, path: str, body: dict | None = None, timeout: float = 30
+    ) -> dict:
+        """One authenticated call to the k7-agent on ``node_name``; anything but 200 raises ``RuntimeError``."""
+        base = await self._k7d_agent_base_url(node_name)
+        headers = self._agent_headers(self._k7d_agent_token())
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(timeout, 10))) as http:
+                resp = await http.request(method, f"{base}{path}", json=body, headers=headers)
+        except httpx.TransportError as e:
+            raise RuntimeError(f"cannot reach k7-agent on {node_name} ({type(e).__name__}: {e})") from e
+        if resp.status_code != 200:
+            raise RuntimeError(f"k7-agent on {node_name}: {method} {path}: HTTP {resp.status_code}: {resp.text}")
+        return resp.json()
 
     async def nodes_storage(self) -> dict:
         """Per-node storage-pool utilization, aggregated from every node's
@@ -1050,7 +1304,7 @@ class K7Core:
             try:
                 base = await self._k7d_agent_base_url(name)
                 async with httpx.AsyncClient(timeout=30) as http:
-                    resp = await http.get(f"{base}/agent/v1/storage", headers={"X-K7-Agent-Token": token})
+                    resp = await http.get(f"{base}/agent/v1/storage", headers=self._agent_headers(token))
                 if resp.status_code != 200:
                     raise RuntimeError(f"k7-agent storage query failed: HTTP {resp.status_code}: {resp.text}")
                 out[name] = resp.json()
@@ -1146,12 +1400,36 @@ class K7Core:
             )
         return memory_mib
 
+    def _get_roles_dir(self) -> Path:
+        """Packaged Ansible roles. The playbook runs from a tempfile, so
+        ANSIBLE_ROLES_PATH must point here explicitly."""
+        roles = Path(str(resources.files("k7.deploy").joinpath("roles")))
+        if not roles.is_dir():
+            raise RuntimeError(f"k7 Ansible roles not found at {roles}; the k7 package is incomplete")
+        return roles
+
     def _count_playbook_tasks(self, playbook_content: str) -> int:
-        """Count tasks in Ansible playbook."""
+        """Count tasks in the first play, following import_role/import_tasks into the packaged roles."""
+        roles_dir = self._get_roles_dir()
+
+        def count(tasks: list, task_dir: Path | None) -> int:
+            total = 0
+            for task in tasks or []:
+                role = task.get("ansible.builtin.import_role") or task.get("import_role")
+                inc = task.get("ansible.builtin.import_tasks") or task.get("import_tasks")
+                if role:
+                    rdir = roles_dir / role["name"] / "tasks"
+                    total += count(yaml.safe_load((rdir / f"{role.get('tasks_from', 'main')}.yml").read_text()), rdir)
+                elif inc and task_dir is not None:
+                    total += count(yaml.safe_load((task_dir / inc).read_text()), task_dir)
+                else:
+                    total += 1
+            return total
+
         try:
             playbook = yaml.safe_load(playbook_content)
             if isinstance(playbook, list) and len(playbook) > 0:
-                return len(playbook[0].get("tasks", []))
+                return count(playbook[0].get("tasks", []), None)
         except Exception:
             pass
         return 0
@@ -1236,7 +1514,7 @@ class K7Core:
         self,
         pvc_name: str,
         snapshot_name: str,
-        snapshot_class: str = "longhorn",
+        snapshot_class: str | None = None,
         namespace: str = "default",
         kind: str = SNAPSHOT_KIND_NAMED,
         source_sandbox: str | None = None,
@@ -1271,15 +1549,17 @@ class K7Core:
                 "name": snapshot_name,
                 "namespace": namespace,
                 "annotations": annotations,
+                "labels": self._identity_labels(),
             },
             "spec": {
-                "volumeSnapshotClassName": snapshot_class,
+                "volumeSnapshotClassName": snapshot_class or cluster_config.kql_snapshot_class(),
                 "source": {
                     "persistentVolumeClaimName": pvc_name,
                 },
             },
         }
-        try:
+
+        async def create() -> None:
             await custom.create_namespaced_custom_object(
                 group="snapshot.storage.k8s.io",
                 version="v1",
@@ -1287,6 +1567,13 @@ class K7Core:
                 plural="volumesnapshots",
                 body=snapshot_body,
             )
+
+        try:
+            # Fork's temporary snapshot is deleted inline; user snapshots count.
+            if self.admission is not None and kind != SNAPSHOT_KIND_FORK:
+                await tenancy.admit_snapshot(self, self.admission, namespace, pvc_name, create)
+            else:
+                await create()
         except ApiException as e:
             return OperationResult(
                 success=False,
@@ -1313,7 +1600,12 @@ class K7Core:
                 ready = (snap.get("status") or {}).get("readyToUse")
                 if ready is True:
                     elapsed = time.time() - start
-                    print(f"⏱️  Snapshot {snapshot_name} ready in {elapsed:.2f}s", file=sys.stderr)
+                    log.info(
+                        "⏱️  Snapshot %s ready in %.2fs",
+                        snapshot_name,
+                        elapsed,
+                        extra={"duration_ms": round(elapsed * 1000, 1)},
+                    )
                     return OperationResult(success=True)
             except ApiException:
                 pass
@@ -1375,7 +1667,7 @@ class K7Core:
             creation_timestamp=ctime,
             age=age,
             size_bytes=size_bytes,
-            snapshot_class=spec.get("volumeSnapshotClassName") or "longhorn",
+            snapshot_class=spec.get("volumeSnapshotClassName") or "",
         )
 
     async def _create_pvc_from_snapshot(
@@ -1393,20 +1685,22 @@ class K7Core:
         ``access_modes`` / ``volume_mode`` / ``storage_class_name`` from
         (fork's case, where the source sandbox still exists). When ``None``
         (restore's case), defaults to ``ReadWriteOnce`` / ``Filesystem`` /
-        ``longhorn`` — the kata-qemu-longhorn root PVC. Pass
+        the kql StorageClass — the kata-qemu-longhorn root PVC. Pass
         ``volume_mode="Block"`` for the docker graph PVC.
         """
         v1 = await self._get_core_v1_client()
         if source_pvc_spec is not None:
             access_modes = source_pvc_spec.access_modes or ["ReadWriteOnce"]
             resolved_mode = volume_mode or source_pvc_spec.volume_mode or "Filesystem"
-            storage_class = source_pvc_spec.storage_class_name or "longhorn"
+            storage_class = source_pvc_spec.storage_class_name or cluster_config.kql_storage_class()
         else:
             access_modes = ["ReadWriteOnce"]
             resolved_mode = volume_mode or "Filesystem"
-            storage_class = "longhorn"
+            storage_class = cluster_config.kql_storage_class()
         pvc_body = client.V1PersistentVolumeClaim(
-            metadata=client.V1ObjectMeta(name=target_pvc_name, namespace=namespace),
+            metadata=client.V1ObjectMeta(
+                name=target_pvc_name, namespace=namespace, labels=self._identity_labels() or None
+            ),
             spec=client.V1PersistentVolumeClaimSpec(
                 access_modes=access_modes,
                 volume_mode=resolved_mode,
@@ -1446,7 +1740,9 @@ class K7Core:
                 phase = getattr(pvc.status, "phase", None)
                 if phase == "Bound":
                     elapsed = time.time() - start
-                    print(f"⏱️  PVC {pvc_name} bound in {elapsed:.2f}s", file=sys.stderr)
+                    log.info(
+                        "⏱️  PVC %s bound in %.2fs", pvc_name, elapsed, extra={"duration_ms": round(elapsed * 1000, 1)}
+                    )
                     return OperationResult(success=True)
             except ApiException as e:
                 if e.status == 404:
@@ -1456,6 +1752,40 @@ class K7Core:
             await asyncio.sleep(poll_interval)
             poll_interval = min(poll_interval * 1.2, 2.0)
         return OperationResult(success=False, error=f"PVC {pvc_name} not Bound within {timeout}s")
+
+    async def _wait_for_longhorn_clone(self, pvc_name: str, namespace: str, timeout: int = 300) -> OperationResult:
+        """Wait until Longhorn has copied a snapshot-sourced PVC's data.
+
+        The PVC binds as soon as Longhorn creates the volume; the full-copy
+        clone from the snapshot runs after that. Deleting the source snapshot
+        before ``cloneStatus.state`` is ``completed`` purges it mid-copy and
+        leaves the clone with an unmountable filesystem.
+        """
+        v1 = await self._get_core_v1_client()
+        custom = await self._get_custom_objects_client()
+        pvc = await v1.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+        volume = pvc.spec.volume_name
+        sc = await client.StorageV1Api(await self._get_api_client()).read_storage_class(pvc.spec.storage_class_name)
+        if sc.provisioner != LONGHORN_PROVISIONER:
+            # Only Longhorn binds before the copy is done; other CSI drivers hand
+            # out a snapshot-sourced volume once its content is in place.
+            return OperationResult(success=True)
+        start = time.time()
+        state = None
+        while time.time() - start < timeout:
+            vol = await custom.get_namespaced_custom_object(
+                group="longhorn.io", version="v1beta2", namespace="longhorn-system", plural="volumes", name=volume
+            )
+            state = ((vol.get("status") or {}).get("cloneStatus") or {}).get("state")
+            if state == "completed":
+                log.info("⏱️  Clone %s copied in %.2fs", volume, time.time() - start)
+                return OperationResult(success=True)
+            if state == "failed":
+                return OperationResult(success=False, error=f"Longhorn clone of PVC {pvc_name} ({volume}) failed")
+            await asyncio.sleep(1)
+        return OperationResult(
+            success=False, error=f"Longhorn clone of PVC {pvc_name} ({volume}) not completed within {timeout}s: {state}"
+        )
 
     def _root_pvc_name(self, sandbox_name: str) -> str:
         """Derive the canonical root PVC name for a sandbox."""
@@ -1486,7 +1816,7 @@ class K7Core:
             )
         freeze = await self.exec_command(
             sandbox_name,
-            f"cp {FSFREEZE_STAGED} {FSFREEZE_VEHICLE} && chmod 755 {FSFREEZE_VEHICLE} && "
+            f"rm -rf {FSFREEZE_VEHICLE_DIR} && mkdir -p /usr/local/lib && cp -a {FSFREEZE_STAGED} {FSFREEZE_VEHICLE_DIR} && "
             f"{FSFREEZE_VEHICLE} -f {KATA_GRAPH_MOUNT}",
             namespace=namespace,
             container=VEHICLE_CONTAINER_NAME,
@@ -1554,20 +1884,22 @@ class K7Core:
                 result = await self._create_volume_snapshot(
                     pvc_name=root_pvc,
                     snapshot_name=snapshot_name,
-                    snapshot_class="longhorn",
                     namespace=namespace,
                     kind=kind,
                     source_sandbox=sandbox_name,
                 )
                 if result.success and docker_pvc is not None:
-                    docker_snap = await self._create_volume_snapshot(
-                        pvc_name=docker_pvc,
-                        snapshot_name=self._docker_snapshot_name(snapshot_name),
-                        snapshot_class="longhorn",
-                        namespace=namespace,
-                        kind=kind,
-                        source_sandbox=sandbox_name,
-                    )
+                    try:
+                        docker_snap = await self._create_volume_snapshot(
+                            pvc_name=docker_pvc,
+                            snapshot_name=self._docker_snapshot_name(snapshot_name),
+                            namespace=namespace,
+                            kind=kind,
+                            source_sandbox=sandbox_name,
+                        )
+                    except tenancy.AdmissionError:
+                        await self.delete_snapshot(snapshot_name, namespace=namespace)
+                        raise
                     if not docker_snap.success:
                         result = docker_snap
         finally:
@@ -1629,11 +1961,11 @@ class K7Core:
             if e.status != 404:
                 return OperationResult(success=False, error=f"PVC lookup error: {e}")
         pvc_body = client.V1PersistentVolumeClaim(
-            metadata=client.V1ObjectMeta(name=pvc_name, namespace=namespace),
+            metadata=client.V1ObjectMeta(name=pvc_name, namespace=namespace, labels=self._identity_labels() or None),
             spec=client.V1PersistentVolumeClaimSpec(
                 access_modes=["ReadWriteOnce"],
                 volume_mode="Filesystem",
-                storage_class_name="longhorn",
+                storage_class_name=cluster_config.kql_storage_class(),
                 resources=client.V1VolumeResourceRequirements(requests={"storage": root_disk_size}),
             ),
         )
@@ -1709,11 +2041,11 @@ class K7Core:
             if e.status != 404:
                 return OperationResult(success=False, error=f"PVC lookup error: {e}")
         pvc_body = client.V1PersistentVolumeClaim(
-            metadata=client.V1ObjectMeta(name=pvc_name, namespace=namespace),
+            metadata=client.V1ObjectMeta(name=pvc_name, namespace=namespace, labels=self._identity_labels() or None),
             spec=client.V1PersistentVolumeClaimSpec(
                 access_modes=["ReadWriteOnce"],
                 volume_mode="Block",
-                storage_class_name="longhorn",
+                storage_class_name=cluster_config.kql_storage_class(),
                 resources=client.V1VolumeResourceRequirements(requests={"storage": docker_disk}),
             ),
         )
@@ -1941,70 +2273,17 @@ class K7Core:
         cidrs: list[str],
         fqdns: list[str],
     ) -> OperationResult:
-        """Create (or replace) a CiliumNetworkPolicy that allows FQDN + optional CIDR egress.
-
-        Cilium's FQDN matching requires DNS lookups to pass through Cilium's DNS
-        proxy, so we always whitelist cluster DNS (kube-dns) on UDP/TCP 53 when
-        FQDNs are present.
-        """
+        """Create (or replace) the ``{name}-egress`` CiliumNetworkPolicy (spec: ``_cilium_egress_spec``)."""
         custom = await self._get_custom_objects_client()
-
-        egress_rules: list[dict] = []
-
-        # DNS egress + FQDN allowlist (paired so the FQDN proxy can observe lookups).
-        dns_rule: dict = {
-            "toEndpoints": [
-                {
-                    "matchLabels": {
-                        "k8s:io.kubernetes.pod.namespace": "kube-system",
-                        "k8s:k8s-app": "kube-dns",
-                    }
-                }
-            ],
-            "toPorts": [
-                {
-                    "ports": [
-                        {"port": "53", "protocol": "UDP"},
-                        {"port": "53", "protocol": "TCP"},
-                    ],
-                    "rules": {"dns": [{"matchPattern": "*"}]},
-                }
-            ],
-        }
-        egress_rules.append(dns_rule)
-
-        fqdn_matchers: list[dict] = []
-        for fqdn in fqdns:
-            if "*" in fqdn:
-                # Cilium matchPattern semantics trap: `*`
-                # matches DNS characters within a SINGLE label — it never
-                # crosses dots. `*.docker.com` therefore does NOT match
-                # `production.cloudfront.docker.com`, which silently breaks
-                # CDN-backed registries (Docker Hub blobs). k7 promises
-                # "any subdomain", so translate a leading `*.` into Cilium's
-                # multi-label subdomain wildcard `**.` (one or more labels).
-                if fqdn.startswith("*.") and not fqdn.startswith("**"):
-                    fqdn = "*" + fqdn
-                fqdn_matchers.append({"matchPattern": fqdn})
-            else:
-                fqdn_matchers.append({"matchName": fqdn})
-        if fqdn_matchers:
-            egress_rules.append({"toFQDNs": fqdn_matchers})
-
-        if cidrs:
-            egress_rules.append({"toCIDR": cidrs})
-
         body = {
             "apiVersion": "cilium.io/v2",
             "kind": "CiliumNetworkPolicy",
             "metadata": {
                 "name": f"{sandbox_name}-egress",
                 "namespace": namespace,
+                "labels": self._identity_labels(),
             },
-            "spec": {
-                "endpointSelector": {"matchLabels": {"katakate.org/sandbox": sandbox_name}},
-                "egress": egress_rules,
-            },
+            "spec": _cilium_egress_spec(sandbox_name, cidrs, fqdns),
         }
 
         try:
@@ -2037,6 +2316,61 @@ class K7Core:
                     error=f"Failed to create CiliumNetworkPolicy: {e}",
                 )
         return OperationResult(success=True)
+
+    async def reconcile_cilium_egress_policies(self) -> list[str]:
+        """Bring every sandbox ``{name}-egress`` policy's DNS rule in line with its allowlist.
+
+        Policies written before the DNS rule mirrored ``toFQDNs`` allow every
+        name (``matchPattern: "*"``). Only the spec is rewritten, from the
+        policy's own allowlist, so metadata (tenant labels) and resourceVersion
+        are kept; an up-to-date policy is left alone. Returns ``ns/name`` of
+        each policy changed.
+        """
+        if not await self._cilium_available():
+            return []
+        custom = await self._get_custom_objects_client()
+        listed = await custom.list_cluster_custom_object(
+            group="cilium.io", version="v2", plural="ciliumnetworkpolicies"
+        )
+        changed: list[str] = []
+        for cnp in listed.get("items") or []:
+            meta = cnp["metadata"]
+            selector = ((cnp.get("spec") or {}).get("endpointSelector") or {}).get("matchLabels") or {}
+            sandbox = selector.get("katakate.org/sandbox")
+            if not sandbox or meta["name"] != f"{sandbox}-egress":
+                continue
+            cidrs, fqdns = _classify_egress_entries(_whitelist_from_cnp(cnp))
+            if _cnp_dns_matchers(cnp) == _fqdn_matchers(fqdns):
+                continue
+            cnp["spec"] = _cilium_egress_spec(sandbox, cidrs, fqdns)
+            ref = {"group": "cilium.io", "version": "v2", "namespace": meta["namespace"]}
+            ref |= {"plural": "ciliumnetworkpolicies", "name": meta["name"]}
+            try:
+                await custom.replace_namespaced_custom_object(**ref, body=cnp)
+            except ApiException as e:
+                # Another k7-api replica reconciling at the same time: fine if it got there first.
+                if e.status != 409 or _cnp_dns_matchers(await custom.get_namespaced_custom_object(**ref)) != (
+                    _fqdn_matchers(fqdns)
+                ):
+                    raise
+                continue
+            changed.append(f"{meta['namespace']}/{meta['name']}")
+        return changed
+
+    async def _cluster_dns_ips(self) -> list[Any]:
+        """Service and pod IPs of the cluster resolver (``kube-system``, ``k8s-app=kube-dns``)."""
+        core_v1 = await self._get_core_v1_client()
+        services = await core_v1.list_namespaced_service("kube-system", label_selector="k8s-app=kube-dns")
+        pods = await core_v1.list_namespaced_pod("kube-system", label_selector="k8s-app=kube-dns")
+        raw = [ip for s in services.items for ip in (s.spec.cluster_i_ps or [s.spec.cluster_ip]) if ip]
+        raw += [p.status.pod_ip for p in pods.items if p.status and p.status.pod_ip]
+        ips = [ipaddress.ip_address(ip) for ip in raw if ip != "None"]
+        if not ips:
+            raise RuntimeError(
+                "cannot find the cluster DNS server (kube-system Service/pods labelled k8s-app=kube-dns), "
+                "so a CIDR egress allowlist cannot be checked for a DNS exfiltration path"
+            )
+        return ips
 
     async def _apply_sandbox_network_policies(
         self,
@@ -2090,6 +2424,22 @@ class K7Core:
                         error=cnp_result.error or "Cilium egress policy failed",
                     )
             else:
+                # Cilium's ipBlock selects only `world`, never the CoreDNS pod. Other
+                # engines match pod and Service IPs, so a CIDR covering the cluster
+                # resolver would let the sandbox resolve any name (DNS exfiltration).
+                if cidrs and not await self._cilium_available():
+                    dns_ips = await self._cluster_dns_ips()
+                    leaking = [c for c in cidrs if any(ip in ipaddress.ip_network(c) for ip in dns_ips)]
+                    if leaking:
+                        return OperationResult(
+                            success=False,
+                            error=(
+                                f"egress CIDR(s) {', '.join(leaking)} contain the cluster DNS server "
+                                f"({', '.join(map(str, dns_ips))}). Without Cilium's DNS proxy that lets the "
+                                "sandbox resolve any name through CoreDNS, a DNS exfiltration channel. "
+                                "Narrow the CIDRs, or install with Cilium (k7 install --cni cilium)."
+                            ),
+                        )
                 egress_rules = [
                     client.V1NetworkPolicyEgressRule(
                         to=[client.V1NetworkPolicyPeer(ip_block=client.V1IPBlock(cidr=cidr))]
@@ -2098,7 +2448,9 @@ class K7Core:
                 ]
 
                 network_policy = client.V1NetworkPolicy(
-                    metadata=client.V1ObjectMeta(name=f"{name}-netpol", namespace=namespace),
+                    metadata=client.V1ObjectMeta(
+                        name=f"{name}-netpol", namespace=namespace, labels=self._identity_labels() or None
+                    ),
                     spec=client.V1NetworkPolicySpec(
                         pod_selector=client.V1LabelSelector(match_labels={"katakate.org/sandbox": name}),
                         policy_types=["Egress"],
@@ -2147,7 +2499,9 @@ class K7Core:
         # renaming it would strand policies created by older k7 versions across
         # an upgrade.
         ingress_np = client.V1NetworkPolicy(
-            metadata=client.V1ObjectMeta(name=f"{name}-deny-ingress", namespace=namespace),
+            metadata=client.V1ObjectMeta(
+                name=f"{name}-deny-ingress", namespace=namespace, labels=self._identity_labels() or None
+            ),
             spec=client.V1NetworkPolicySpec(
                 pod_selector=client.V1LabelSelector(match_labels={"katakate.org/sandbox": name}),
                 policy_types=["Ingress"],
@@ -2194,7 +2548,7 @@ class K7Core:
             metadata=client.V1ObjectMeta(
                 name=svc_name,
                 namespace=namespace,
-                labels={"katakate.org/sandbox": name},
+                labels={"katakate.org/sandbox": name, **self._identity_labels()},
             ),
             spec=client.V1ServiceSpec(
                 type="NodePort",
@@ -2282,18 +2636,7 @@ class K7Core:
             cnp = None
 
         if cnp:
-            entries: list[str] = []
-            for rule in (cnp.get("spec") or {}).get("egress") or []:
-                for matcher in rule.get("toFQDNs") or []:
-                    fqdn = matcher.get("matchName") or matcher.get("matchPattern")
-                    if not fqdn:
-                        continue
-                    # `_apply_cilium_egress_policy` rewrites a user's `*.foo`
-                    # into Cilium's multi-label `**.foo`; undo it so the fork
-                    # re-derives the same policy from the same input.
-                    entries.append(fqdn[1:] if fqdn.startswith("**.") else fqdn)
-                entries.extend(rule.get("toCIDR") or [])
-            return entries
+            return _whitelist_from_cnp(cnp)
 
         try:
             np = await networking_v1.read_namespaced_network_policy(name=f"{name}-netpol", namespace=namespace)
@@ -2569,12 +2912,23 @@ class K7Core:
             if not playbook_content:
                 return OperationResult(success=False, error="No playbook content available")
 
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as playbook_file:
-                playbook_file.write(playbook_content)
-                playbook_path = playbook_file.name
+            total_tasks = self._count_playbook_tasks(playbook_content)
+            if progress_callback:
+                try:
+                    progress_callback({"type": "total", "total_tasks": total_tasks})
+                except Exception:
+                    pass
 
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".ini", delete=False) as inventory_file:
-                inventory_file.write(
+            current_index = 0
+            task_pattern = re.compile(r"^TASK \[(.*?)\]")
+            ansi_escape = re.compile(r"\x1b\[[0-9;]*[mK]")
+            combined_output = []
+            # One directory for playbook, inventory and extra-vars: removed even when
+            # ansible-playbook never starts.
+            with tempfile.TemporaryDirectory(prefix="k7-install-") as tmp:
+                playbook_path, inventory_path = Path(tmp, "playbook.yaml"), Path(tmp, "inventory.ini")
+                playbook_path.write_text(playbook_content)
+                inventory_path.write_text(
                     inventory_content
                     or (
                         "[k7_servers]\n"
@@ -2583,44 +2937,23 @@ class K7Core:
                         "\n[k7_cluster:children]\nk7_servers\nk7_agents\n"
                     )
                 )
-                inventory_path = inventory_file.name
+                cmd = ["ansible-playbook", "-i", str(inventory_path), str(playbook_path)]
+                if extra_vars:
+                    extra_vars_path = Path(tmp, "extra-vars.yml")
+                    extra_vars_path.write_text(yaml.safe_dump(extra_vars, default_flow_style=False))
+                    cmd += ["-e", f"@{extra_vars_path}"]
+                if verbose:
+                    cmd.append("-v")
 
-            extra_vars_path: str | None = None
-            if extra_vars:
-                try:
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as evf:
-                        yaml.safe_dump(extra_vars, evf, default_flow_style=False)
-                        extra_vars_path = evf.name
-                except Exception:
-                    extra_vars_path = None
-
-            total_tasks = self._count_playbook_tasks(playbook_content)
-            if progress_callback:
-                try:
-                    progress_callback({"type": "total", "total_tasks": total_tasks})
-                except Exception:
-                    pass
-
-            cmd = ["ansible-playbook", "-i", inventory_path, playbook_path]
-            if extra_vars_path:
-                cmd += ["-e", f"@{extra_vars_path}"]
-            if verbose:
-                cmd.append("-v")
-
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-
-            current_index = 0
-            task_pattern = re.compile(r"^TASK \[(.*?)\]")
-            ansi_escape = re.compile(r"\x1b\[[0-9;]*[mK]")
-            combined_output = []
-            try:
+                process = subprocess.Popen(
+                    cmd,
+                    env={**os.environ, "ANSIBLE_ROLES_PATH": str(self._get_roles_dir())},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                )
                 assert process.stdout is not None
                 for line in process.stdout:
                     combined_output.append(line)
@@ -2647,20 +2980,6 @@ class K7Core:
                             except Exception:
                                 pass
                 process.wait()
-            finally:
-                try:
-                    os.unlink(playbook_path)
-                except Exception:
-                    pass
-                try:
-                    os.unlink(inventory_path)
-                except Exception:
-                    pass
-                try:
-                    if extra_vars_path:
-                        os.unlink(extra_vars_path)
-                except Exception:
-                    pass
 
             if process.returncode == 0:
                 return OperationResult(success=True, message="Installation completed successfully")
@@ -2674,6 +2993,7 @@ class K7Core:
         except Exception as e:
             return OperationResult(success=False, error=str(e))
 
+    @observed("create")
     async def create_sandbox(
         self,
         config: SandboxConfig,
@@ -2714,17 +3034,47 @@ class K7Core:
                     ),
                 )
 
+            egress_refusal = cluster_config.egress_mode_error(
+                config.egress_whitelist, _classify_egress_entries(config.egress_whitelist or [])[1]
+            )
+            if egress_refusal:
+                return OperationResult(success=False, error=egress_refusal)
+
             # SSRF guard: refuse image registries that resolve to non-public
             # addresses before any control-plane HTTP or cluster create work.
             if config.image:
                 registry, _, _ = self._parse_image_reference(config.image)
                 await self._assert_registry_host_allowed_async(registry)
 
+            backend = self._canonicalize_backend(config.backend) or await self._detect_backend()
+            k7_logging.bind(backend=backend)
+            if backend not in _ALLOWED_BACKENDS:
+                return OperationResult(
+                    success=False,
+                    error=(
+                        f"Unsupported backend '{backend}'. "
+                        "Use kata-firecracker-devmapper (kfd), kata-qemu-longhorn (kql), k7d, or k7d-fc."
+                    ),
+                )
+            if self.admission is not None:
+                tenancy.apply_policy(config, backend, self.admission.tenant, self.admission.mode)
+            if config.network_limits:
+                refusal = tenancy.unenforceable(backend, "network")
+                if refusal:
+                    return OperationResult(success=False, error=refusal)
+                try:
+                    network_annotations = tenancy.network_annotations(config.network_limits, backend)
+                except ValueError as e:
+                    return OperationResult(success=False, error=f"invalid network_limits: {e}")
+            else:
+                network_annotations = {}
+
             apps_v1 = await self._get_apps_v1_client()
             v1 = await self._get_core_v1_client()
 
             _emit({"stage": "provisioning", "status": "start"})
 
+            env_secret_created = False
             if config.env_file and os.path.exists(config.env_file):
                 with open(config.env_file) as f:
                     env_content = f.read()
@@ -2753,6 +3103,7 @@ class K7Core:
 
                 try:
                     await v1.create_namespaced_secret(namespace=config.namespace, body=secret)
+                    env_secret_created = True
                 except ApiException as e:
                     if e.status != 409:
                         return OperationResult(success=False, error=f"Failed to create secret: {e}")
@@ -2781,16 +3132,6 @@ class K7Core:
                     add=add_caps,
                 ),
             )
-
-            backend = self._canonicalize_backend(config.backend) or await self._detect_backend()
-            if backend not in _ALLOWED_BACKENDS:
-                return OperationResult(
-                    success=False,
-                    error=(
-                        f"Unsupported backend '{backend}'. "
-                        "Use kata-firecracker-devmapper (kfd), kata-qemu-longhorn (kql), k7d, or k7d-fc."
-                    ),
-                )
 
             if backend == "k7d-fc":
                 for vol in getattr(config, "volumes", None) or []:
@@ -2859,6 +3200,7 @@ class K7Core:
 
             base_annotations = {
                 "k7.katakate.org/backend": backend,
+                **network_annotations,
             }
             if want_docker:
                 base_annotations[ANN_K7_DOCKER] = "true"
@@ -3138,16 +3480,18 @@ class K7Core:
             create_error: ApiException | None = None
             deployment_create_start = time.time()
             try:
-                await apps_v1.create_namespaced_deployment(namespace=config.namespace, body=deployment)
+                await self._create_sandbox_deployment(config.namespace, deployment)
                 deployment_created = True
-                print(
-                    f"⏱️  Deployment created in {time.time() - deployment_create_start:.2f}s",
-                    file=sys.stderr,
-                )
+                log.info("⏱️  Deployment created in %.2fs", time.time() - deployment_create_start)
             except ApiException as e:
                 create_error = e
             finally:
                 if not deployment_created:
+                    if env_secret_created:
+                        try:
+                            await v1.delete_namespaced_secret(name=f"{config.name}-env", namespace=config.namespace)
+                        except Exception:
+                            pass
                     if wrapper_created and wrapper_cm_name:
                         try:
                             await v1.delete_namespaced_config_map(name=wrapper_cm_name, namespace=config.namespace)
@@ -3274,10 +3618,7 @@ class K7Core:
                     )
                     if not pod_name:
                         return await _fail_and_rollback("Timed out waiting for sandbox container to start")
-                    print(
-                        f"⏱️  Pod container started in {time.time() - pod_wait_start:.2f}s",
-                        file=sys.stderr,
-                    )
+                    log.info("⏱️  Pod container started in %.2fs", time.time() - pod_wait_start)
                     script = config.before_script.strip()
                     # `pipefail` isn't a POSIX sh builtin (the `sleep 365d` pid 1
                     # may be busybox sh, dash, ...). Try to enable it but fall
@@ -3291,7 +3632,7 @@ class K7Core:
                             f"set -eu; {script}; touch {before_done_file}"
                         ),
                     ]
-                    async with WsApiClient() as ws_api:
+                    async with _exec_ws_client() as ws_api:
                         v1_ws = client.CoreV1Api(api_client=ws_api)
                         await v1_ws.connect_get_namespaced_pod_exec(
                             pod_name,
@@ -3351,12 +3692,14 @@ class K7Core:
                 data={"endpoints": endpoints} if endpoints else None,
             )
 
+        except tenancy.AdmissionError:
+            raise
         except Exception as e:
             try:
                 _emit({"stage": "error", "error": str(e)})
             except Exception:
                 pass
-            return OperationResult(success=False, error=str(e))
+            return OperationResult(success=False, error=str(e), transient=isinstance(e, RegistryUnresolvableError))
 
     async def list_sandboxes(self, namespace: str | None = None) -> list[SandboxInfo]:
         """List all sandboxes."""
@@ -3439,13 +3782,14 @@ class K7Core:
         except Exception:
             return []
 
+    @observed("pause")
     async def pause_sandbox(
         self,
         name: str,
         namespace: str = "default",
         pvc_name: str | None = None,
         snapshot_name: str | None = None,
-        snapshot_class: str = "longhorn",
+        snapshot_class: str | None = None,
     ) -> OperationResult:
         """Scale down the sandbox and optionally take a crash-consistent snapshot of its PVC.
 
@@ -3455,10 +3799,15 @@ class K7Core:
         k7d backend: the sandbox's microVM is paused **in place** through the
         k7d daemon (vCPUs stopped, guest memory and vsock identity retained) —
         the pod stays scheduled, and ``resume_sandbox`` restarts the vCPUs on
-        the exact same state. Longhorn-style ``snapshot_name`` does not apply.
+        the exact same state. ``snapshot_name`` is rejected on k7d and kfd.
         """
         try:
-            backend = await self._detect_backend(name, namespace)
+            backend = await self._existing_backend(name, namespace)
+            k7_logging.bind(backend=backend)
+            if backend is None:
+                return OperationResult(success=False, error=f"Sandbox {name} not found in namespace {namespace}")
+            if snapshot_name and backend == "kata-firecracker-devmapper":
+                return OperationResult(success=False, error=KFD_SNAPSHOT_REJECT)
             if _is_k7d_family(backend):
                 if snapshot_name:
                     return OperationResult(
@@ -3466,7 +3815,7 @@ class K7Core:
                         error=f"--snapshot is not supported when pausing a k7d sandbox: {K7D_SNAPSHOT_UNSUPPORTED}",
                     )
                 node, pod_name = await self._k7d_sandbox_placement(name, namespace)
-                if node != self._k7d_local_node():
+                if not self._k7d_is_local(node):
                     result = await self._k7d_forward_vm_op(
                         node,
                         "pause",
@@ -3478,6 +3827,7 @@ class K7Core:
                     return result
                 vm = await self._k7d_vm_for_sandbox(name, namespace)
                 await self._k7d_request({"op": "pause_vm", "vm_id": vm["vm_id"]})
+                await asyncio.to_thread(pauses.record, vm["sandbox_id"], True)
                 await self._update_deployment_annotation(name, namespace, K7D_ANN_PAUSED, "true")
                 return OperationResult(
                     success=True,
@@ -3487,37 +3837,50 @@ class K7Core:
                 )
 
             apps_v1 = await self._get_apps_v1_client()
+            prev_replicas = (
+                await apps_v1.read_namespaced_deployment_scale(name=name, namespace=namespace)
+            ).spec.replicas
             scale_body = {"spec": {"replicas": 0}}
             await apps_v1.patch_namespaced_deployment_scale(name=name, namespace=namespace, body=scale_body)
             snap_result = None
             if snapshot_name:
                 effective_pvc = pvc_name or self._root_pvc_name(name)
-                snap_result = await self._create_volume_snapshot(
-                    pvc_name=effective_pvc,
-                    snapshot_name=snapshot_name,
-                    snapshot_class=snapshot_class,
-                    namespace=namespace,
-                    kind=SNAPSHOT_KIND_PAUSE,
-                    source_sandbox=name,
-                )
+                try:
+                    snap_result = await self._create_volume_snapshot(
+                        pvc_name=effective_pvc,
+                        snapshot_name=snapshot_name,
+                        snapshot_class=snapshot_class,
+                        namespace=namespace,
+                        kind=SNAPSHOT_KIND_PAUSE,
+                        source_sandbox=name,
+                    )
+                except tenancy.AdmissionError:
+                    await apps_v1.patch_namespaced_deployment_scale(
+                        name=name, namespace=namespace, body={"spec": {"replicas": prev_replicas}}
+                    )
+                    raise
                 if not snap_result.success:
                     return snap_result
             msg = f"Sandbox {name} paused (replicas=0)."
             if snap_result and snap_result.success:
                 msg += f" Snapshot {snapshot_name} created."
             return OperationResult(success=True, message=msg)
+        except tenancy.AdmissionError:
+            raise
         except ApiException as e:
             return OperationResult(success=False, error=f"Kubernetes error while pausing: {e}")
         except Exception as e:
             return OperationResult(success=False, error=str(e))
 
+    @observed("resume")
     async def resume_sandbox(self, name: str, namespace: str = "default") -> OperationResult:
         """Scale sandbox back to 1 replica (k7d: unfreeze the VM in place)."""
         try:
             backend = await self._detect_backend(name, namespace)
+            k7_logging.bind(backend=backend)
             if _is_k7d_family(backend):
                 node, pod_name = await self._k7d_sandbox_placement(name, namespace)
-                if node != self._k7d_local_node():
+                if not self._k7d_is_local(node):
                     result = await self._k7d_forward_vm_op(
                         node,
                         "resume",
@@ -3529,6 +3892,7 @@ class K7Core:
                     return result
                 vm = await self._k7d_vm_for_sandbox(name, namespace)
                 await self._k7d_request({"op": "resume_vm", "vm_id": vm["vm_id"]})
+                await asyncio.to_thread(pauses.record, vm["sandbox_id"], False)
                 await self._update_deployment_annotation(name, namespace, K7D_ANN_PAUSED, "false")
                 return OperationResult(
                     success=True,
@@ -3563,7 +3927,7 @@ class K7Core:
             return OperationResult(success=False, error="Pod not found")
 
         pod_name = pods.items[0].metadata.name
-        kubectl_cmd = ["k3s", "kubectl"] if shutil.which("k3s") else ["kubectl"]
+        kubectl_cmd = cluster_config.kubectl_cmd()
         exec_command = kubectl_cmd + ["exec", "-it", pod_name, "-n", namespace, "-c", "sandbox", "--", "/bin/sh"]
 
         try:
@@ -3578,6 +3942,7 @@ class K7Core:
             )
         return OperationResult(success=True)
 
+    @observed("fork")
     async def fork_sandbox(
         self,
         source_name: str,
@@ -3594,7 +3959,10 @@ class K7Core:
         """
         fork_start = time.time()
         try:
-            backend = await self._detect_backend(source_name, namespace)
+            backend = await self._existing_backend(source_name, namespace)
+            k7_logging.bind(backend=backend)
+            if backend is None:
+                return OperationResult(success=False, error=f"Sandbox {source_name} not found in namespace {namespace}")
             if _is_k7d_family(backend):
                 return await self._fork_sandbox_k7d(
                     source_name=source_name,
@@ -3775,10 +4143,15 @@ class K7Core:
                     new_dep.spec.template.metadata.annotations[ANN_DOCKER_PVC] = target_docker_pvc_name
 
             try:
-                await apps_v1.create_namespaced_deployment(namespace=namespace, body=new_dep)
+                await self._create_sandbox_deployment(namespace, new_dep)
             except ApiException as e:
                 if e.status == 409:
                     return OperationResult(success=False, error=f"Sandbox {new_name} already exists")
+                raise
+            except tenancy.AdmissionError:
+                await self._delete_sandbox_resources(new_name, namespace)
+                if auto_temp_snapshot:
+                    await self.delete_snapshot(snap_name, namespace=namespace)
                 raise
 
             # Lock the fork down before its pod can start (the cloned PVC is still
@@ -3811,19 +4184,23 @@ class K7Core:
                     return docker_bound
 
             # Option A: an auto-named fork snapshot has done its job once
-            # the cloned PVC is Bound (Longhorn has finished provisioning the new
-            # volume from the snapshot's data). Delete it inline so namespaces
-            # don't accumulate stale ``-fork-`` snapshots. Best-effort: failures
-            # are swallowed because the fork itself succeeded; the GC backstop
-            # (Option C, snapshot-gc CronJob) will eventually catch any leak.
+            # Longhorn has copied it into the cloned volumes. Delete it inline so
+            # namespaces don't accumulate stale ``-fork-`` snapshots. Best-effort:
+            # failures are swallowed because the fork itself succeeded; the GC
+            # backstop (Option C, snapshot-gc CronJob) will eventually catch any leak.
             if auto_temp_snapshot:
+                clones = [target_pvc_name]
+                if src_ann.get(ANN_K7_DOCKER) == "true":
+                    clones.append(target_docker_pvc_name)
+                for pvc in clones:
+                    copied = await self._wait_for_longhorn_clone(pvc, namespace)
+                    if not copied.success:
+                        await self._delete_sandbox_resources(new_name, namespace)
+                        return copied
                 try:
                     await self.delete_snapshot(snap_name, namespace=namespace)
                 except Exception as e:
-                    print(
-                        f"⚠️  Failed to inline-delete fork snapshot {snap_name}: {e}",
-                        file=sys.stderr,
-                    )
+                    log.warning("⚠️  Failed to inline-delete fork snapshot %s: %s", snap_name, e)
 
             fork_elapsed = time.time() - fork_start
             return OperationResult(
@@ -3833,6 +4210,8 @@ class K7Core:
                     f"(PVC {target_pvc_name} from snapshot {snap_name}) in {fork_elapsed:.2f}s"
                 ),
             )
+        except tenancy.AdmissionError:
+            raise
         except ApiException as e:
             return OperationResult(success=False, error=f"Kubernetes error while forking: {e}")
         except Exception as e:
@@ -3923,7 +4302,7 @@ class K7Core:
         new_dep.spec.template.spec.node_name = node
 
         try:
-            await apps_v1.create_namespaced_deployment(namespace=namespace, body=new_dep)
+            await self._create_sandbox_deployment(namespace, new_dep)
         except ApiException as e:
             if e.status == 409:
                 return OperationResult(success=False, error=f"Sandbox {new_name} already exists")
@@ -4003,7 +4382,7 @@ class K7Core:
                     plural="volumesnapshots",
                 )
         except ApiException as e:
-            print(f"⚠️  Failed to list VolumeSnapshots: {e}", file=sys.stderr)
+            log.warning("⚠️  Failed to list VolumeSnapshots: %s", e)
             return []
 
         items = resp.get("items") or []
@@ -4146,6 +4525,7 @@ class K7Core:
         except ApiException:
             pass
 
+    @observed("snapshot")
     async def create_snapshot(
         self,
         sandbox_name: str,
@@ -4153,7 +4533,12 @@ class K7Core:
         namespace: str = "default",
     ) -> OperationResult:
         """Snapshot a running sandbox's root PVC without pausing it (kind=named)."""
-        backend = await self._detect_backend(sandbox_name, namespace)
+        backend = await self._existing_backend(sandbox_name, namespace)
+        k7_logging.bind(backend=backend)
+        if backend is None:
+            return OperationResult(success=False, error=f"Sandbox {sandbox_name} not found in namespace {namespace}")
+        if backend == "kata-firecracker-devmapper":
+            return OperationResult(success=False, error=KFD_SNAPSHOT_REJECT)
         if _is_k7d_family(backend):
             return OperationResult(
                 success=False,
@@ -4182,12 +4567,14 @@ class K7Core:
         )
         if not root.success:
             return root
-        if not want_docker:
-            return root
-        docker_snap_name = self._docker_snapshot_name(snapshot_name)
+        # Deleting a snapshot whose content is still being cut makes the
+        # snapshot controller drop its sync and pin pvc-as-source-protection.
         root_ready = await self._wait_for_snapshot_ready(snapshot_name, namespace=namespace)
         if not root_ready.success:
             return root_ready
+        if not want_docker:
+            return root
+        docker_snap_name = self._docker_snapshot_name(snapshot_name)
         docker_ready = await self._wait_for_snapshot_ready(docker_snap_name, namespace=namespace)
         if not docker_ready.success:
             return docker_ready
@@ -4468,6 +4855,7 @@ class K7Core:
             ),
         )
 
+    @observed("restore")
     async def restore_sandbox(
         self,
         snapshot_name: str,
@@ -4534,6 +4922,7 @@ class K7Core:
         config: SandboxConfig = config_result.data
         if node_name:
             config.node_name = node_name
+        k7_logging.bind(backend=config.backend)
 
         # Restore is kata-qemu-longhorn-only: kata-firecracker-devmapper has no PVC to
         # clone, so it has no snapshots either.
@@ -4584,30 +4973,29 @@ class K7Core:
         # ``create_sandbox`` does the rest. ``_ensure_root_pvc`` is idempotent
         # and will detect our pre-created PVC; the Deployment, ConfigMap,
         # NetworkPolicy, and readiness wait all happen in the normal path.
-        create_result = await self.create_sandbox(config)
-        if not create_result.success:
-            # Roll back the orphaned PVC so we don't leak storage.
-            try:
-                v1 = await self._get_core_v1_client()
-                await v1.delete_namespaced_persistent_volume_claim(name=target_pvc, namespace=namespace)
-            except Exception:
-                pass
-            if config.docker:
+        async def rollback_pvcs() -> None:
+            v1 = await self._get_core_v1_client()
+            for pvc in [target_pvc, docker_pvc] if config.docker else [target_pvc]:
                 try:
-                    v1 = await self._get_core_v1_client()
-                    await v1.delete_namespaced_persistent_volume_claim(name=docker_pvc, namespace=namespace)
+                    await v1.delete_namespaced_persistent_volume_claim(name=pvc, namespace=namespace)
                 except Exception:
                     pass
+
+        try:
+            create_result = await self.create_sandbox(config)
+        except tenancy.AdmissionError:
+            await rollback_pvcs()
+            raise
+        if not create_result.success:
+            # Roll back the orphaned PVC so we don't leak storage.
+            await rollback_pvcs()
             return create_result
 
         if not keep_snapshot:
             try:
                 await self.delete_snapshot(snapshot_name, namespace=namespace)
             except Exception as e:
-                print(
-                    f"⚠️  Failed to delete snapshot {snapshot_name} after restore: {e}",
-                    file=sys.stderr,
-                )
+                log.warning("⚠️  Failed to delete snapshot %s after restore: %s", snapshot_name, e)
 
         return OperationResult(
             success=True,
@@ -4615,6 +5003,7 @@ class K7Core:
             data={"source_snapshot": snapshot_name, "new_sandbox_name": new_sandbox_name},
         )
 
+    @observed("delete")
     async def delete_sandbox(self, name: str, namespace: str = "default") -> OperationResult:
         """Delete a sandbox's Kubernetes objects.
 
@@ -4624,6 +5013,12 @@ class K7Core:
         waited on here — coupling API latency to shim teardown would stall
         every delete. Callers that need the graph file gone must poll.
         """
+        try:
+            dep = await (await self._get_apps_v1_client()).read_namespaced_deployment(name, namespace)
+            annotations = dep.metadata.annotations or {}
+            k7_logging.bind(backend=self._canonicalize_backend(annotations.get("k7.katakate.org/backend")))
+        except ApiException:
+            pass  # backend label stays "unknown"; the deletes below report the API error
         return await self._delete_sandbox_resources(name, namespace)
 
     async def delete_all_sandboxes(self, namespace: str = "default") -> OperationResult:
@@ -4695,7 +5090,9 @@ class K7Core:
             pod_name = pod.metadata.name
 
             exec_cmd = ["/bin/sh", "-c", command]
-            async with WsApiClient() as ws_api:
+            out, err = bytearray(), bytearray()
+            status: bytes | None = None
+            async with _exec_ws_client() as ws_api:
                 v1_ws = client.CoreV1Api(api_client=ws_api)
                 resp = await v1_ws.connect_get_namespaced_pod_exec(
                     pod_name,
@@ -4706,24 +5103,44 @@ class K7Core:
                     stdin=False,
                     stdout=True,
                     tty=False,
+                    _preload_content=False,
                 )
+                async with resp as ws:  # ty: ignore[invalid-context-manager]
+                    async for msg in ws:
+                        frame = msg.data.encode() if isinstance(msg.data, str) else msg.data
+                        if not isinstance(frame, bytes | bytearray) or not frame:
+                            continue
+                        channel, payload = frame[0], bytes(frame[1:])
+                        if channel == STDOUT_CHANNEL:
+                            out += payload
+                        elif channel == STDERR_CHANNEL:
+                            err += payload
+                        elif channel == ERROR_CHANNEL and payload:
+                            status = payload
 
-            stdout_data = resp if isinstance(resp, str) else ""
-            stderr_data = ""
-            exit_code = 0
-
+            stdout_data = out.decode("utf-8", errors="replace")
+            stderr_data = err.decode("utf-8", errors="replace")
             duration_ms = int((time.time() - start_time) * 1000)
-
+            # The v4 status frame is the only authoritative exit status; output
+            # alone cannot tell a finished command from a stream cut short.
+            if status is None:
+                return ExecResult(
+                    exit_code=EXEC_NO_STATUS,
+                    stdout=stdout_data,
+                    stderr=stderr_data + "exec stream closed without an exit status",
+                    duration_ms=duration_ms,
+                )
+            exit_code, status_error = _exec_exit_code(status)
             return ExecResult(
                 exit_code=exit_code,
                 stdout=stdout_data,
-                stderr=stderr_data,
+                stderr=stderr_data + status_error,
                 duration_ms=duration_ms,
             )
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
-            return ExecResult(exit_code=1, stdout="", stderr=str(e), duration_ms=duration_ms)
+            return ExecResult(exit_code=EXEC_NO_STATUS, stdout="", stderr=str(e), duration_ms=duration_ms)
 
     async def get_logs(
         self,

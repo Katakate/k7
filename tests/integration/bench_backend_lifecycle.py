@@ -37,6 +37,8 @@ import pytest
 from k7.core.core import K7Core, _is_k7d_family
 from k7.core.models import SandboxConfig
 
+from .cluster import KUBECTL
+
 pytestmark = pytest.mark.bench
 
 REPS = int(os.environ.get("K7_BENCH_REPS", "3"))
@@ -52,8 +54,7 @@ DOCKER_PULL_IMAGE = "alpine:3.21"
 def _pod_ready(sandbox: str, namespace: str) -> bool:
     result = subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "get",
             "pods",
             "-n",
@@ -91,7 +92,7 @@ def _wait(predicate, timeout: float, what: str, interval: float = 0.5) -> None:
 
 def _no_pods(sandbox: str, namespace: str) -> bool:
     result = subprocess.run(
-        ["k3s", "kubectl", "get", "pods", "-n", namespace, "-l", f"app={sandbox}", "--no-headers"],
+        [*KUBECTL, "get", "pods", "-n", namespace, "-l", f"app={sandbox}", "--no-headers"],
         capture_output=True,
         text=True,
         check=False,

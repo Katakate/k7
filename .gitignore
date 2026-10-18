@@ -6,6 +6,8 @@ __pycache__/
 .env
 
 # Build artifacts
+# Release-only: the release workflow writes it into the .deb / wheel.
+src/k7/deploy/images.lock.yaml
 dist/
 build/
 *.egg
@@ -59,3 +61,6 @@ rootfs-qemu-lh.img*
 # SSH keys (temporary baked key, will move to K8s Secrets)
 k7-vm-ssh-key
 k7-vm-ssh-key.pub
+
+# Integration run artifacts (utils/run-integration-tests.sh)
+itest-artifacts/

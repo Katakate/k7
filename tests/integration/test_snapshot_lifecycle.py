@@ -25,9 +25,10 @@ import pytest
 from k7.core.core import K7Core
 from k7.core.models import SandboxConfig
 
+from .cluster import KUBECTL, system_ns
+
 pytestmark = pytest.mark.integration
 
-_K3S = "/usr/local/bin/k3s"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEV_SH = _REPO_ROOT / "src" / "k7" / "cli" / "dev.sh"
 
@@ -44,8 +45,7 @@ def _wait_pod_ready(name: str, namespace: str, timeout: int = 240) -> None:
     while time.time() < deadline:
         out = subprocess.run(
             [
-                _K3S,
-                "kubectl",
+                *KUBECTL,
                 "get",
                 "pods",
                 "-n",
@@ -66,7 +66,7 @@ def _wait_pod_ready(name: str, namespace: str, timeout: int = 240) -> None:
 
 def _list_snapshots(namespace: str) -> list[str]:
     out = subprocess.run(
-        [_K3S, "kubectl", "get", "volumesnapshot", "-n", namespace, "-o", "name"],
+        [*KUBECTL, "get", "volumesnapshot", "-n", namespace, "-o", "name"],
         capture_output=True,
         text=True,
     )
@@ -77,7 +77,7 @@ def _list_snapshots(namespace: str) -> list[str]:
 
 def _snapshot_exists(name: str, namespace: str) -> bool:
     out = subprocess.run(
-        [_K3S, "kubectl", "get", "volumesnapshot", name, "-n", namespace, "-o", "name"],
+        [*KUBECTL, "get", "volumesnapshot", name, "-n", namespace, "-o", "name"],
         capture_output=True,
         text=True,
     )
@@ -89,7 +89,7 @@ def _wait_snapshot_deleting_or_gone(name: str, namespace: str, timeout: int = 60
     deadline = time.time() + timeout
     while time.time() < deadline:
         out = subprocess.run(
-            [_K3S, "kubectl", "get", "volumesnapshot", name, "-n", namespace, "-o", "json"],
+            [*KUBECTL, "get", "volumesnapshot", name, "-n", namespace, "-o", "json"],
             capture_output=True,
             text=True,
         )
@@ -108,7 +108,7 @@ def _wait_snapshot_deleting_or_gone(name: str, namespace: str, timeout: int = 60
 
 def _vsc_names_for_namespace(namespace: str) -> list[str]:
     raw = subprocess.run(
-        [_K3S, "kubectl", "get", "volumesnapshotcontent", "-o", "json"],
+        [*KUBECTL, "get", "volumesnapshotcontent", "-o", "json"],
         capture_output=True,
         text=True,
     )
@@ -132,8 +132,7 @@ def _force_delete_snapshot(name: str, namespace: str) -> None:
     """Best-effort cleanup: strip finalizers so Longhorn doesn't hang the delete."""
     subprocess.run(
         [
-            _K3S,
-            "kubectl",
+            *KUBECTL,
             "patch",
             "volumesnapshot",
             name,
@@ -146,7 +145,7 @@ def _force_delete_snapshot(name: str, namespace: str) -> None:
         capture_output=True,
     )
     subprocess.run(
-        [_K3S, "kubectl", "delete", "volumesnapshot", name, "-n", namespace, "--ignore-not-found", "--wait=false"],
+        [*KUBECTL, "delete", "volumesnapshot", name, "-n", namespace, "--ignore-not-found", "--wait=false"],
         capture_output=True,
     )
 
@@ -212,8 +211,7 @@ class TestSnapshotCrud:
                     break
                 ts = subprocess.run(
                     [
-                        _K3S,
-                        "kubectl",
+                        *KUBECTL,
                         "get",
                         "volumesnapshot",
                         snap,
@@ -362,7 +360,7 @@ class TestCronJobManifest:
 
     def test_cronjob_applied_by_install(self):
         out = subprocess.run(
-            [_K3S, "kubectl", "get", "cronjob", "k7-snapshot-gc", "-n", "kube-system", "-o", "name"],
+            [*KUBECTL, "get", "cronjob", "k7-snapshot-gc", "-n", system_ns(), "-o", "name"],
             capture_output=True,
             text=True,
         )
@@ -372,7 +370,7 @@ class TestCronJobManifest:
     def test_manual_gc_job_completes(self):
         """Trigger a Job from the CronJob and verify it completes within 2 min."""
         check = subprocess.run(
-            [_K3S, "kubectl", "get", "cronjob", "k7-snapshot-gc", "-n", "kube-system", "-o", "name"],
+            [*KUBECTL, "get", "cronjob", "k7-snapshot-gc", "-n", system_ns(), "-o", "name"],
             capture_output=True,
             text=True,
         )
@@ -383,14 +381,13 @@ class TestCronJobManifest:
         try:
             create = subprocess.run(
                 [
-                    _K3S,
-                    "kubectl",
+                    *KUBECTL,
                     "create",
                     "job",
                     "--from=cronjob/k7-snapshot-gc",
                     job_name,
                     "-n",
-                    "kube-system",
+                    system_ns(),
                 ],
                 capture_output=True,
                 text=True,
@@ -402,13 +399,12 @@ class TestCronJobManifest:
             while time.time() < deadline:
                 out = subprocess.run(
                     [
-                        _K3S,
-                        "kubectl",
+                        *KUBECTL,
                         "get",
                         "job",
                         job_name,
                         "-n",
-                        "kube-system",
+                        system_ns(),
                         "-o",
                         "jsonpath={.status.succeeded}",
                     ],
@@ -422,6 +418,6 @@ class TestCronJobManifest:
             assert succeeded, f"Job {job_name} never reached succeeded=1"
         finally:
             subprocess.run(
-                [_K3S, "kubectl", "delete", "job", job_name, "-n", "kube-system", "--ignore-not-found"],
+                [*KUBECTL, "delete", "job", job_name, "-n", system_ns(), "--ignore-not-found"],
                 capture_output=True,
             )

@@ -2,12 +2,14 @@
 
 from pathlib import Path
 
+from tests.unit.conftest import install_tree_text
+
 PLAYBOOK = Path(__file__).resolve().parents[2] / "src/k7/deploy/k7-install-node.yaml"
 EXAMPLE = Path(__file__).resolve().parents[2] / "src/k7/deploy/inventory.ini.example"
 
 
 def test_playbook_has_no_backend_default():
-    text = PLAYBOOK.read_text()
+    text = install_tree_text()
     assert "k7_backend_default" not in text
     assert "empty/omitted is not" in text
     assert "k7_backends=none" in text or "or none" in text

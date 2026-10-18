@@ -23,11 +23,15 @@ Behaviour:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from datetime import timedelta
 
+from k7 import logging as k7_logging
 from k7.core.core import K7Core
+
+log = logging.getLogger("k7.snapshot_gc")
 
 
 def _env_int(key: str, default: int) -> int:
@@ -37,7 +41,7 @@ def _env_int(key: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        print(f"⚠️  Invalid integer for {key}={raw!r}; using default {default}", file=sys.stderr)
+        log.warning("⚠️  Invalid integer for %s=%r; using default %s", key, raw, default)
         return default
 
 
@@ -49,6 +53,8 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 async def _main() -> int:
+    k7_logging.configure_from_env()
+    k7_logging.new_context(request_id=k7_logging.uuid7(), op="snapshot-gc")
     keep_minutes = _env_int("K7_GC_KEEP_FORK_FOR_MINUTES", 10)
     dry_run = _env_bool("K7_GC_DRY_RUN", False)
     core = K7Core()
@@ -59,12 +65,12 @@ async def _main() -> int:
             dry_run=dry_run,
         )
         if not result.success:
-            print(f"❌ snapshot-gc failed: {result.error}", file=sys.stderr)
+            log.error("❌ snapshot-gc failed: %s", result.error)
             return 1
-        print(result.message)
+        log.info("%s", result.message)
         for record in result.data or []:
             marker = "would-delete" if dry_run else ("deleted" if record.get("deleted") else "failed")
-            print(f"  [{marker}] {record['namespace']}/{record['name']} (age={record['age']})")
+            log.info("  [%s] %s/%s (age=%s)", marker, record["namespace"], record["name"], record["age"])
         return 0
     finally:
         await core.aclose()

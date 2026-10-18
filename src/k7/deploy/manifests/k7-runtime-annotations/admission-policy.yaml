@@ -1,0 +1,79 @@
+# containerd forwards pod annotations into the sandbox OCI spec, where the
+# k7d shim and the Kata runtime act on them: k7d.katakate.org/cluster-id
+# skips the pod netns (egress leaves as the node, bypassing Cilium),
+# fork-source-*/tree-* clone any VM on the node, io.katacontainers.config_path
+# picks any host config, ...runtime.disable_guest_seccomp undoes the playbook.
+# Only k7 may add, change or remove these pod annotations, on Pods and on
+# every built-in pod template. Exempt: the k7-api ServiceAccount, cluster
+# admins (system:masters: the host-side k7 CLI, Ansible; they can delete
+# this policy anyway) and kube-controller-manager, which only copies
+# templates this policy already admitted. Everyone else, including
+# namespace admins and tenants, is denied (SECURITY.md).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: k7-runtime-annotations
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "replicationcontrollers"]
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs", "cronjobs"]
+  matchConditions:
+    - name: not-k7-or-cluster-admin
+      expression: >-
+        !(request.userInfo.username == 'system:serviceaccount:kube-system:k7-api' ||
+          (has(request.userInfo.groups) && 'system:masters' in request.userInfo.groups))
+    - name: not-kube-controller-manager
+      expression: >-
+        !(request.userInfo.username in [
+          'system:kube-controller-manager',
+          'system:serviceaccount:kube-system:replicaset-controller',
+          'system:serviceaccount:kube-system:replication-controller',
+          'system:serviceaccount:kube-system:deployment-controller',
+          'system:serviceaccount:kube-system:statefulset-controller',
+          'system:serviceaccount:kube-system:daemon-set-controller',
+          'system:serviceaccount:kube-system:job-controller',
+          'system:serviceaccount:kube-system:cronjob-controller'])
+  variables:
+    # [new] on CREATE, [new, old] on UPDATE. dyn(): one expression for every kind.
+    - name: objects
+      expression: "request.operation == 'UPDATE' ? [dyn(object), dyn(oldObject)] : [dyn(object)]"
+    - name: annotations
+      expression: >-
+        variables.objects.map(o,
+          request.kind.kind == 'Pod' ? o :
+          request.kind.kind == 'CronJob' ? o.spec.jobTemplate.spec.template :
+          has(o.spec.template) ? o.spec.template : {}
+        ).map(p, has(p.metadata) && has(p.metadata.annotations) ? p.metadata.annotations : {})
+    - name: new
+      expression: variables.annotations[0]
+    - name: old
+      expression: "size(variables.annotations) == 2 ? variables.annotations[1] : {}"
+  validations:
+    - expression: >-
+        variables.new.all(k, !(k.startsWith('k7d.katakate.org/') || k.startsWith('io.katacontainers.')) ||
+          (k in variables.old && variables.old[k] == variables.new[k])) &&
+        variables.old.all(k, !(k.startsWith('k7d.katakate.org/') || k.startsWith('io.katacontainers.')) ||
+          k in variables.new)
+      message: >-
+        only k7 may set, change or remove k7d.katakate.org/ and io.katacontainers. pod annotations
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: k7-runtime-annotations
+spec:
+  policyName: k7-runtime-annotations
+  validationActions: [Deny]

@@ -1,0 +1,10 @@
+---
+# UNVERIFIED until the Helm chart and the node installer run an EKS AL2023 node. Do not advertise support.
+k7_containerd_socket: /run/containerd/containerd.sock
+k7_containerd_config_mode: drop-in
+k7_containerd_config_path: /etc/containerd/conf.d/k7.toml
+k7_containerd_service: containerd
+k7_containerd_root: /var/lib/containerd
+# Empty: node-prep never calls kubectl, and k7_cluster refuses this distro
+# (the Helm chart owns cluster resources on EKS).
+k7_kubectl: ""

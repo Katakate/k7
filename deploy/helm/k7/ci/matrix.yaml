@@ -1,0 +1,5 @@
+# `helm lint` + `helm template` matrix (tests/unit/test_helm_chart.py renders
+# every provider × backend pair, plus all backends together, over base-values.yaml).
+providers: [cilium, kubernetes, none]
+backends: [kfd, kql, k7d, k7dFc]
+tlsModes: [certManager, secret, insecureHTTP]

@@ -1,0 +1,67 @@
+{{- if eq .Values.networkPolicy.provider "cilium" }}
+# Same specs as src/k7/deploy/manifests/k7-api/cilium/ (unit-tested); see
+# those files for why each rule is shaped the way it is.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: k7-agent-ingress
+  namespace: {{ .Release.Namespace }}
+spec:
+  endpointSelector:
+    matchLabels:
+      app: k7-agent
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: k7-api
+        # helm test runs K7Core in its own pod (not a k7-api Service endpoint).
+        - matchLabels:
+            app: k7-helm-test
+    - fromEntities:
+        - host
+---
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: k7-sandbox-platform-deny
+spec:
+  description: "Deny sandbox egress to node, control plane and metadata"
+  enableDefaultDeny:
+    egress: false
+    ingress: false
+  endpointSelector:
+    matchExpressions:
+      - key: katakate.org/sandbox
+        operator: Exists
+  egressDeny:
+    - toEntities:
+        - host
+        - remote-node
+        - kube-apiserver
+    - toCIDR:
+        - 169.254.0.0/16
+    - toEndpoints:
+        - matchExpressions:
+            - key: k8s:io.kubernetes.pod.namespace
+              operator: In
+              values: {{ .Values.networkPolicy.platformNamespaces | concat (list .Release.Namespace) | uniq | toJson }}
+            - key: k8s:k8s-app
+              operator: NotIn
+              values: [kube-dns]
+{{- with .Values.networkPolicy.apiAllowCIDRs }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: k7-api-ingress
+  namespace: {{ $.Release.Namespace }}
+spec:
+  description: "Restrict k7-api ingress to operator-supplied source CIDRs"
+  endpointSelector:
+    matchLabels:
+      app: k7-api
+  ingress:
+    - fromEntities: ["host", "remote-node", "health", "kube-apiserver"]
+    - fromCIDR: {{ toJson . }}
+{{- end }}
+{{- end }}

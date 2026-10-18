@@ -1,0 +1,879 @@
+---
+# ── K7 API deployment into K3s ─────────────────────────────────────
+
+# LVM CSI for kfd --docker graph volumes (kata-vg/thin-pool).
+- name: Set fact for any kfd node in cluster
+  ansible.builtin.set_fact:
+    cluster_has_devmapper: >-
+      {{
+        groups['k7_cluster']
+        | map('extract', hostvars, 'k7_backends_list')
+        | flatten | unique
+        | intersect(['kata-firecracker-devmapper'])
+        | length > 0
+      }}
+  tags: ['docker-lvm']
+
+- name: Install helm (pinned) for OpenEBS LVM LocalPV and --monitoring
+  ansible.builtin.shell: |
+    set -eu
+    if command -v helm >/dev/null 2>&1 && helm version --short | grep -q '{{ helm_version }}'; then
+      echo "helm {{ helm_version }} already installed"
+      exit 0
+    fi
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    curl -fsSL -o "$tmp/helm.tgz" "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+    echo "{{ helm_sha256 }}  $tmp/helm.tgz" | sha256sum -c -
+    tar -xzf "$tmp/helm.tgz" -C "$tmp"
+    install -m 0755 "$tmp/linux-amd64/helm" /usr/local/bin/helm
+  args:
+    executable: /bin/bash
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: (cluster_has_devmapper | default(false) | bool) or (k7_monitoring | bool)
+  tags: ['docker-lvm', 'monitoring']
+
+- name: Install OpenEBS LVM LocalPV chart
+  ansible.builtin.shell: |
+    set -eu
+    export KUBECONFIG={{ k7_kubeconfig }}
+    helm repo add openebs-lvm https://openebs.github.io/lvm-localpv
+    helm repo update openebs-lvm
+    cat >/tmp/k7-docker-lvm-values.yaml <<EOF
+    lvmPlugin:
+      image:
+        registry: docker.io
+        repository: openebs/lvm-driver
+        tag: "{{ openebs_lvm_localpv_version }}"
+    lvmNode:
+      kubeletDir: "/var/lib/kubelet/"
+      nodeSelector:
+        k7.katakate.org/backend-kata-firecracker-devmapper: "true"
+    # Longhorn already installed snapshot CRDs + snapshot-controller.
+    # OpenEBS GetCapacity reports VG VFree (leftover after thin-pool),
+    # not thin-pool free — CSIStorageCapacity would refuse the 20Gi graph.
+    crds:
+      csi:
+        volumeSnapshots:
+          enabled: false
+    lvmController:
+      snapshotController:
+        enabled: false
+    storageCapacity: false
+    EOF
+    helm upgrade --install openebs-lvm openebs-lvm/lvm-localpv \
+      --version {{ openebs_lvm_localpv_version }} \
+      --namespace openebs --create-namespace \
+      --values /tmp/k7-docker-lvm-values.yaml
+  args:
+    executable: /bin/bash
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_devmapper | default(false) | bool
+  tags: ['docker-lvm']
+
+- name: Wait for OpenEBS LVM pods
+  ansible.builtin.command: "{{ k7_kubectl }} -n openebs wait --for=condition=Ready pod --all --timeout=180s"
+  retries: 5
+  delay: 10
+  register: lvm_pods
+  until: lvm_pods.rc == 0
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_devmapper | default(false) | bool
+  tags: ['docker-lvm']
+
+- name: Apply StorageClass k7-docker-lvm
+  ansible.builtin.shell: |
+    set -eu
+    cat <<'EOF' | {{ k7_kubectl }} apply -f -
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata:
+      name: k7-docker-lvm
+    provisioner: local.csi.openebs.io
+    reclaimPolicy: Delete
+    volumeBindingMode: WaitForFirstConsumer
+    allowVolumeExpansion: false
+    parameters:
+      storage: "lvm"
+      volgroup: "kata-vg"
+      thinProvision: "yes"
+    EOF
+  args:
+    executable: /bin/bash
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  when: cluster_has_devmapper | default(false) | bool
+  tags: ['docker-lvm']
+
+# Shared token authenticating k7-api → k7-agent (and root CLI →
+# agent) traffic. Generated once on the first master, distributed to
+# /etc/k7/agent_token (0600) on every node; both the API deployment and
+# the agent DaemonSet read it through the /etc/k7 hostPath mount.
+- name: Generate shared k7 agent token on first master  # noqa: command-instead-of-shell
+  ansible.builtin.shell: umask 077 && openssl rand -hex 32 > /etc/k7/agent_token
+  args:
+    creates: /etc/k7/agent_token
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Read agent token from first master
+  ansible.builtin.slurp:
+    src: /etc/k7/agent_token
+  register: k7_agent_token_slurp
+  no_log: true
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Distribute agent token to every node
+  ansible.builtin.copy:
+    content: "{{ k7_agent_token_slurp.content | b64decode }}"
+    dest: /etc/k7/agent_token
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true
+  when: k7_api_enabled | default(true) | bool
+  tags: ['k7', 'api']
+
+# Copied from the controller's packaged deploy dir (the playbook itself
+# runs from a tempfile, so a `playbook_dir`-relative lookup is wrong).
+- name: Copy K7 API manifests on first master
+  ansible.builtin.copy:
+    src: "{{ k7_deploy_dir }}/manifests/k7-api/"
+    dest: /etc/k7/manifests/k7-api/
+    mode: '0644'
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# The containerd socket is distro-specific (adapter value); the static
+# manifests carry placeholders. The Helm chart templates the same.
+- name: Render the containerd socket into the K7 API manifests
+  ansible.builtin.replace:
+    path: "/etc/k7/manifests/k7-api/{{ item[0] }}"
+    regexp: "{{ item[1] }}"
+    replace: "{{ item[2] }}"
+  loop: "{{ ['deployment.yaml', 'agent-daemonset.yaml'] | product(k7_socket_placeholders) | map('flatten') | list }}"
+  vars:
+    k7_socket_placeholders:
+      - ['__K7_CONTAINERD_SOCKET_DIR__', "{{ k7_containerd_socket | dirname }}"]
+      - ['__K7_CONTAINERD_SOCKET__', "{{ k7_containerd_socket }}"]
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Render the k7-api image into the manifests
+  ansible.builtin.replace:
+    path: "/etc/k7/manifests/k7-api/{{ item[0] }}"
+    regexp: "{{ item[1].key }}"
+    replace: "{{ item[1].value }}"
+  loop: "{{ ['deployment.yaml', 'agent-daemonset.yaml', 'snapshot-gc-cronjob.yaml'] | product(k7_api_image_subs | dict2items) | list }}"
+  vars:
+    k7_api_image_subs:
+      __K7_API_IMAGE_PULL_POLICY__: "{{ k7_api_image_pull_policy }}"
+      __K7_API_IMAGE__: "{{ k7_api_image_ref }}"
+      __K7_API_MODE__: "{{ k7_api_mode }}"
+      __K7_API_TRANSPORT__: "{{ 'https' if (k7_api_tls_enabled | bool) else 'insecure-http' }}"
+      __K7_API_REMOTE_INSTALL__: "{{ '1' if k7_api_remote_install | bool else '0' }}"
+      __K7_NODE_INSTALLER_IMAGE__: "{{ k7_node_installer_image_ref if k7_api_remote_install | bool else '' }}"
+      __K7_NODE_INSTALLER_NAMESPACE__: "{{ 'k7-system' if k7_api_remote_install | bool else '' }}"
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# envFrom is read only at pod start: the hash in the pod template rolls
+# k7-api exactly when the OIDC settings change.
+- name: Render the OIDC config hash into the k7-api Deployment
+  ansible.builtin.replace:
+    path: /etc/k7/manifests/k7-api/deployment.yaml
+    regexp: __K7_OIDC_CONFIG_HASH__
+    replace: "{{ (((k7_oidc_cm_data | to_json) if k7_oidc_cm_data else '') | hash('sha256'))[:16] }}"
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# k7-api and k7-agent read the metering settings at start.
+- name: Render the metering config hash into the k7-api and k7-agent pod templates
+  ansible.builtin.replace:
+    path: "/etc/k7/manifests/k7-api/{{ item }}"
+    regexp: __K7_METERING_CONFIG_HASH__
+    replace: "{{ (k7_metering | to_json(sort_keys=True) | hash('sha256'))[:16] }}"
+  loop: [deployment.yaml, agent-daemonset.yaml]
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Fail if any K7 API manifest placeholder is left unrendered
+  ansible.builtin.command: grep -rl __K7_ /etc/k7/manifests/k7-api
+  register: k7_manifest_placeholders
+  changed_when: false
+  failed_when: k7_manifest_placeholders.rc != 1
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Stage the TLS manifest renderer on the first master
+  ansible.builtin.copy:
+    src: "{{ k7_deploy_dir }}/k7_api_tls.py"
+    dest: /etc/k7/k7_api_tls.py
+    mode: '0644'
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# Older installs shipped this CiliumNetworkPolicy at the top
+# level; copy does not prune, so remove the stale copy explicitly.
+- name: Remove legacy top-level agent-networkpolicy.yaml (moved to cilium/)
+  ansible.builtin.file:
+    path: /etc/k7/manifests/k7-api/agent-networkpolicy.yaml
+    state: absent
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# The k7-api ingress allowlist is rendered from the operator's
+# --api-allow-cidr values, so it cannot ship as a static manifest. Rendered
+# here with `copy: content:` rather than `template:` because the playbook
+# itself runs from a tempfile on the controller, which makes a
+# controller-side template `src` unreliable.
+#
+# The `fromEntities` block is mandatory, not decorative: an `ingress:`
+# section flips the k7-api endpoint to default-deny, and `host` is what
+# carries the kubelet liveness/readiness probes. Drop it and the API pod
+# crash-loops. Never widen this to anything that could touch port 22 or
+# the k3s API port — this policy selects one pod endpoint, not the host.
+#
+# No `fromEndpoints` rule is needed for k7-snapshot-gc: it runs
+# `python -m k7.api.snapshot_gc`, which drives K7Core against the
+# Kubernetes API in-process (re-verified), never HTTP to
+# k7-api. Should it ever become an HTTP client, it needs one.
+- name: Render the k7-api ingress allowlist policy
+  ansible.builtin.copy:
+    dest: /etc/k7/manifests/k7-api/cilium/k7-api-ingress.yaml
+    mode: '0644'
+    content: |
+      # Rendered by `k7 install --api-allow-cidr`. Edits are overwritten.
+      apiVersion: cilium.io/v2
+      kind: CiliumNetworkPolicy
+      metadata:
+        name: k7-api-ingress
+        namespace: kube-system
+      spec:
+        description: "Restrict k7-api ingress to operator-supplied source CIDRs"
+        endpointSelector:
+          matchLabels:
+            app: k7-api
+        ingress:
+          - fromEntities: ["host", "remote-node", "health", "kube-apiserver"]
+          - fromCIDR: {{ k7_api_allow_cidrs_list | to_json }}
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_allow_cidrs_list | length > 0
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api', 'cilium']
+
+- name: Drop the rendered k7-api ingress policy when no allowlist is configured
+  ansible.builtin.file:
+    path: /etc/k7/manifests/k7-api/cilium/k7-api-ingress.yaml
+    state: absent
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_allow_cidrs_list | length == 0
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api', 'cilium']
+
+# first-master InternalIP is a SAN and the host in
+# /etc/k7/api_endpoint. Fail loud if the lookup is empty — a
+# playbook-minted cert without the node IP is an outage.
+- name: Resolve first-master IPv4 for TLS SANs and api_endpoint
+  ansible.builtin.shell: >
+    {{ k7_kubectl }} get nodes -l k7.katakate.org/first-master=true -o json |
+    python3 -c "import sys,json;
+    items=json.load(sys.stdin)['items'];
+    items or sys.exit('no first-master node');
+    addrs=items[0]['status']['addresses'];
+    print(next(a['address'] for a in addrs if a['type']=='InternalIP' and ':' not in a['address']))"
+  when: k7_api_enabled | default(true) | bool
+  register: k7_first_master_ip_cmd
+  changed_when: false
+  failed_when: k7_first_master_ip_cmd.rc != 0 or k7_first_master_ip_cmd.stdout | trim | length == 0
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Record first-master IPv4
+  ansible.builtin.set_fact:
+    k7_first_master_ip: "{{ hostvars[k7_first_master]['k7_first_master_ip_cmd']['stdout'] | trim }}"
+  when: k7_api_enabled | default(true) | bool
+  tags: ['k7', 'api']
+
+- name: Read first-master hostname for the server-cert SAN
+  ansible.builtin.command: hostname -s
+  register: k7_first_master_hostname_cmd
+  changed_when: false
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+    - not (k7_api_tls_acme | bool)
+    - not (k7_api_tls_operator | bool)
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Fail if --api-hostname does not resolve to the first master
+  ansible.builtin.shell: |
+    set -euo pipefail
+    resolved="$(getent ahostsv4 "{{ k7_api_hostname }}" | awk '{print $1; exit}')"
+    if [ -z "${resolved}" ]; then
+      echo "Error: --api-hostname {{ k7_api_hostname }} has no A record" >&2
+      exit 1
+    fi
+    if [ "${resolved}" != "{{ k7_first_master_ip }}" ]; then
+      echo "Error: --api-hostname {{ k7_api_hostname }} resolves to ${resolved}, not first-master {{ k7_first_master_ip }}" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_acme | bool
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Create /etc/k7/tls on the first master
+  ansible.builtin.file:
+    path: /etc/k7/tls
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Create /etc/k7/caddy on the first master (mode 0700)
+  ansible.builtin.file:
+    path: /etc/k7/caddy
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# Track A: playbook cluster CA. Reuse the CA; re-issue the server
+# cert only when it is missing or has fewer than 30 days left.
+# ca.key is 0600 root and is never copied into a Secret or volume.
+- name: Issue or reuse the playbook cluster CA and server cert (track A)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    TLS_DIR=/etc/k7/tls
+    IP="{{ k7_first_master_ip }}"
+    HOST="{{ hostvars[k7_first_master]['k7_first_master_hostname_cmd']['stdout'] | trim }}"
+    if [ -z "${IP}" ] || [ -z "${HOST}" ]; then
+      echo "Error: first-master IP or hostname is empty; refusing to mint a server cert" >&2
+      exit 1
+    fi
+    if [ ! -f "${TLS_DIR}/ca.crt" ] || [ ! -f "${TLS_DIR}/ca.key" ]; then
+      openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+        -keyout "${TLS_DIR}/ca.key" -out "${TLS_DIR}/ca.crt" \
+        -subj "/CN=k7-cluster-ca"
+      chmod 0600 "${TLS_DIR}/ca.key"
+      chmod 0644 "${TLS_DIR}/ca.crt"
+    fi
+    need_issue=1
+    if [ -f "${TLS_DIR}/server.crt" ] && [ -f "${TLS_DIR}/server.key" ]; then
+      if openssl x509 -checkend $((30*24*3600)) -noout -in "${TLS_DIR}/server.crt"; then
+        need_issue=0
+      fi
+    fi
+    if [ "${need_issue}" -eq 1 ]; then
+      openssl req -newkey rsa:2048 -nodes \
+        -keyout "${TLS_DIR}/server.key" -out /tmp/k7-server.csr \
+        -subj "/CN=k7-api"
+      printf 'subjectAltName=IP:%s,IP:127.0.0.1,DNS:localhost,DNS:%s\nextendedKeyUsage=serverAuth\n' \
+        "${IP}" "${HOST}" > /tmp/k7-san.ext
+      openssl x509 -req -in /tmp/k7-server.csr \
+        -CA "${TLS_DIR}/ca.crt" -CAkey "${TLS_DIR}/ca.key" \
+        -CAcreateserial -out "${TLS_DIR}/server.crt" -days 365 -sha256 \
+        -extfile /tmp/k7-san.ext
+      chmod 0600 "${TLS_DIR}/server.key"
+      chmod 0644 "${TLS_DIR}/server.crt"
+      rm -f /tmp/k7-server.csr /tmp/k7-san.ext
+    fi
+  args:
+    executable: /bin/bash
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+    - not (k7_api_tls_acme | bool)
+    - not (k7_api_tls_operator | bool)
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Copy operator-supplied server certificate (track C)
+  ansible.builtin.copy:
+    src: "{{ k7_api_tls_cert_src }}"
+    dest: /etc/k7/tls/server.crt
+    owner: root
+    group: root
+    mode: '0644'
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_operator | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Copy operator-supplied server key (track C)
+  ansible.builtin.copy:
+    src: "{{ k7_api_tls_key_src }}"
+    dest: /etc/k7/tls/server.key
+    owner: root
+    group: root
+    mode: '0600'
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_operator | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Warn if the operator cert SAN list omits the first-master IP
+  ansible.builtin.shell: |
+    set -euo pipefail
+    text="$(openssl x509 -in /etc/k7/tls/server.crt -noout -text)"
+    if ! echo "${text}" | grep -q "{{ k7_first_master_ip }}"; then
+      echo "Warning: operator cert SAN list does not include first-master IP {{ k7_first_master_ip }}"
+    fi
+  args:
+    executable: /bin/bash
+  register: k7_operator_san_check
+  changed_when: false
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_operator | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Show operator-cert SAN warning
+  ansible.builtin.debug:
+    msg: "{{ k7_operator_san_check.stdout }}"
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_operator | bool
+    - k7_operator_san_check.stdout is defined
+    - k7_operator_san_check.stdout | length > 0
+  run_once: true
+  tags: ['k7', 'api']
+
+- name: Create or update the k7-api TLS Secret (tracks A and C)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    {{ k7_kubectl }} -n kube-system create secret tls k7-api-tls \
+      --cert=/etc/k7/tls/server.crt --key=/etc/k7/tls/server.key \
+      --dry-run=client -o yaml | {{ k7_kubectl }} apply -f -
+  args:
+    executable: /bin/bash
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+    - not (k7_api_tls_acme | bool)
+  register: k7_api_tls_secret
+  changed_when: "'configured' in k7_api_tls_secret.stdout or 'created' in k7_api_tls_secret.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Overlay the TLS Deployment, Service, and Caddyfile
+  ansible.builtin.command:
+    argv:
+      - python3
+      - /etc/k7/k7_api_tls.py
+      - write
+      - --manifest-dir
+      - /etc/k7/manifests/k7-api
+      - --caddy-dir
+      - /etc/k7/caddy
+      - --mode
+      - "{{ 'acme' if (k7_api_tls_acme | bool) else 'files' }}"
+      - --hostname
+      - "{{ k7_api_hostname | default('') }}"
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+    - not (k7_api_acme_staging | default(false) | bool)
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Overlay the TLS manifests with Let's Encrypt staging
+  ansible.builtin.command:
+    argv:
+      - python3
+      - /etc/k7/k7_api_tls.py
+      - write
+      - --manifest-dir
+      - /etc/k7/manifests/k7-api
+      - --caddy-dir
+      - /etc/k7/caddy
+      - --mode
+      - acme
+      - --hostname
+      - "{{ k7_api_hostname }}"
+      - --acme-staging
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+    - k7_api_acme_staging | default(false) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Delete a leftover k7-api TLS Secret on --api-insecure-http
+  ansible.builtin.command: "{{ k7_kubectl }} -n kube-system delete secret k7-api-tls --ignore-not-found"
+  when:
+    - k7_api_enabled | default(true) | bool
+    - not (k7_api_tls_enabled | bool)
+  register: k7_api_tls_secret_delete
+  changed_when: "'deleted' in k7_api_tls_secret_delete.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# k7-api and k7-agent pods have no /etc/k7 hostPath: the agent token
+# and the first master's backend / k7d_version reach them as a Secret
+# and a ConfigMap (projected at /etc/k7). The host files stay for the
+# root CLI.
+- name: Publish agent token and host config to kube-system  # noqa: command-instead-of-shell
+  ansible.builtin.shell: |
+    set -euo pipefail
+    k3s kubectl -n kube-system create secret generic k7-agent-token \
+      --from-file=agent_token=/etc/k7/agent_token --dry-run=client -o yaml | k3s kubectl apply -f -
+    args=(--from-file=backend=/etc/k7/backend)
+    if [ -f /etc/k7/k7d_version ]; then args+=(--from-file=k7d_version=/etc/k7/k7d_version); fi
+    k3s kubectl -n kube-system create configmap k7-host-config "${args[@]}" \
+      --dry-run=client -o yaml | k3s kubectl apply -f -
+  args:
+    executable: /bin/bash
+  no_log: true
+  when: k7_api_enabled | default(true) | bool
+  register: k7_host_config_publish
+  changed_when: "'configured' in k7_host_config_publish.stdout or 'created' in k7_host_config_publish.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Publish the Caddyfile ConfigMap  # noqa: command-instead-of-shell
+  ansible.builtin.shell: |
+    set -euo pipefail
+    k3s kubectl -n kube-system create configmap k7-api-caddyfile \
+      --from-file=Caddyfile=/etc/k7/caddy/Caddyfile --dry-run=client -o yaml | k3s kubectl apply -f -
+  args:
+    executable: /bin/bash
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_api_tls_enabled | bool
+  register: k7_caddyfile_publish
+  changed_when: "'configured' in k7_caddyfile_publish.stdout or 'created' in k7_caddyfile_publish.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Stage the API key migrator on the first master
+  ansible.builtin.copy:
+    src: "{{ k7_deploy_dir }}/k7_api_keys.py"
+    dest: /etc/k7/k7_api_keys.py
+    mode: '0644'
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# API keys live in Secret kube-system/k7-api-keys. Copies a pre-0.5
+# /etc/k7/api_keys.json in (then renames it *.migrated), creates both
+# key Secrets if missing, and fails loud if file and Secret disagree.
+# Must run before the new Deployment, which only reads the Secret.
+- name: Migrate API keys into the k7-api-keys Secret
+  ansible.builtin.command:
+    argv: [python3, /etc/k7/k7_api_keys.py, migrate, --kubectl, k3s kubectl, --namespace, kube-system]
+  when: k7_api_enabled | default(true) | bool
+  register: k7_api_keys_migrate
+  changed_when: "'migrated' in k7_api_keys_migrate.stdout or '-> role' in k7_api_keys_migrate.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Publish the k7-api OIDC settings (ConfigMap k7-oidc)
+  ansible.builtin.command: "{{ k7_kubectl }} apply -f -"
+  args:
+    stdin: >-
+      {{ {'apiVersion': 'v1', 'kind': 'ConfigMap',
+          'metadata': {'name': 'k7-oidc', 'namespace': 'kube-system', 'labels': {'app': 'k7-api'}},
+          'data': k7_oidc_cm_data} | to_json }}
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_oidc_env.K7_OIDC_ISSUER | length > 0
+  register: k7_oidc_cm_apply
+  changed_when: "'unchanged' not in k7_oidc_cm_apply.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# Reversal path, like --api-allow-cidr: reinstalling without --oidc-* turns OIDC off.
+- name: Delete the k7-oidc ConfigMap when OIDC is not configured
+  ansible.builtin.command: "{{ k7_kubectl }} -n kube-system delete configmap k7-oidc --ignore-not-found"
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_oidc_env.K7_OIDC_ISSUER | length == 0
+  register: k7_oidc_cm_delete
+  changed_when: "'deleted' in k7_oidc_cm_delete.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# The usage-event source is k7://<cluster-id>/... The id is
+# created once and never regenerated (backups carry it): a new id
+# would make every downstream consumer see a new cluster.
+- name: Create the k7-cluster-id ConfigMap once  # noqa: command-instead-of-shell
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if {{ k7_kubectl }} -n kube-system get configmap k7-cluster-id >/dev/null 2>&1; then
+      echo "k7-cluster-id exists"
+    else
+      {{ k7_kubectl }} -n kube-system create configmap k7-cluster-id \
+        --from-literal=id="$(cat /proc/sys/kernel/random/uuid)"
+    fi
+  args:
+    executable: /bin/bash
+  when: k7_api_enabled | default(true) | bool
+  register: k7_cluster_id_create
+  changed_when: "'created' in k7_cluster_id_create.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Publish the metering settings (ConfigMap k7-metering)
+  ansible.builtin.command: "{{ k7_kubectl }} apply -f -"
+  args:
+    stdin: >-
+      {{ {'apiVersion': 'v1', 'kind': 'ConfigMap',
+          'metadata': {'name': 'k7-metering', 'namespace': 'kube-system', 'labels': {'app': 'k7-api'}},
+          'data': {'metering.json': k7_metering | to_json(sort_keys=True)}} | to_json }}
+  when: k7_api_enabled | default(true) | bool
+  register: k7_metering_cm_apply
+  changed_when: "'unchanged' not in k7_metering_cm_apply.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Stage the /metrics policy renderer on the first master
+  ansible.builtin.copy:
+    src: "{{ k7_deploy_dir }}/k7_metrics_policy.py"
+    dest: /etc/k7/k7_metrics_policy.py
+    mode: '0644'
+  when: k7_api_enabled | default(true) | bool
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# Port 9464 (/metrics) admits only --metrics-scraper pods; with
+# none, no pod. Cilium gets cilium/k7-metrics.yaml, Flannel a top-level
+# NetworkPolicy List; the renderer deletes the other CNI's file.
+- name: Render the /metrics network policy
+  ansible.builtin.command:
+    argv:
+      - python3
+      - /etc/k7/k7_metrics_policy.py
+      - write
+      - --manifest-dir
+      - /etc/k7/manifests/k7-api
+      - --cni
+      - "{{ 'cilium' if k7_cni_is_cilium else 'flannel' }}"
+      - --scraper
+      - "{{ k7_metrics_scraper | default('') }}"
+      - --namespace
+      - kube-system
+      - --acme
+      - "{{ 'true' if (k7_api_tls_acme | bool) else 'false' }}"
+  when: k7_api_enabled | default(true) | bool
+  changed_when: false  # the apply below reports changes
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# Non-recursive on purpose: manifests/k7-api/cilium/ holds Cilium CRs
+# that would fail `kubectl apply` on a Flannel cluster (no cilium.io
+# CRDs), aborting the whole directory apply. They are applied below,
+# gated on the CNI.
+- name: Apply K7 API manifests
+  ansible.builtin.command: "{{ k7_kubectl }} apply --recursive=false -f /etc/k7/manifests/k7-api/"
+  when: k7_api_enabled | default(true) | bool
+  register: api_apply
+  changed_when: "'created' in api_apply.stdout or 'configured' in api_apply.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+# A rebuilt `k7-api:local` keeps the same tag and imagePullPolicy Never, so
+# the pod spec is unchanged and nothing rolls: stamp the image ID instead.
+# `apply` leaves the annotation alone (it is not in last-applied).
+- name: Roll k7-api and k7-agent onto the rebuilt local image
+  ansible.builtin.command: >-
+    {{ k7_kubectl }} -n kube-system patch {{ item }} -p
+    '{"spec":{"template":{"metadata":{"annotations":{"k7.katakate.org/api-image-id":"{{ k7_local_image_id['k7-api:local'] }}"}}}}}'
+  loop: [deployment/k7-api, daemonset/k7-agent]
+  register: api_image_roll
+  changed_when: "'no change' not in api_image_roll.stdout"
+  when: (k7_api_enabled | default(true) | bool) and (k7_api_image_local | bool)
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Apply Cilium-only K7 manifests
+  ansible.builtin.command: "{{ k7_kubectl }} apply -f /etc/k7/manifests/k7-api/cilium/"
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_cni_is_cilium
+  register: api_cilium_apply
+  changed_when: "'created' in api_cilium_apply.stdout or 'configured' in api_cilium_apply.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api', 'cilium']
+
+# Cilium enforces v1 NetworkPolicies too: drop the Flannel-path ones.
+- name: Delete Flannel-path /metrics NetworkPolicies on Cilium
+  ansible.builtin.command: >
+    {{ k7_kubectl }} -n kube-system delete networkpolicy k7-api-metrics k7-agent-metrics --ignore-not-found
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_cni_is_cilium
+  register: api_metrics_np_delete
+  changed_when: "'deleted' in api_metrics_np_delete.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api', 'cilium']
+
+# Reversal path: re-running `k7 install` without --api-allow-cidr removes
+# the policy, so a wrong CIDR is undone by a reinstall as well as by the
+# documented `kubectl delete ciliumnetworkpolicy k7-api-ingress`.
+- name: Delete a stale k7-api ingress policy when no allowlist is configured
+  ansible.builtin.command: >
+    {{ k7_kubectl }} -n kube-system delete ciliumnetworkpolicy k7-api-ingress --ignore-not-found
+  when:
+    - k7_api_enabled | default(true) | bool
+    - k7_cni_is_cilium
+    - k7_api_allow_cidrs_list | length == 0
+  register: api_cnp_delete
+  changed_when: "'deleted' in api_cnp_delete.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api', 'cilium']
+
+# externalTrafficPolicy: Local preserves the external client's source IP,
+# without which the CIDR allowlist above would see a node IP for every
+# caller. Only flipped when an allowlist is configured; patching back to
+# Cluster otherwise is a no-op on a default install and reverts a
+# previously-hardened one. Consequence with Local: the NodePort answers
+# only on nodes running a k7-api replica; one replica prefers the first
+# master, which is what /etc/k7/api_endpoint points at.
+- name: Set k7-api externalTrafficPolicy to match the allowlist
+  ansible.builtin.command: >
+    {{ k7_kubectl }} -n kube-system patch svc k7-api -p
+    '{"spec":{"externalTrafficPolicy":"{{ 'Local' if k7_api_allow_cidrs_list | length > 0 else 'Cluster' }}"}}'
+  when: k7_api_enabled | default(true) | bool
+  register: api_etp_patch
+  changed_when: "'no change' not in api_etp_patch.stdout"
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Wait for K7 API deployment to be ready
+  ansible.builtin.command: >
+    {{ k7_kubectl }} rollout status deployment/k7-api -n kube-system
+    --timeout={{ '300s' if (k7_api_tls_acme | default(false) | bool) else '180s' }}
+  when: k7_api_enabled | default(true) | bool
+  register: api_rollout
+  retries: 3
+  delay: 10
+  until: api_rollout.rc == 0
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Wait for k7-agent DaemonSet rollout
+  ansible.builtin.command: "{{ k7_kubectl }} rollout status daemonset/k7-agent -n kube-system --timeout=180s"
+  when: k7_api_enabled | default(true) | bool
+  register: agent_rollout
+  retries: 3
+  delay: 10
+  until: agent_rollout.rc == 0
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Get K7 API NodePort
+  ansible.builtin.command: >
+    {{ k7_kubectl }} get svc k7-api -n kube-system
+    -o jsonpath='{.spec.ports[0].nodePort}'
+  when: k7_api_enabled | default(true) | bool
+  register: api_nodeport
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ k7_first_master }}"
+  tags: ['k7', 'api']
+
+- name: Compute API endpoint host and scheme
+  ansible.builtin.set_fact:
+    k7_api_endpoint_scheme: "{{ 'http' if (k7_api_insecure_http | default(false) | bool) else 'https' }}"
+    k7_api_endpoint_host: "{{ k7_api_hostname if (k7_api_hostname | default('') | length > 0) else k7_first_master_ip }}"
+  when: k7_api_enabled | default(true) | bool
+  tags: ['k7', 'api']
+
+- name: Store API endpoint in /etc/k7/api_endpoint on every host
+  ansible.builtin.copy:
+    dest: /etc/k7/api_endpoint
+    content: "{{ k7_api_endpoint_scheme }}://{{ k7_api_endpoint_host }}:{{ hostvars[k7_first_master]['api_nodeport']['stdout'] }}"
+    mode: '0644'
+  when: k7_api_enabled | default(true) | bool
+  tags: ['k7', 'api']
+
+- name: Reminder about logging out and back in for group changes
+  ansible.builtin.debug:
+    msg: >-
+      IMPORTANT: User '{{ target_user }}' was added to 'docker' and/or 'kvm' groups.
+      Log out and back in on the server for group changes to take effect.
+  tags: ['info']

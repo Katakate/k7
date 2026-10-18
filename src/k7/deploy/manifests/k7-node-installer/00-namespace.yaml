@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k7-system
+  labels:
+    # The installer is privileged + hostPID by design.
+    pod-security.kubernetes.io/enforce: privileged

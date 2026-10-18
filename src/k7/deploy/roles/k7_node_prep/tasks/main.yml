@@ -1,0 +1,25 @@
+---
+# Host-only node preparation: no kubectl, runnable on a node that already
+# runs another Kubernetes distribution (k7_distro selects vars/<distro>.yml).
+# k7-install-node.yaml imports these files individually so K3s can install
+# between network.yml and runtimes.yml, exactly where it always has.
+- name: Shared variable contract and distro adapter
+  ansible.builtin.import_tasks: facts.yml
+
+- name: Host packages, KVM, iptables, CNI plugins
+  ansible.builtin.import_tasks: host.yml
+
+- name: Host networking and Docker
+  ansible.builtin.import_tasks: network.yml
+
+- name: Firecracker, Kata and the VMM reaper
+  ansible.builtin.import_tasks: runtimes.yml
+
+- name: LVM thin pool for kfd (disk source)
+  ansible.builtin.import_tasks: disks.yml
+
+- name: K7d and k7d-fc
+  ansible.builtin.import_tasks: k7d.yml
+
+- name: Node config files, containerd runtime handlers, containerd restart
+  ansible.builtin.import_tasks: containerd.yml

@@ -31,6 +31,7 @@ import typer
 
 from k7_sdk.client import Client
 
+from . import _oidc
 from ._config import get_config_value
 
 # ---------------------------------------------------------------------------
@@ -179,20 +180,25 @@ def resolve_client(api_url: str | None, api_key: str | None, api_ca: str | None 
             err=True,
         )
         raise typer.Exit(1)
-    key = _resolve_api_key(api_key)
-    if not key:
-        typer.echo(
-            "❌ No API key configured. Pass --api-key, set K7_API_KEY, "
-            "or run `k7 config set api.key <KEY>` "
-            "(generate one with `k7 generate-api-key <name>` on the node).",
-            err=True,
-        )
-        raise typer.Exit(1)
     ca = _resolve_api_ca(api_ca)
     if ca and not Path(ca).is_file():
         typer.echo(f"❌ API CA file not found: {ca}", err=True)
         raise typer.Exit(1)
-    return Client(endpoint=url, api_key=key, verify_ssl=verify_ssl_for_url(url, ca))
+    verify = verify_ssl_for_url(url, ca)
+    explicit_key = api_key or os.environ.get("K7_API_KEY") or get_config_value("api.key")
+    provider = None if explicit_key else _oidc.token_provider(url)
+    if provider is not None:
+        return Client(endpoint=url, token_provider=provider, verify_ssl=verify)
+    key = _resolve_api_key(api_key)
+    if not key:
+        typer.echo(
+            "❌ No API key configured. Pass --api-key, set K7_API_KEY, "
+            "run `k7 config set api.key <KEY>` (generate one with `k7 generate-api-key <name> --role <role>` "
+            "on the node), or `k7 login` when the API has OIDC configured.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return Client(endpoint=url, api_key=key, verify_ssl=verify)
 
 
 T = TypeVar("T")
@@ -208,6 +214,9 @@ def handle_api_call(fn: Callable[[], T]) -> T:
     """
     try:
         return fn()
+    except _oidc.LoginRequired as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(1) from None
     except requests.ConnectionError as e:
         typer.echo(f"❌ Could not reach the K7 API: {e}", err=True)
         raise typer.Exit(1) from None

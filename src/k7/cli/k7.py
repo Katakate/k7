@@ -2,14 +2,14 @@
 
 import asyncio
 import builtins
-import hashlib
 import ipaddress
 import json
 import os
-import secrets
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -17,7 +17,8 @@ from pathlib import Path
 
 import requests
 import typer
-from click.core import ParameterSource
+import yaml
+from kubernetes_asyncio.client.exceptions import ApiException
 from rich.console import Console, Group
 from rich.live import Live
 from rich.progress import (
@@ -32,12 +33,21 @@ from rich.table import Table
 from rich.text import Text
 
 from k7 import __version__ as K7_VERSION
+from k7 import logging as k7_logging
+from k7.cli import _oidc
 from k7.cli._client import CliContext, _resolve_api_ca, _resolve_api_url, handle_api_call, verify_ssl_for_url
 from k7.cli._config import config_app
-from k7.core.core import K7Core, aclose_k7_core
+from k7.core import cluster_config, tenancy
+from k7.core.core import CONTAINERD_SOCKET_FILE, K7Core, aclose_k7_core
 from k7.core.docker import parse_docker_disk
 from k7.core.models import SandboxConfig, SandboxConfigOverrides
 from k7.core.sidecar import SIDECAR_REGISTRY
+from k7.deploy import images as k7_images
+from k7.deploy import k7_api_keys as api_keys_store
+from k7.deploy import k7_metrics_policy
+from k7.metering import config as metering_config
+from k7.metering import showback
+from k7_sdk.client import Client
 
 
 def _core_run(core: K7Core, coro):
@@ -56,6 +66,12 @@ def _core_run(core: K7Core, coro):
 
     return asyncio.run(_run())
 
+
+K3S_VERSION_RE = re.compile(r"^v1\.\d+\.\d+\+k3s\d+$")
+# k7-install-node.yaml k7_monitoring_scraper: kube-prometheus-stack's Prometheus pods.
+MONITORING_SCRAPER = "monitoring:app.kubernetes.io/name=prometheus"
+MONITORING_PROMETHEUS_URL = "http://kube-prometheus-stack-prometheus.monitoring.svc:9090"
+DEV_SAMPLE_INTERVAL = 15
 
 app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]})
 app.add_typer(config_app, name="config")
@@ -90,6 +106,12 @@ def _main(
         envvar="K7_API_CA",
         help="CA file to trust for https:// API URLs (overrides env / config / /etc/k7/tls/ca.crt).",
     ),
+    system_namespace: str | None = typer.Option(
+        None,
+        "--system-namespace",
+        envvar="K7_SYSTEM_NAMESPACE",
+        help="Namespace of k7-api / k7-agent (default: /etc/k7/config; kube-system for `k7 install`).",
+    ),
     use_core: bool = typer.Option(
         False,
         "--core",
@@ -107,6 +129,9 @@ def _main(
     if version:
         typer.echo(K7_VERSION)
         raise typer.Exit()
+    k7_logging.configure("human", "info")
+    if system_namespace:
+        os.environ[cluster_config.SYSTEM_NAMESPACE] = system_namespace
     # CliContext is built lazily — handlers that never call ``ctx.obj.client()``
     # (install / start-api / config / ...) don't trigger the missing-URL error.
     ctx.obj = CliContext(use_core=use_core, api_url=api_url, api_key=api_key, api_ca=api_ca)
@@ -119,36 +144,17 @@ def _main(
         raise typer.Exit()
 
 
-API_KEYS_FILE = Path(os.getenv("K7_API_KEYS_FILE", "/etc/k7/api_keys.json"))
 _ETC_K7_API_ENDPOINT = Path("/etc/k7/api_endpoint")
-# The k7-api container runs as this fixed non-root uid (`useradd -u 1000
-# k7user` in src/k7/api/Dockerfile.api) and reads the key store through a
-# hostPath mount. The store holds sha256 *hashes* (never raw keys), but we
-# still keep it 0600 — which means it must be owned by the API uid or the
-# pod cannot read it and every key is rejected.
-K7_API_UID = 1000
+PLATFORM_DENY_POLICY = "k7-sandbox-platform-deny"
 
 
-def _write_api_keys(api_keys: dict) -> None:
-    """Persist the key store with permissions the k7-api pod can use.
-
-    Mode 0600 owned by the API container uid. The chown needs root (the
-    normal case on a node); when unavailable we warn loudly instead of
-    leaving the API silently locked out.
-    """
-    API_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(API_KEYS_FILE, "w") as f:
-        json.dump(api_keys, f, indent=2)
-    os.chmod(API_KEYS_FILE, 0o600)
+def _key_store_call(fn, *args, **kwargs):
+    """Run a key-store op against the k7-api-keys Secret via the node's kubectl; loud on failure."""
     try:
-        os.chown(API_KEYS_FILE, K7_API_UID, K7_API_UID)
-    except (PermissionError, OSError) as e:
-        typer.echo(
-            f"⚠️  Could not chown {API_KEYS_FILE} to uid {K7_API_UID} ({e}). "
-            "The k7-api pod runs as that uid and will NOT be able to read the "
-            "key store — re-run as root on the node hosting the k7-api pod.",
-            err=True,
-        )
+        return fn(api_keys_store.Kubectl(_kubectl_cmd(), _system_ns()), *args, **kwargs)
+    except (RuntimeError, ValueError, OSError) as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(1)
 
 
 BACKEND_ALLOWED = {"kata-firecracker-devmapper", "kata-qemu-longhorn", "k7d", "k7d-fc"}
@@ -233,8 +239,15 @@ def _parse_backends(value: str) -> list[str]:
 
 
 def _kubectl_cmd() -> list[str]:
-    """Return the kubectl command prefix (k3s kubectl or kubectl)."""
-    return ["k3s", "kubectl"] if shutil.which("k3s") else ["kubectl"]
+    return cluster_config.kubectl_cmd()
+
+
+def _system_ns() -> str:
+    try:
+        return cluster_config.system_namespace()
+    except RuntimeError as e:
+        typer.echo(f"❌ {e} Or pass --system-namespace.", err=True)
+        raise typer.Exit(1) from None
 
 
 def _kubectl_run(kubectl: list[str], args: list[str]) -> subprocess.CompletedProcess[str] | None:
@@ -291,13 +304,13 @@ def _build_default_inventory(
     server_lines: builtins.list[str] = []
     agent_lines: builtins.list[str] = []
     backends_csv = ",".join(backends) if backends else BACKEND_NONE
-    has_devmapper = "kata-firecracker-devmapper" in backends
     has_longhorn = "kata-qemu-longhorn" in backends
 
     def _host_vars(extra_host: str | None = None) -> str:
-        parts = [f"k7_backends={backends_csv}"]
-        if has_devmapper and disk:
-            parts.append(f"k7_devmapper_disk={disk}")
+        parts = [
+            f"k7_backends={backends_csv}",
+            f"k7_disk_source=device:{disk}" if disk else "k7_disk_source=spare-disk",
+        ]
         if has_longhorn and longhorn_extra_disk:
             parts.append(f"longhorn_extra_disk={longhorn_extra_disk}")
         if extra_host:
@@ -362,6 +375,27 @@ def _validate_api_hostname(name: str) -> str:
     )
 
 
+def _validate_dns_upstreams(values: list[str]) -> list[str]:
+    """Same rules as the playbook's dns_validate.yml, checked before Ansible runs."""
+    ips = [v.strip() for v in values if v.strip()]
+    if len(ips) > 3:
+        raise typer.BadParameter(
+            f"at most 3 --dns-upstream values (got {len(ips)}): the kubelet hands CoreDNS only 3 nameservers"
+        )
+    for raw in ips:
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError as exc:
+            raise typer.BadParameter(f"--dns-upstream '{raw}' is not an IP address: {exc}") from exc
+        if ip.version != 4:
+            raise typer.BadParameter(
+                f"--dns-upstream {raw} is IPv6; the pod network is IPv4-only, so CoreDNS could not reach it"
+            )
+        if ip.is_loopback or ip.packed[0] == 0:
+            raise typer.BadParameter(f"--dns-upstream {raw} would point CoreDNS back at itself")
+    return ips
+
+
 def _read_api_endpoint(kubectl: list[str]) -> str | None:
     """Read the K7 API NodePort endpoint from the file the playbook wrote, or the Service."""
     etc = _ETC_K7_API_ENDPOINT
@@ -380,7 +414,7 @@ def _read_api_endpoint(kubectl: list[str]) -> str | None:
                 "svc",
                 "k7-api",
                 "-n",
-                "kube-system",
+                _system_ns(),
                 "-o",
                 "jsonpath={.spec.ports[0].nodePort},{.spec.ports[0].targetPort}",
             ],
@@ -433,6 +467,50 @@ def _get_api_manifests_dir() -> str:
         return str(src_path)
     typer.echo("❌ K3s API manifests not found in package", err=True)
     raise typer.Exit(1)
+
+
+def _get_deploy_dir() -> str:
+    """Packaged ``k7/deploy`` directory (manifests, k7d-fc, TLS renderer) — no checkout needed."""
+    return str(Path(_get_api_manifests_dir()).parent.parent)
+
+
+def _metering_settings(
+    api_mode: str,
+    sample_interval: int | None,
+    storage_interval: int,
+    spool_size: str,
+    high_water: int,
+    require_delivery: bool,
+    prometheus_url: str | None,
+    sinks_file: Path | None,
+) -> dict:
+    """The k7-metering document, validated exactly as k7-api and k7-agent will read it."""
+    if sample_interval is None:
+        if api_mode == "production":
+            raise typer.BadParameter("--api-mode production needs an explicit --metering-sample-interval (5-60 s)")
+        sample_interval = DEV_SAMPLE_INTERVAL
+    sinks: object = []
+    if sinks_file is not None:
+        try:
+            sinks = yaml.safe_load(sinks_file.read_text())
+        except (OSError, yaml.YAMLError) as e:
+            raise typer.BadParameter(f"--metering-sinks-file {sinks_file}: {e}") from e
+    try:
+        doc = {
+            "sampleInterval": sample_interval,
+            "storageInterval": storage_interval,
+            "spool": {
+                "maxBytes": int(tenancy.quantity(spool_size, "--metering-spool-size")),
+                "highWaterPercent": high_water,
+            },
+            "requireDelivery": require_delivery,
+            "prometheusUrl": prometheus_url,
+            "sinks": sinks,
+        }
+        metering_config.parse(doc)
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    return doc
 
 
 @app.command()
@@ -526,6 +604,31 @@ def install(
             "Defence in depth only — this is not rate limiting and not a secure-API claim."
         ),
     ),
+    metrics_scraper: str | None = typer.Option(
+        None,
+        "--metrics-scraper",
+        help=(
+            "Pods allowed to scrape /metrics on k7-api and k7-agent port 9464, as "
+            "<namespace>:<label>=<value>[,<label>=<value>] (e.g. monitoring:app.kubernetes.io/name=prometheus). "
+            "Without it no pod can reach the port."
+        ),
+    ),
+    monitoring: bool = typer.Option(
+        False,
+        "--monitoring",
+        help=(
+            "Also install the pinned kube-prometheus-stack (namespace monitoring) with K7's dashboards and "
+            "alerts, scraping K7. A convenience for single-box installs; implies the scraper selector."
+        ),
+    ),
+    dns_upstream: list[str] | None = typer.Option(
+        None,
+        "--dns-upstream",
+        help=(
+            "Upstream resolver for CoreDNS (repeatable, IPv4, at most 3, e.g. 1.1.1.1). "
+            "Default: the host's resolvers. Sets the playbook's k7_dns_upstreams."
+        ),
+    ),
     api_insecure_http: bool = typer.Option(
         False,
         "--api-insecure-http",
@@ -552,10 +655,108 @@ def install(
         hidden=True,
         help="Use the Let's Encrypt staging ACME directory (integration tests).",
     ),
+    oidc_issuer: str | None = typer.Option(
+        None,
+        "--oidc-issuer",
+        help=(
+            "OIDC issuer URL (https). Enables `k7 login`. The five required settings are issuer, "
+            "audience, client id, groups claim and username claim (or none). --oidc-jwks-ttl is optional."
+        ),
+    ),
+    oidc_audience: str | None = typer.Option(None, "--oidc-audience", help="Expected `aud` of OIDC tokens."),
+    oidc_client_id: str | None = typer.Option(None, "--oidc-client-id", help="Public OIDC client for `k7 login`."),
+    oidc_groups_claim: str | None = typer.Option(None, "--oidc-groups-claim", help="Groups claim, e.g. groups."),
+    oidc_username_claim: str | None = typer.Option(None, "--oidc-username-claim", help="Username claim, e.g. email."),
+    oidc_jwks_ttl: int = typer.Option(
+        3600,  # k7.api.oidc.JWKS_TTL_SECONDS
+        "--oidc-jwks-ttl",
+        help="Seconds to trust a cached OIDC JWKS before refetching (default 3600; minimum 10).",
+    ),
+    oidc_allow_http_issuer: bool = typer.Option(
+        False, "--oidc-allow-http-issuer", hidden=True, help="Allow an http:// issuer (integration tests only)."
+    ),
+    api_mode: str | None = typer.Option(
+        None,
+        "--api-mode",
+        help=(
+            "Required with the API (no default): production (every key needs a tenant or a cluster role, sandboxes "
+            "need cpu/memory, refuses --api-insecure-http) or development (today's behaviour)."
+        ),
+    ),
     no_api: bool = typer.Option(
         False,
         "--no-api",
         help="Skip deploying the K7 API into K3s (CLI-only install). Re-run `k7 install` later to add it.",
+    ),
+    k3s_version: str | None = typer.Option(
+        None,
+        "--k3s-version",
+        help="Override the pinned K3s version (v1.X.Y+k3sZ). Only applies when K3s is not installed yet.",
+    ),
+    node_prep_only: bool = typer.Option(
+        False,
+        "--node-prep-only",
+        hidden=True,
+        help="Run only the k7_node_prep role (no K3s install, no cluster resources).",
+    ),
+    metering_sample_interval: int | None = typer.Option(
+        None,
+        "--metering-sample-interval",
+        help="Usage sample period in seconds (5-60). Required with --api-mode production; development uses 15.",
+    ),
+    metering_storage_interval: int = typer.Option(
+        60, "--metering-storage-interval", help="Disk/snapshot usage window in seconds (30-600)."
+    ),
+    metering_spool_size: str = typer.Option(
+        "1Gi", "--metering-spool-size", help="Per-node usage spool cap; the oldest segment is dropped past it."
+    ),
+    metering_spool_high_water: int = typer.Option(
+        80, "--metering-spool-high-water", help="Spool fill percent above which --metering-require-delivery refuses."
+    ),
+    metering_require_delivery: bool = typer.Option(
+        False,
+        "--metering-require-delivery",
+        help="Refuse sandbox creates (503) on nodes whose usage spool is above its high-water mark.",
+    ),
+    metering_prometheus_url: str | None = typer.Option(
+        None,
+        "--metering-prometheus-url",
+        help="Prometheus that scrapes K7, for `k7 usage`. --monitoring sets its own.",
+    ),
+    metering_sinks_file: Path | None = typer.Option(
+        None,
+        "--metering-sinks-file",
+        help="YAML list of usage sinks (http with the openmeter preset, stdout); see docs/METERING.md.",
+    ),
+    api_image: str | None = typer.Option(
+        None,
+        "--api-image",
+        help=(
+            "k7-api image: 'local' builds k7-api:local from the checkout in the cwd (unsigned, needs "
+            "Docker), or name@sha256:<digest>. Default: the digest in this release's images.lock.yaml."
+        ),
+    ),
+    api_remote_install: bool = typer.Option(
+        False,
+        "--api-remote-install",
+        help=(
+            "Enable POST /api/v1/install (cluster-wide admin role): deploys the k7-node-installer DaemonSet in "
+            "k7-system, configured from the first master, and lets the API label nodes into its pool. "
+            "Re-installing without it removes that stack and the pool labels again."
+        ),
+    ),
+    node_installer_image: str | None = typer.Option(
+        None,
+        "--node-installer-image",
+        help=(
+            "With --api-remote-install: 'local' builds k7-node-installer:local from the checkout in the "
+            "cwd (unsigned, needs Docker), or name@sha256:<digest>. Default: images.lock.yaml."
+        ),
+    ),
+    node_installer_allow_server_restart: bool = typer.Option(
+        False,
+        "--node-installer-allow-server-restart",
+        help="With --api-remote-install: let the installer prepare K3s server nodes (restarts their apiserver).",
     ),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Enable verbose output"),
 ):
@@ -607,6 +808,19 @@ def install(
                     err=True,
                 )
 
+    scraper = (metrics_scraper or "").strip()
+    if monitoring:
+        if scraper:
+            raise typer.BadParameter("--monitoring sets the scraper to its own Prometheus; drop --metrics-scraper")
+        if no_api:
+            raise typer.BadParameter("--monitoring scrapes the k7-api; it cannot be combined with --no-api")
+        scraper = MONITORING_SCRAPER
+    try:
+        k7_metrics_policy.parse_scraper(scraper)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    dns_upstreams = _validate_dns_upstreams(dns_upstream or [])
+
     # TLS flag combinations fail here, before Ansible.
     hostname = (api_hostname or "").strip() or None
     cert_path = Path(api_tls_cert).expanduser() if api_tls_cert else None
@@ -631,9 +845,78 @@ def install(
         )
     if api_acme_staging and not hostname:
         raise typer.BadParameter("--api-acme-staging requires --api-hostname")
+    if k3s_version is not None and not K3S_VERSION_RE.match(k3s_version):
+        raise typer.BadParameter(f"--k3s-version must look like v1.36.5+k3s1, got '{k3s_version}'")
 
     if join and not join_token:
         raise typer.BadParameter("--join requires --join-token")
+
+    oidc = {
+        "issuer": oidc_issuer,
+        "audience": oidc_audience,
+        "client_id": oidc_client_id,
+        "groups_claim": oidc_groups_claim,
+        "username_claim": oidc_username_claim,
+    }
+    oidc = {k: (v or "").strip() for k, v in oidc.items()}
+    if any(oidc.values()) and not all(oidc.values()):
+        missing = [f"--oidc-{k.replace('_', '-')}" for k, v in oidc.items() if not v]
+        raise typer.BadParameter(f"OIDC needs all five --oidc-* flags; also pass {', '.join(missing)}")
+    if oidc["issuer"] and not oidc["issuer"].startswith("https://") and not oidc_allow_http_issuer:
+        raise typer.BadParameter(f"--oidc-issuer must be https:// (got {oidc['issuer']})")
+    if oidc_jwks_ttl < 10:  # k7.api.oidc.REFRESH_SECONDS
+        raise typer.BadParameter(f"--oidc-jwks-ttl must be an integer >= 10 seconds (got {oidc_jwks_ttl})")
+
+    resolved_api_image = ""
+    metering = None
+    if not (no_api or node_prep_only):
+        if api_mode not in cluster_config.API_MODES:
+            raise typer.BadParameter(
+                f"--api-mode is required (production or development; there is no default), got {api_mode!r}"
+            )
+        if api_mode == "production" and api_insecure_http:
+            raise typer.BadParameter(
+                "--api-mode production refuses --api-insecure-http (keys would travel in cleartext)"
+            )
+        metering = _metering_settings(
+            api_mode,
+            metering_sample_interval,
+            metering_storage_interval,
+            metering_spool_size,
+            metering_spool_high_water,
+            metering_require_delivery,
+            MONITORING_PROMETHEUS_URL if monitoring else metering_prometheus_url,
+            metering_sinks_file,
+        )
+        if monitoring and metering_prometheus_url:
+            raise typer.BadParameter("--monitoring sets metering.prometheusUrl to its own Prometheus; drop the flag")
+        try:
+            resolved_api_image = k7_images.resolve_api_image(api_image)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc))
+        except LookupError as exc:
+            typer.echo(f"❌ {exc}", err=True)
+            raise typer.Exit(1)
+
+    if (node_installer_image or node_installer_allow_server_restart) and not api_remote_install:
+        raise typer.BadParameter(
+            "--node-installer-image / --node-installer-allow-server-restart need --api-remote-install"
+        )
+    resolved_installer_image = ""
+    if api_remote_install:
+        if no_api or node_prep_only:
+            raise typer.BadParameter("--api-remote-install needs the k7-api (drop --no-api / --node-prep-only)")
+        if api_mode == "production":
+            raise typer.BadParameter(
+                "--api-mode production refuses --api-remote-install (k7-api would exit at startup)"
+            )
+        try:
+            resolved_installer_image = k7_images.resolve_image(k7_images.NODE_INSTALLER_IMAGE_KEY, node_installer_image)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc))
+        except LookupError as exc:
+            typer.echo(f"❌ {exc}", err=True)
+            raise typer.Exit(1)
 
     if ha and not inventory and (not hosts or len(hosts) < 3):
         typer.echo(
@@ -648,11 +931,13 @@ def install(
             playbook_content = f.read()
 
     inventory_file = inventory if inventory and os.path.exists(inventory) else None
-    backend_explicit = ctx.get_parameter_source("backend") == ParameterSource.COMMANDLINE
+    # No default and no envvar: non-None means --backend was passed. typer 0.27 no longer
+    # reports ParameterSource.COMMANDLINE for it.
+    backend_explicit = backend is not None
     if not backend_explicit and not inventory_file:
         typer.echo(INSTALL_BACKEND_REQUIRED, err=True)
         raise typer.Exit(1)
-    backends_list = _parse_backends(backend) if backend_explicit and backend is not None else []
+    backends_list = _parse_backends(backend) if backend is not None else []
 
     inventory_content = None
     if inventory_file:
@@ -742,17 +1027,18 @@ def install(
             effective_replicas = None
         else:
             effective_replicas = min(3, node_count)
-        # The playbook builds the k7-api Docker image on the first master via
-        # `delegate_to`, with `chdir` pointing to the source tree. Pass the
-        # controller's cwd as `k7_repo_root`; the playbook validates that the
-        # path exists on the first master and fails loudly otherwise. The user
-        # is expected to invoke `k7 install` from a checkout of the repo (or
-        # via SSH on a node that has the source tree at the same path).
-        repo_root = os.getcwd()
+        # Only a `local` image needs a checkout: the playbook builds it on
+        # the first master from `k7_repo_root` (the cwd) and fails loudly if
+        # the Dockerfile is not there. Everything else the playbook copies
+        # comes from this package's deploy dir.
+        is_local_image = resolved_api_image == k7_images.API_IMAGE_LOCAL
+        is_local_installer = resolved_installer_image == k7_images.API_IMAGE_LOCAL
         extra_vars = {
-            # `k7_disk` is the legacy name; the playbook prefers `k7_devmapper_disk`
-            # but still falls back to `k7_disk` for backward compat.
-            "k7_disk": disk,
+            "k7_distro": "k3s",
+            "k3s_version": k3s_version,
+            "k7_node_prep_only": "true" if node_prep_only else None,
+            # Without -i, --disk is already in the generated inventory.
+            "k7_disk_source": f"device:{disk}" if disk and inventory_user_supplied else None,
             # `k7_backends` is required on every host. Empty extra-var would
             # look like "omitted" in Ansible — send the `none` sentinel.
             "k7_backends": ",".join(backends_list) if backends_list else BACKEND_NONE,
@@ -761,7 +1047,12 @@ def install(
             "longhorn_extra_disk": longhorn_extra_disk,
             "k7_cni": cni_value,
             "k7_hubble_enabled": "true" if hubble else "false",
-            "k7_repo_root": repo_root,
+            "k7_deploy_dir": _get_deploy_dir(),
+            "k7_api_image": resolved_api_image,
+            "k7_repo_root": os.getcwd() if is_local_image or is_local_installer else None,
+            "k7_api_remote_install": "true" if api_remote_install else "false",
+            "k7_node_installer_image": resolved_installer_image,
+            "k7_node_installer_allow_server_restart": "true" if node_installer_allow_server_restart else "false",
             # ``--no-api`` flips the playbook's existing
             # ``k7_api_enabled`` gate (default true) so the API
             # manifests aren't applied.
@@ -769,13 +1060,24 @@ def install(
             # Empty means no CiliumNetworkPolicy and no Service
             # change — today's install, bit for bit.
             "k7_api_allow_cidrs": ",".join(api_cidrs),
+            # Empty renders a deny-all policy for port 9464.
+            "k7_metrics_scraper": scraper,
+            "k7_monitoring": "true" if monitoring else "false",
+            # None when the flag is absent, so an inventory's k7_dns_upstreams wins.
+            "k7_dns_upstreams": ",".join(dns_upstreams) if dns_upstreams else None,
             # Default is HTTPS + playbook CA. Extra-vars are
             # strings so Ansible's `| bool` filter stays deterministic.
             "k7_api_insecure_http": "true" if api_insecure_http else "false",
+            "k7_api_mode": api_mode,
             "k7_api_hostname": hostname or "",
             "k7_api_tls_cert_src": str(cert_path.resolve()) if cert_path else "",
             "k7_api_tls_key_src": str(key_path.resolve()) if key_path else "",
             "k7_api_acme_staging": "true" if api_acme_staging else "false",
+            # All empty means no k7-oidc ConfigMap (OIDC off), like the other API flags.
+            **{f"k7_oidc_{k}": v for k, v in oidc.items()},
+            "k7_oidc_jwks_ttl_seconds": str(oidc_jwks_ttl),
+            "k7_oidc_allow_http_issuer": "true" if oidc_allow_http_issuer else "false",
+            "k7_metering": metering,
             # k7d backend artifact source overrides.
             "k7d_version": k7d_version,
             "k7d_artifact_local_path": k7d_artifact,
@@ -786,7 +1088,6 @@ def install(
         # per-host `k7_backends` declared in a user-supplied inventory. Only
         # forward the CLI value when the user explicitly passed --backend;
         # otherwise the inventory is authoritative.
-        backend_explicit = ctx.get_parameter_source("backend") == ParameterSource.COMMANDLINE
         if inventory_user_supplied and not backend_explicit:
             extra_vars.pop("k7_backends", None)
         elif inventory_user_supplied and backend_explicit:
@@ -815,6 +1116,14 @@ def install(
 
     if result.success:
         typer.echo("✅ Installation completed successfully!")
+        if is_local_image:
+            typer.echo(f"⚠️  Deployed {k7_images.LOCAL_API_IMAGE_REF} built from {os.getcwd()} — unsigned.")
+        elif resolved_api_image:
+            typer.echo(f"Deployed k7-api image: {resolved_api_image}")
+        if is_local_installer:
+            typer.echo(f"⚠️  Deployed {k7_images.LOCAL_NODE_INSTALLER_IMAGE_REF} built from {os.getcwd()} — unsigned.")
+        elif resolved_installer_image:
+            typer.echo(f"Remote install on; k7-node-installer image: {resolved_installer_image}")
     else:
         typer.echo(f"❌ Installation failed: {result.error}", err=True)
         raise typer.Exit(1)
@@ -913,9 +1222,15 @@ def create(
         help="Override image CMD (repeatable, ordered)",
     ),
     root_disk_size: str | None = typer.Option(
-        "10Gi",
+        None,
         "--root-disk-size",
-        help="Longhorn root disk size, kata-qemu-longhorn backend only (e.g., 10Gi, 20Gi)",
+        help="Longhorn root disk size, kata-qemu-longhorn backend only (default: tenant defaultSize.disk, else 10Gi)",
+    ),
+    egress_bps: str | None = typer.Option(
+        None, "--egress-bps", help="Cap guest egress, bits/s (e.g. 100M). kfd/kql; may only lower a tenant cap."
+    ),
+    ingress_bps: str | None = typer.Option(
+        None, "--ingress-bps", help="Cap guest ingress, bits/s (e.g. 100M). kfd/kql; may only lower a tenant cap."
     ),
     backend: str | None = typer.Option(
         None,
@@ -1073,6 +1388,10 @@ def create(
             docker=docker,
             docker_disk=docker_disk,
         )
+
+    network = {k: v for k, v in (("egressBps", egress_bps), ("ingressBps", ingress_bps)) if v}
+    if network:
+        sandbox_config.network_limits = {**(sandbox_config.network_limits or {}), **network}
 
     resolved_backend = _normalize_backend(sandbox_config.backend) if sandbox_config.backend else None
     if root_disk_size and resolved_backend == "kata-firecracker-devmapper":
@@ -1278,7 +1597,7 @@ def create(
     details_text.stylize("dim")
 
     # Prepare before_script log streaming (started when core signals 'waiting')
-    kubectl_cmd = ["k3s", "kubectl"] if shutil.which("k3s") else ["kubectl"]
+    kubectl_cmd = _kubectl_cmd()
     stop_log_event: threading.Event = threading.Event()
     log_thread: threading.Thread | None = None
     log_started_event: threading.Event = threading.Event()
@@ -1745,7 +2064,7 @@ def logs(
     """
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
-        kubectl_cmd = ["k3s", "kubectl"] if shutil.which("k3s") else ["kubectl"]
+        kubectl_cmd = _kubectl_cmd()
         try:
             pod_name_proc = subprocess.run(
                 kubectl_cmd
@@ -1913,119 +2232,269 @@ def _dedupe_keep_order(values: builtins.list[str] | None) -> builtins.list[str]:
     return out
 
 
+_API_FLAG_HELP = "Go through k7-api (admin key or `k7 login`) instead of kubectl on a server node."
+
+
 @app.command()
 def generate_api_key(
+    ctx: typer.Context,
     name: str,
+    role: str = typer.Option(..., "--role", help=f"One of {', '.join(api_keys_store.ROLES)}."),
+    tenant: str | None = typer.Option(
+        None, "--tenant", help="Tenant for read-only/user; forbidden for operator/admin."
+    ),
     expires_days: int = typer.Option(365, help="API key expiration in days"),
     namespace: builtins.list[str] | None = typer.Option(
         None,
         "--namespace",
         "-n",
-        help="Restrict key to this namespace (repeatable). Omit for unrestricted access.",
+        help="Further restrict the key to this namespace (repeatable).",
     ),
     node: builtins.list[str] | None = typer.Option(
         None,
         "--node",
         help="Restrict key to this Kubernetes node name (repeatable; copy from `k7 nodes list`). Placement uses kubernetes.io/hostname (kubelet-stamped, not inventory). Omit for unrestricted placement.",
     ),
+    use_api: bool = typer.Option(False, "--api", help=_API_FLAG_HELP),
 ):
-    """Generate a new API key."""
-    api_key = secrets.token_urlsafe(32)
-    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-
-    api_keys = {}
-    if API_KEYS_FILE.exists():
-        with open(API_KEYS_FILE) as f:
-            api_keys = json.load(f)
-
-    expiry_timestamp = int((datetime.now() + timedelta(days=expires_days)).timestamp())
-    entry: dict = {
-        "name": name,
-        "created": int(time.time()),
-        "expires": expiry_timestamp,
-        "last_used": None,
+    """Generate a new API key with a role (k7-api-keys Secret; kubectl on a node, or --api)."""
+    scope = {
+        "role": role,
+        "tenant": tenant,
+        "expires_days": expires_days,
+        "namespaces": _dedupe_keep_order(namespace),
+        "nodes": _dedupe_keep_order(node),
     }
-    scoped_ns = _dedupe_keep_order(namespace)
-    if scoped_ns:
-        entry["namespaces"] = scoped_ns
-    scoped_nodes = _dedupe_keep_order(node)
-    if scoped_nodes:
-        entry["nodes"] = scoped_nodes
-    api_keys[key_hash] = entry
-
-    _write_api_keys(api_keys)
-
-    typer.echo(f"Generated API key for '{name}':")
-    typer.echo(f"API Key: {api_key}")
-    typer.echo(f"Expires: {datetime.fromtimestamp(expiry_timestamp)}")
+    if use_api:
+        cli_ctx: CliContext = ctx.obj
+        entry = handle_api_call(lambda: cli_ctx.client().create_api_key(name, **scope))
+        token, key_id = entry["token"], entry["id"]
+    else:
+        token, key_id, entry = _key_store_call(api_keys_store.generate, name, **scope)
+    typer.echo(f"Generated API key for '{name}' (id {key_id}):")
+    typer.echo(f"API Key: {token}")
+    typer.echo(f"Role: {entry['role']}" + (f" on tenant {entry['tenant']}" if entry.get("tenant") else ""))
+    typer.echo(f"Expires: {datetime.fromtimestamp(entry['expires'])}")
     if entry.get("namespaces"):
         typer.echo(f"Namespaces: {', '.join(entry['namespaces'])}")
-    else:
-        typer.echo("Namespaces: * (unrestricted)")
-    if entry.get("nodes"):
-        typer.echo(f"Nodes: {', '.join(entry['nodes'])}")
-    else:
-        typer.echo("Nodes: * (unrestricted)")
+    typer.echo(f"Nodes: {', '.join(entry['nodes'])}" if entry.get("nodes") else "Nodes: * (unrestricted)")
     typer.echo("Keep this key secure - it won't be shown again!")
 
 
+def _read_keys_and_usage(kc: "api_keys_store.Kubectl") -> tuple[dict, dict]:
+    keys = api_keys_store.decode_keys(kc.read(api_keys_store.KEYS_SECRET) or {})
+    return keys, kc.read(api_keys_store.USAGE_SECRET) or {}
+
+
 @app.command()
-def list_api_keys():
-    """List all API keys."""
-    if not API_KEYS_FILE.exists():
+def list_api_keys(ctx: typer.Context, use_api: bool = typer.Option(False, "--api", help=_API_FLAG_HELP)):
+    """List all API keys (legacy pre-0.5 and unscoped keys from before roles are flagged)."""
+    if use_api:
+        cli_ctx: CliContext = ctx.obj
+        rows = handle_api_call(lambda: cli_ctx.client().list_api_keys())
+        keys = {r["id"]: r for r in rows}
+        usage = {r["id"]: r["last_used"] for r in rows if r.get("last_used")}
+    else:
+        keys, usage = _key_store_call(_read_keys_and_usage)
+    if not keys:
         typer.echo("No API keys found.")
         return
-
-    with open(API_KEYS_FILE) as f:
-        api_keys = json.load(f)
 
     console = Console()
     table = Table(title="API Keys")
-    table.add_column("Name", style="cyan")
-    table.add_column("Created", style="blue")
-    table.add_column("Expires", style="yellow")
-    table.add_column("Last Used", style="green")
-    table.add_column("Namespaces", style="magenta")
-    table.add_column("Nodes", style="magenta")
+    for col, style in [
+        ("ID", "white"),
+        ("Name", "cyan"),
+        ("Created", "blue"),
+        ("Expires", "yellow"),
+        ("Last Used", "green"),
+        ("Role", "red"),
+        ("Tenant", "magenta"),
+        ("Namespaces", "magenta"),
+        ("Nodes", "magenta"),
+    ]:
+        table.add_column(col, style=style)
 
-    for _key_hash, key_data in api_keys.items():
-        created = datetime.fromtimestamp(key_data["created"]).strftime("%Y-%m-%d %H:%M")
-        expires = datetime.fromtimestamp(key_data["expires"]).strftime("%Y-%m-%d %H:%M")
-        last_used = "Never"
-        if key_data["last_used"]:
-            last_used = datetime.fromtimestamp(key_data["last_used"]).strftime("%Y-%m-%d %H:%M")
-        namespaces = key_data.get("namespaces") or []
-        ns_col = "*" if not namespaces else ", ".join(namespaces)
-        nodes = key_data.get("nodes") or []
-        node_col = "*" if not nodes else ", ".join(nodes)
+    def _ts(v) -> str:
+        return datetime.fromtimestamp(int(v)).strftime("%Y-%m-%d %H:%M") if v else "Never"
 
-        table.add_row(key_data["name"], created, expires, last_used, ns_col, node_col)
-
+    for key_id, key_data in keys.items():
+        table.add_row(
+            key_id,
+            key_data["name"],
+            _ts(key_data.get("created")),
+            _ts(key_data.get("expires")),
+            _ts(usage.get(key_id)),
+            key_data.get("role") or "NONE (run `k7 api keys migrate`)",
+            key_data.get("tenant") or "-",
+            ", ".join(key_data.get("namespaces") or []) or "*",
+            ", ".join(key_data.get("nodes") or []) or "*",
+        )
     console.print(table)
+    unscoped = [k for k, v in keys.items() if v.get("unscoped_legacy")]
+    if unscoped:
+        typer.echo(
+            f"⚠️  {len(unscoped)} unscoped key(s) from before roles ({', '.join(unscoped)}) were migrated to role admin "
+            "(development mode only). Replace them with tenant-scoped keys: "
+            "`k7 generate-api-key --role user --tenant <t>` + `k7 revoke-api-key`."
+        )
+    legacy = [k for k in keys if k.startswith(api_keys_store.LEGACY_PREFIX)]
+    if legacy:
+        typer.echo(
+            f"⚠️  {len(legacy)} legacy key(s) ({', '.join(legacy)}): pre-k7_<id>_<secret> format, matched by hash "
+            "scan until they expire. Rotate with `k7 generate-api-key` + `k7 revoke-api-key`."
+        )
 
 
 @app.command()
-def revoke_api_key(name: str):
-    """Revoke an API key by name."""
-    if not API_KEYS_FILE.exists():
-        typer.echo("No API keys found.")
-        return
-
-    with open(API_KEYS_FILE) as f:
-        api_keys = json.load(f)
-
-    key_to_remove = None
-    for key_hash, key_data in api_keys.items():
-        if key_data["name"] == name:
-            key_to_remove = key_hash
-            break
-
-    if key_to_remove:
-        del api_keys[key_to_remove]
-        _write_api_keys(api_keys)
-        typer.echo(f"API key '{name}' revoked successfully.")
+def revoke_api_key(ctx: typer.Context, name: str, use_api: bool = typer.Option(False, "--api", help=_API_FLAG_HELP)):
+    """Revoke every API key with this name (takes effect within seconds on all API replicas)."""
+    if use_api:
+        cli_ctx: CliContext = ctx.obj
+        ids = handle_api_call(lambda: cli_ctx.client().revoke_api_key(name))["revoked"]
+    else:
+        ids = _key_store_call(api_keys_store.revoke, name)
+    if ids:
+        typer.echo(f"API key '{name}' revoked successfully ({', '.join(ids)}).")
     else:
         typer.echo(f"API key '{name}' not found.")
+
+
+def _login_url(ctx: typer.Context, api: str | None) -> str:
+    url = (api or _resolve_api_url(ctx.obj.api_url) or "").rstrip("/")
+    if not url:
+        typer.echo("❌ Pass --api https://<k7-api> (or set api.url).", err=True)
+        raise typer.Exit(1)
+    return url
+
+
+@app.command()
+def login(
+    ctx: typer.Context,
+    api: str | None = typer.Option(None, "--api", help="K7 API URL (default: --api-url / K7_API_URL / api.url)."),
+    browser: bool = typer.Option(False, "--browser", help="Authorization Code + PKCE in a local browser."),
+    scopes: str = typer.Option(_oidc.DEFAULT_SCOPES, "--scopes", help="OAuth scopes to request."),
+):
+    """Sign in through the API's OIDC IdP (device flow by default; works over SSH)."""
+    url = _login_url(ctx, api)
+    verify = verify_ssl_for_url(url, _resolve_api_ca(ctx.obj.api_ca))
+    try:
+        r = requests.get(f"{url}/api/v1/auth/oidc", timeout=15, verify=verify)
+        if r.status_code >= 400:
+            raise RuntimeError(f"{url} returned HTTP {r.status_code}: {r.text[:300]}")
+        _oidc.login(url, r.json()["data"], browser=browser, scopes=scopes, echo=lambda m: typer.echo(m))
+    except (RuntimeError, requests.RequestException) as e:
+        typer.echo(f"❌ Login failed: {e}", err=True)
+        raise typer.Exit(1)
+    me = handle_api_call(
+        lambda: Client(endpoint=url, token_provider=_oidc.token_provider(url), verify_ssl=verify).whoami()
+    )
+    typer.echo(f"✅ Logged in to {url} as {me['subject']} ({'; '.join(me['grants'])})")
+
+
+@app.command()
+def logout(
+    ctx: typer.Context,
+    api: str | None = typer.Option(None, "--api", help="K7 API URL (default: --api-url / K7_API_URL / api.url)."),
+):
+    """Delete the cached OIDC login for this API and revoke it at the IdP when supported."""
+    try:
+        typer.echo(_oidc.logout(_login_url(ctx, api)))
+    except (RuntimeError, requests.RequestException) as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command()
+def whoami(ctx: typer.Context):
+    """Show the principal (API key or OIDC subject) and the roles the API grants it."""
+    me = handle_api_call(lambda: ctx.obj.client().whoami())
+    typer.echo(f"{me['type']} {me['subject']}: {'; '.join(me['grants'])}")
+    if me.get("groups"):
+        typer.echo(f"groups: {', '.join(me['groups'])}")
+
+
+_USAGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _usage_time(raw: str, now: float) -> float:
+    """``now``, a duration ago (``24h``, ``7d``), unix seconds, or RFC 3339 with an offset."""
+    m = re.fullmatch(r"([0-9]+)([smhd])", raw)
+    if raw == "now":
+        return now
+    if m:
+        return now - int(m.group(1)) * _USAGE_UNITS[m.group(2)]
+    if re.fullmatch(r"[0-9]+(\.[0-9]+)?", raw):
+        return float(raw)
+    try:
+        dt = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        dt = None
+    if dt is None or dt.tzinfo is None:
+        raise typer.BadParameter(f"{raw!r}: use now, a duration like 24h/7d, unix seconds or RFC 3339 with an offset")
+    return dt.timestamp()
+
+
+@app.command()
+def usage(
+    ctx: typer.Context,
+    tenant: str | None = typer.Option(None, "--tenant", help="One tenant (a tenant key must name its own)"),
+    since: str = typer.Option("24h", "--from", help="Start: a duration ago (24h, 7d), unix seconds or RFC 3339"),
+    until: str = typer.Option("now", "--to", help="End: now, a duration ago, unix seconds or RFC 3339"),
+    group_by: str = typer.Option("tenant", "--group-by", help="Comma-separated: tenant,namespace,backend,state"),
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
+):
+    """Showback from Prometheus: sandbox/vCPU/memory seconds, egress bytes, disk and snapshot GiB·s."""
+    if ctx.obj.use_core:
+        typer.echo("❌ k7 usage queries Prometheus through k7-api; drop --core", err=True)
+        raise typer.Exit(1)
+    now = time.time()
+    start, end = _usage_time(since, now), _usage_time(until, now)
+    data = handle_api_call(lambda: ctx.obj.client().usage(start, end, tenant=tenant, group_by=group_by))
+    if as_json:
+        typer.echo(json.dumps(data, indent=2))
+        return
+    table = Table(
+        title=f"K7 usage {datetime.fromtimestamp(start):%Y-%m-%d %H:%M} → {datetime.fromtimestamp(end):%Y-%m-%d %H:%M}"
+    )
+    cols = [*showback.COUNTERS, *showback.GAUGES]
+    for col in [*data["group_by"], *cols]:
+        table.add_column(col.upper(), justify="left" if col in data["group_by"] else "right")
+    for row in data["rows"]:
+        table.add_row(
+            *[str(row[g]) for g in data["group_by"]], *[f"{row[c]:,.3f}".rstrip("0").rstrip(".") for c in cols]
+        )
+    Console().print(table)
+
+
+role_bindings_app = typer.Typer(
+    help="OIDC group/user/subject → role bindings (ConfigMap k7-role-bindings; admin only).",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(role_bindings_app, name="role-bindings")
+
+
+@role_bindings_app.command("get")
+def role_bindings_get(ctx: typer.Context):
+    """Print the current bindings and deny-subjects as YAML (input for `apply -f`)."""
+    data = handle_api_call(lambda: ctx.obj.client().get_role_bindings())
+    typer.echo(yaml.safe_dump(data, sort_keys=False), nl=False)
+
+
+@role_bindings_app.command("apply")
+def role_bindings_apply(
+    ctx: typer.Context,
+    file: Path = typer.Option(
+        ..., "-f", "--file", exists=True, dir_okay=False, help="YAML with bindings/deny_subjects"
+    ),
+):
+    """Replace all bindings and deny-subjects with the contents of FILE."""
+    data = yaml.safe_load(file.read_text()) or {}
+    if not isinstance(data, dict) or set(data) - {"bindings", "deny_subjects"} or "bindings" not in data:
+        typer.echo("❌ FILE must be a mapping with `bindings` (list) and optional `deny_subjects` (list).", err=True)
+        raise typer.Exit(1)
+    out = handle_api_call(lambda: ctx.obj.client().put_role_bindings(data["bindings"], data.get("deny_subjects") or []))
+    typer.echo(f"✅ Applied {len(out['bindings'])} binding(s), {len(out['deny_subjects'])} deny-subject(s).")
 
 
 _PAUSE_SNAPSHOT_AUTO = "__auto__"
@@ -2339,7 +2808,7 @@ def _api_scale_deployment(replicas: int) -> None:
     failure mode this is meant to eliminate.
     """
     kubectl = _kubectl_cmd()
-    result = _kubectl_run(kubectl, ["scale", "deployment", "k7-api", "-n", "kube-system", f"--replicas={replicas}"])
+    result = _kubectl_run(kubectl, ["scale", "deployment", "k7-api", "-n", _system_ns(), f"--replicas={replicas}"])
     if result is None:
         typer.echo("❌ `k7 api enable`/`disable` need kubectl on a cluster node.", err=True)
         raise typer.Exit(1)
@@ -2352,23 +2821,19 @@ def _api_scale_deployment(replicas: int) -> None:
 def api_status_cmd():
     """Show API server readiness, endpoint, and key-management hints."""
     kubectl = _kubectl_cmd()
+    if shutil.which(kubectl[0]) is None:
+        _api_status_via_https()
+        return
+    ns = _system_ns()
     result = _kubectl_run(
         kubectl,
-        [
-            "get",
-            "deployment",
-            "k7-api",
-            "-n",
-            "kube-system",
-            "-o",
-            "jsonpath={.status.readyReplicas}/{.spec.replicas}",
-        ],
+        ["get", "deployment", "k7-api", "-n", ns, "-o", "jsonpath={.status.readyReplicas}/{.spec.replicas}"],
     )
     if result is None:
         _api_status_via_https()
         return
     if result.returncode != 0:
-        typer.echo("❌ K7 API deployment not found in K3s")
+        typer.echo(f"❌ K7 API deployment not found in namespace {ns}")
         typer.echo("Run `k7 install` to deploy it, or `k7 install --no-api` if that's deliberate.")
         return
 
@@ -2378,19 +2843,26 @@ def api_status_cmd():
     desired = int(parts[1]) if len(parts) > 1 and parts[1] else 0
 
     if ready_count > 0:
-        typer.echo(f"✅ K7 API is running in K3s ({ready_count}/{desired} ready)")
+        typer.echo(f"✅ K7 API is running in {ns} ({ready_count}/{desired} ready)")
     elif desired == 0:
         typer.echo("⚠️  K7 API deployment exists but is scaled to 0 (disabled). Run `k7 api enable`.")
     else:
         typer.echo(f"⚠️  K7 API deployment exists but no pods ready ({ready_count}/{desired})")
 
     pod_result = subprocess.run(
-        kubectl + ["get", "pods", "-n", "kube-system", "-l", "app=k7-api", "-o", "wide", "--no-headers"],
+        kubectl + ["get", "pods", "-n", ns, "-l", "app=k7-api", "-o", "wide", "--no-headers"],
         capture_output=True,
         text=True,
     )
     if pod_result.returncode == 0 and pod_result.stdout.strip():
         typer.echo(f"\n📦 Pod(s):\n{pod_result.stdout.strip()}")
+
+    deny = _kubectl_run(kubectl, ["get", "ciliumclusterwidenetworkpolicy", PLATFORM_DENY_POLICY, "-o", "name"])
+    if deny is None or deny.returncode != 0:
+        typer.echo(
+            f"\n⚠️  Sandbox→platform deny ({PLATFORM_DENY_POLICY}) is absent: sandboxes can reach the nodes, "
+            "the Kubernetes API and cloud metadata. Only Cilium enforces it (chart networkPolicy.provider=cilium)."
+        )
 
     endpoint = _read_api_endpoint(kubectl)
     if endpoint:
@@ -2421,18 +2893,63 @@ def api_endpoint_cmd():
         raise typer.Exit(1)
 
 
+_API_REPLICAS_ANN = "k7.katakate.org/enabled-replicas"
+
+
+def _api_kubectl_or_exit(args: builtins.list[str]) -> str:
+    result = _kubectl_run(_kubectl_cmd(), args)
+    if result is None:
+        typer.echo("❌ `k7 api enable`/`disable` need kubectl on a cluster node.", err=True)
+        raise typer.Exit(1)
+    if result.returncode != 0:
+        typer.echo(f"❌ kubectl {' '.join(args)} failed: {result.stderr.strip()}", err=True)
+        raise typer.Exit(1)
+    return result.stdout.strip()
+
+
 @api_app.command("enable")
-def api_enable_cmd():
-    """Scale the existing k7-api Deployment to 1 replica."""
-    _api_scale_deployment(1)
-    typer.echo("✅ K7 API enabled (replicas=1).")
+def api_enable_cmd(
+    replicas: int | None = typer.Option(
+        None, "--replicas", help="Replica count (default: the count recorded by `k7 api disable`)."
+    ),
+):
+    """Scale the k7-api Deployment back up."""
+    if replicas is None:
+        jsonpath = "jsonpath={.metadata.annotations." + _API_REPLICAS_ANN.replace(".", "\\.") + "}"
+        recorded = _api_kubectl_or_exit(["get", "deployment", "k7-api", "-n", _system_ns(), "-o", jsonpath])
+        if not recorded:
+            typer.echo("❌ No replica count recorded by `k7 api disable`; pass --replicas N.", err=True)
+            raise typer.Exit(1)
+        replicas = int(recorded)
+    _api_scale_deployment(replicas)
+    typer.echo(f"✅ K7 API enabled (replicas={replicas}).")
 
 
 @api_app.command("disable")
 def api_disable_cmd():
     """Scale the existing k7-api Deployment to 0 replicas (temporary off)."""
+    current = _api_kubectl_or_exit(
+        ["get", "deployment", "k7-api", "-n", _system_ns(), "-o", "jsonpath={.spec.replicas}"]
+    )
+    if current and int(current) > 0:
+        _api_kubectl_or_exit(
+            ["annotate", "deployment", "k7-api", "-n", _system_ns(), f"{_API_REPLICAS_ANN}={current}", "--overwrite"]
+        )
     _api_scale_deployment(0)
     typer.echo("✅ K7 API disabled (replicas=0). Run `k7 api enable` to bring it back.")
+
+
+api_keys_app = typer.Typer(
+    help="API key store maintenance.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+api_app.add_typer(api_keys_app, name="keys")
+
+
+@api_keys_app.command("migrate")
+def api_keys_migrate_cmd():
+    """Copy /etc/k7/api_keys.json into the k7-api-keys Secret, then give every key a role. Idempotent."""
+    typer.echo(_key_store_call(api_keys_store.migrate))
 
 
 @dev_api_app.command("rebuild")
@@ -2447,20 +2964,38 @@ def dev_api_rebuild_cmd(
     reachable and the k7-api manifests must be present).
     """
     kubectl = _kubectl_cmd()
-    manifests = _get_api_manifests_dir()
 
     if not skip_build and not _build_and_import_api_image():
         typer.echo("⚠️  Image build skipped or failed; deployment may fail if image is not present", err=True)
 
-    # Patch NodePort in the service manifest if non-default.
-    service_file = Path(manifests) / "service.yaml"
-    if api_port != 31007 and service_file.exists():
-        content = service_file.read_text()
-        content = content.replace("nodePort: 31007", f"nodePort: {api_port}")
-        service_file.write_text(content)
-
-    typer.echo("Re-applying K7 API manifests...")
-    apply = subprocess.run(kubectl + ["apply", "-f", manifests], capture_output=True, text=True)
+    if not CONTAINERD_SOCKET_FILE.is_file():
+        typer.echo(f"❌ {CONTAINERD_SOCKET_FILE} is missing; run `k7 install` on this node first.", err=True)
+        raise typer.Exit(1)
+    metering = subprocess.run(
+        kubectl + ["-n", "kube-system", "get", "configmap", "k7-metering", "-o", "jsonpath={.data.metering\\.json}"],
+        capture_output=True,
+        text=True,
+    )
+    if metering.returncode != 0 or not metering.stdout:
+        typer.echo(
+            f"❌ ConfigMap k7-metering is unreadable ({metering.stderr.strip()}); run `k7 install` first.", err=True
+        )
+        raise typer.Exit(1)
+    typer.echo(f"Re-applying K7 API manifests with {k7_images.LOCAL_API_IMAGE_REF} (unsigned)...")
+    with tempfile.TemporaryDirectory() as tmp:
+        manifests = Path(tmp) / "k7-api"
+        k7_images.render_manifests(
+            Path(_get_api_manifests_dir()),
+            manifests,
+            k7_images.API_IMAGE_LOCAL,
+            CONTAINERD_SOCKET_FILE.read_text().strip(),
+            cluster_config.api_mode(),
+            metering.stdout,
+        )
+        service_file = manifests / "service.yaml"
+        if api_port != 31007:
+            service_file.write_text(service_file.read_text().replace("nodePort: 31007", f"nodePort: {api_port}"))
+        apply = subprocess.run(kubectl + ["apply", "-f", str(manifests)], capture_output=True, text=True)
     if apply.returncode != 0:
         typer.echo(f"❌ Failed to apply API manifests: {apply.stderr.strip()}", err=True)
         raise typer.Exit(1)
@@ -2553,6 +3088,207 @@ def _deprecated_get_api_endpoint():
 # ---------------------------------------------------------------------------
 
 
+def _tenant_run(fn):
+    """Run ``fn(core)`` against the cluster (node kubeconfig, not k7-api); loud on failure."""
+    core = K7Core()
+    try:
+        return _core_run(core, fn(core))
+    except (LookupError, ValueError, RuntimeError, ApiException) as e:
+        typer.echo(f"❌ {getattr(e, 'body', None) or e}", err=True)
+        raise typer.Exit(1)
+
+
+def _kv(values: builtins.list[str] | None, flag: str) -> dict | None:
+    """``--quota sandboxes=10,vcpu=8 --quota memory=16Gi`` → dict; None when the flag is absent."""
+    if not values:
+        return None
+    out: dict = {}
+    for item in ",".join(values).split(","):
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip() or not value.strip():
+            raise typer.BadParameter(f"{flag} expects KEY=VALUE[,KEY=VALUE], got {item!r}")
+        value = value.strip()
+        out[key.strip()] = int(value) if key.strip() == "sandboxes" and value.isdigit() else value
+    return out
+
+
+def _tenant_changes(
+    namespace: builtins.list[str] | None,
+    node: builtins.list[str] | None,
+    default_size: builtins.list[str] | None,
+    quota: builtins.list[str] | None,
+    max_size: builtins.list[str] | None,
+    disk_io: builtins.list[str] | None,
+    network: builtins.list[str] | None,
+) -> dict:
+    changes: dict = {}
+    if namespace:
+        changes["namespaces"] = _dedupe_keep_order(namespace)
+    if node:
+        changes["nodes"] = _dedupe_keep_order(node)
+    for key, value in (("defaultSize", _kv(default_size, "--default-size")), ("quotas", _kv(quota, "--quota"))):
+        if value is not None:
+            changes[key] = value
+    limits = {
+        k: v
+        for k, v in (
+            ("maxSandboxSize", _kv(max_size, "--max-size")),
+            ("diskIO", _kv(disk_io, "--disk-io")),
+            ("network", _kv(network, "--network")),
+        )
+        if v is not None
+    }
+    if limits:
+        changes["limits"] = limits
+    return changes
+
+
+_T_NS = typer.Option(None, "-n", "--namespace", help="Tenant namespace (repeatable; created if missing)")
+_T_NODE = typer.Option(None, "--node", help="Dedicated node (repeatable; labelled and tainted)")
+_T_DEFAULT = typer.Option(None, "--default-size", help="cpu=1,memory=1Gi,disk=10Gi for creates without limits")
+_T_QUOTA = typer.Option(
+    None, "--quota", help="sandboxes=N,vcpu=..,memory=..,disk=..,snapshotStorage=.. (absent = no quota)"
+)
+_T_MAX = typer.Option(None, "--max-size", help="Per-sandbox maxSandboxSize: cpu=8,memory=32Gi,disk=200Gi")
+_T_DISKIO = typer.Option(
+    None, "--disk-io", help="Per-VM readBps/writeBps/readIops/writeIops (no backend enforces these yet)"
+)
+_T_NET = typer.Option(None, "--network", help="Per-VM egressBps=500M,ingressBps=500M in bits/s (kfd/kql)")
+
+tenant_app = typer.Typer(
+    help="Tenants: namespaces, API keys, dedicated nodes, default size, quotas and per-VM limits.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(tenant_app, name="tenant")
+
+
+@tenant_app.command("create")
+def tenant_create(
+    name: str = typer.Argument(..., help="Tenant name (DNS label)"),
+    namespace: builtins.list[str] | None = _T_NS,
+    node: builtins.list[str] | None = _T_NODE,
+    default_size: builtins.list[str] | None = _T_DEFAULT,
+    quota: builtins.list[str] | None = _T_QUOTA,
+    max_size: builtins.list[str] | None = _T_MAX,
+    disk_io: builtins.list[str] | None = _T_DISKIO,
+    network: builtins.list[str] | None = _T_NET,
+):
+    """Create a Tenant; refuses a namespace another tenant already claims."""
+    spec = _tenant_changes(namespace, node, default_size, quota, max_size, disk_io, network)
+    _tenant_run(lambda core: tenancy.create_tenant(core, name, spec))
+    typer.echo(f"✅ tenant {name} created (namespaces: {', '.join(spec.get('namespaces') or [])})")
+
+
+@tenant_app.command("update")
+def tenant_update(
+    name: str = typer.Argument(...),
+    namespace: builtins.list[str] | None = _T_NS,
+    node: builtins.list[str] | None = _T_NODE,
+    default_size: builtins.list[str] | None = _T_DEFAULT,
+    quota: builtins.list[str] | None = _T_QUOTA,
+    max_size: builtins.list[str] | None = _T_MAX,
+    disk_io: builtins.list[str] | None = _T_DISKIO,
+    network: builtins.list[str] | None = _T_NET,
+    clear: builtins.list[str] | None = typer.Option(
+        None, "--clear", help="Remove a spec section: nodes, defaultSize, quotas or limits (repeatable)"
+    ),
+):
+    """Replace the given spec sections (each flag replaces its whole section)."""
+    changes: dict = _tenant_changes(namespace, node, default_size, quota, max_size, disk_io, network)
+    for section in clear or []:
+        if section not in ("nodes", "defaultSize", "quotas", "limits") or section in changes:
+            raise typer.BadParameter(f"--clear {section}: not a clearable section, or also being set")
+        changes[section] = None
+    if not changes:
+        raise typer.BadParameter("nothing to update")
+    _tenant_run(lambda core: tenancy.update_tenant(core, name, changes))
+    typer.echo(f"✅ tenant {name} updated ({', '.join(changes)})")
+
+
+@tenant_app.command("get")
+def tenant_get(name: str = typer.Argument(...)):
+    """Print a Tenant (spec and status) as JSON."""
+    tenant = _tenant_run(lambda core: tenancy.get_tenant(core, name))
+    if tenant is None:
+        typer.echo(f"❌ tenant {name} not found", err=True)
+        raise typer.Exit(1)
+    tenant["metadata"].pop("managedFields", None)
+    typer.echo(json.dumps({k: tenant.get(k) for k in ("metadata", "spec", "status")}, indent=2, default=str))
+
+
+@tenant_app.command("list")
+def tenant_list(as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table")):
+    """List Tenants with namespaces, nodes, quotas and last reconciled usage."""
+    tenants = _tenant_run(tenancy.list_tenants)
+    if as_json:
+        typer.echo(json.dumps(tenants, indent=2, default=str))
+        return
+    table = Table(title="K7 Tenants")
+    for col in ("NAME", "NAMESPACES", "NODES", "QUOTAS", "USAGE"):
+        table.add_column(col)
+    for t in tenants:
+        spec, usage = tenancy.spec_of(t), (t.get("status") or {}).get("usage") or {}
+        quotas = spec.get("quotas") or {}
+        table.add_row(
+            tenancy.name_of(t),
+            ",".join(spec.get("namespaces") or []),
+            ",".join(spec.get("nodes") or []) or "-",
+            ",".join(f"{k}={v}" for k, v in quotas.items()) or "-",
+            ",".join(f"{k}={v}" for k, v in usage.items()) or "-",
+        )
+    Console().print(table)
+
+
+@tenant_app.command("delete")
+def tenant_delete(
+    name: str = typer.Argument(...),
+    cascade: bool = typer.Option(False, "--cascade", help="Also delete the tenant's snapshots and sandboxes"),
+):
+    """Delete a Tenant. Refuses while it has sandboxes or snapshots unless --cascade."""
+    deleted = _tenant_run(lambda core: tenancy.delete_tenant(core, name, cascade))
+    for item in deleted:
+        typer.echo(f"deleted {item}")
+    typer.echo(f"✅ tenant {name} deleted")
+
+
+@tenant_app.command("adopt")
+def tenant_adopt(
+    from_keys: bool = typer.Option(False, "--from-keys", help="Propose tenants from existing key namespace scopes"),
+    apply: bool = typer.Option(False, "--apply", help="Create the proposed tenants and bind the keys"),
+):
+    """Migration: one tenant per connected group of key namespaces. Prints the plan; writes only with --apply."""
+    if not from_keys:
+        raise typer.BadParameter("only --from-keys is supported")
+    keys = _key_store_call(lambda kc: api_keys_store.decode_keys(kc.read(api_keys_store.KEYS_SECRET) or {}))
+    tenants = _tenant_run(tenancy.list_tenants)
+    try:
+        plan, unscoped = tenancy.adopt_plan(keys, tenants)
+    except ValueError as e:
+        typer.echo(f"❌ {e}", err=True)
+        raise typer.Exit(1)
+    for item in plan:
+        typer.echo(
+            f"tenant {item['tenant']}: namespaces {', '.join(item['namespaces'])}; keys {', '.join(item['keys'])}"
+        )
+    if unscoped:
+        typer.echo(
+            f"⚠️  unscoped key(s) {', '.join(unscoped)} reach every namespace: production mode refuses them. "
+            "Revoke and reissue with --role user --tenant T (or --role admin for a real admin)."
+        )
+    if not plan:
+        typer.echo("nothing to adopt")
+        return
+    if not apply:
+        typer.echo("dry run; re-run with --apply to create these tenants and bind the keys")
+        return
+    for item in plan:
+        _tenant_run(
+            lambda core, item=item: tenancy.create_tenant(core, item["tenant"], {"namespaces": item["namespaces"]})
+        )
+        _key_store_call(api_keys_store.bind_tenant, item["keys"], item["tenant"])
+        typer.echo(f"✅ tenant {item['tenant']} created; {len(item['keys'])} key(s) bound")
+
+
 nodes_app = typer.Typer(
     help="Query and dedicate cluster nodes (storage pools, tenant isolation).",
     context_settings={"help_option_names": ["-h", "--help"]},
@@ -2608,14 +3344,21 @@ def _print_nodes_storage_table(data: dict) -> None:
     table.add_column("META%", justify="right")
     table.add_column("K7D POOL", justify="right")
     table.add_column("K7D USED%", justify="right")
+    table.add_column("USAGE SPOOL", justify="right")
     table.add_column("ERROR", style="red")
     for node in sorted(data):
         entry = data[node]
         if "error" in entry:
-            table.add_row(node, "-", "-", "-", "-", "-", entry["error"])
+            table.add_row(node, "-", "-", "-", "-", "-", "-", entry["error"])
             continue
         tp = entry.get("kata_thinpool") or {}
         kd = entry.get("k7d_disks") or {}
+        sp = entry.get("usage_spool")
+        if sp is None:
+            spool = "not reported (k7-agent predates metering)"
+        else:
+            spool = f"{_format_size_bytes(sp['bytes'])}/{_format_size_bytes(sp['max_bytes'])}"
+            spool += " (above high-water)" if sp["above_high_water"] else ""
         table.add_row(
             node,
             _format_size_bytes(int(tp.get("size_bytes", 0) or 0)),
@@ -2623,7 +3366,8 @@ def _print_nodes_storage_table(data: dict) -> None:
             f"{float(tp.get('metadata_percent', 0)):.2f}",
             _format_size_bytes(int(kd.get("size_bytes", 0) or 0)),
             f"{float(kd.get('used_percent', 0)):.2f}",
-            "",
+            spool,
+            f"{sp['dropped_events']} usage events dropped" if sp and sp["dropped_events"] else "",
         )
     Console().print(table)
 
@@ -2633,7 +3377,7 @@ def nodes_storage(
     ctx: typer.Context,
     as_json: bool = typer.Option(False, "--json", help="Print raw JSON instead of a table"),
 ):
-    """Show per-node kfd thin-pool and k7d disks-pool utilization."""
+    """Show per-node kfd thin-pool, k7d disks-pool and usage-spool utilization."""
     cli_ctx: CliContext = ctx.obj
     if cli_ctx.use_core:
         core = K7Core()
@@ -2648,34 +3392,39 @@ def nodes_storage(
 
 @nodes_app.command("dedicate")
 def nodes_dedicate(
+    ctx: typer.Context,
     node: str = typer.Argument(..., help="Kubernetes node name (metadata.name / hostname)"),
-    tenant: str = typer.Option(..., "--tenant", help="Tenant id written as k7.katakate.org/tenant"),
+    tenant: str = typer.Option(..., "--tenant", help="Existing Tenant (k7 tenant create) to dedicate the node to"),
+    use_api: bool = typer.Option(False, "--api", help="Go through k7-api (operator/admin) instead of kubeconfig."),
 ):
-    """Label and taint a node so only that tenant's sandboxes can land there.
+    """Label and taint a node for a tenant and add it to ``Tenant.spec.nodes``.
 
     The label is the join key; the NoSchedule taint is the exclusive lock.
-    Must run with cluster access (on a node, or kubeconfig). Does not go
-    through k7-api.
+    Every sandbox of the tenant then lands only on its nodes. Fails if the
+    Tenant does not exist. Runs with cluster access (on a node, or
+    kubeconfig), or with ``--api`` as an operator/admin through k7-api.
     """
-    core = K7Core()
-    result = _core_run(core, core.dedicate_node(node, tenant))
-    if not result.success:
-        typer.echo(f"❌ {result.error}", err=True)
-        raise typer.Exit(1)
-    typer.echo(f"✅ {result.message}")
+    if use_api:
+        cli_ctx: CliContext = ctx.obj
+        typer.echo(f"✅ {handle_api_call(lambda: cli_ctx.client().dedicate_node(node, tenant))['message']}")
+        return
+    _tenant_run(lambda core: tenancy.dedicate(core, node, tenant))
+    typer.echo(f"✅ node {node} dedicated to tenant {tenant} (label+taint {tenancy.TENANT_LABEL}, spec.nodes)")
 
 
 @nodes_app.command("undedicate")
 def nodes_undedicate(
+    ctx: typer.Context,
     node: str = typer.Argument(..., help="Kubernetes node name (metadata.name / hostname)"),
+    use_api: bool = typer.Option(False, "--api", help="Go through k7-api (operator/admin) instead of kubeconfig."),
 ):
-    """Remove the k7 tenant label and taint from a node."""
-    core = K7Core()
-    result = _core_run(core, core.undedicate_node(node))
-    if not result.success:
-        typer.echo(f"❌ {result.error}", err=True)
-        raise typer.Exit(1)
-    typer.echo(f"✅ {result.message}")
+    """Remove the k7 tenant label and taint from a node, and the node from every Tenant's spec.nodes."""
+    if use_api:
+        cli_ctx: CliContext = ctx.obj
+        typer.echo(f"✅ {handle_api_call(lambda: cli_ctx.client().undedicate_node(node))['message']}")
+        return
+    _tenant_run(lambda core: tenancy.undedicate(core, node))
+    typer.echo(f"✅ node {node} undedicated")
 
 
 # ``k7 snapshot …`` sub-app for VolumeSnapshot CRUD + GC.

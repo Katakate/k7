@@ -5,15 +5,18 @@ These tests exercise the full HTTP path: request → NodePort → k7-api pod
 ServiceAccount RBAC, and in-cluster config all work end-to-end.
 """
 
-import hashlib
 import json
 import os
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
 
 import httpx as _httpx
 import pytest
+
+from .cluster import API_CA, KUBECTL, system_ns
 
 pytestmark = pytest.mark.integration
 
@@ -42,9 +45,7 @@ class _Httpx:
 
 httpx = _Httpx()
 
-K7_API_KEYS_FILE = Path("/etc/k7/api_keys.json")
 _API_ENDPOINT_FILE = Path("/etc/k7/api_endpoint")
-_API_CA_FILE = Path("/etc/k7/tls/ca.crt")
 
 
 def _tls_verify() -> bool | str:
@@ -52,8 +53,8 @@ def _tls_verify() -> bool | str:
     endpoint = _API_ENDPOINT_FILE.read_text().strip() if _API_ENDPOINT_FILE.exists() else ""
     if endpoint.startswith("http://"):
         return False
-    if _API_CA_FILE.exists():
-        return str(_API_CA_FILE)
+    if API_CA.exists():
+        return str(API_CA)
     return bool(endpoint.startswith("https://"))
 
 
@@ -65,7 +66,7 @@ def _api_scheme() -> str:
 def _get_api_base_url() -> str:
     """Read the API endpoint from the K3s service."""
     result = subprocess.run(
-        ["k3s", "kubectl", "get", "svc", "k7-api", "-n", "kube-system", "-o", "jsonpath={.spec.ports[0].nodePort}"],
+        [*KUBECTL, "get", "svc", "k7-api", "-n", system_ns(), "-o", "jsonpath={.spec.ports[0].nodePort}"],
         capture_output=True,
         text=True,
     )
@@ -78,13 +79,12 @@ def _get_api_base_url() -> str:
 def _api_pod_ready() -> bool:
     result = subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "get",
             "deployment",
             "k7-api",
             "-n",
-            "kube-system",
+            system_ns(),
             "-o",
             "jsonpath={.status.readyReplicas}",
         ],
@@ -94,55 +94,55 @@ def _api_pod_ready() -> bool:
     return result.returncode == 0 and result.stdout.strip() not in ("", "0")
 
 
+def _keys_kubectl():
+    from k7.deploy.k7_api_keys import Kubectl
+
+    return Kubectl(KUBECTL, system_ns())
+
+
+def _wait_key_live(token: str) -> None:
+    """Keys reach every API replica within one store poll (5 s)."""
+    from k7.api.keystore import POLL_SECONDS
+
+    url = _get_api_base_url()
+    deadline = time.monotonic() + 4 * POLL_SECONDS
+    while time.monotonic() < deadline:
+        if httpx.get(f"{url}/api/v1/sandboxes/metrics", headers={"X-API-Key": token}, timeout=5).status_code != 401:
+            time.sleep(POLL_SECONDS + 1)  # the other replica's poll
+            return
+        time.sleep(1)
+    raise AssertionError(f"API key not accepted within {4 * POLL_SECONDS}s of writing the k7-api-keys Secret")
+
+
 def _generate_test_api_key(
     *,
-    name: str = "integration-test",
+    name: str,
     namespaces: list[str] | None = None,
     nodes: list[str] | None = None,
+    role: str = "admin",
+    tenant: str | None = None,
 ) -> str:
-    """Write a test API key directly into the keys file, return the raw token."""
-    import os
-    import secrets as _secrets
+    """Create a 1-day key in the k7-api-keys Secret, wait until the API accepts it, return the token."""
+    from k7.deploy.k7_api_keys import generate
 
-    token = _secrets.token_urlsafe(32)
-    key_hash = hashlib.sha256(token.encode()).hexdigest()
-
-    keys: dict = {}
-    if K7_API_KEYS_FILE.exists():
-        keys = json.loads(K7_API_KEYS_FILE.read_text())
-
-    entry: dict = {
-        "name": name,
-        "created": int(time.time()),
-        "expires": int(time.time()) + 3600,
-        "last_used": None,
-    }
-    if namespaces:
-        entry["namespaces"] = list(namespaces)
-    if nodes:
-        entry["nodes"] = list(nodes)
-    keys[key_hash] = entry
-    K7_API_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    K7_API_KEYS_FILE.write_text(json.dumps(keys, indent=2))
-    # Mirror production permissions (`k7 generate-api-key`): 0600 owned by
-    # the API container uid (1000, see Dockerfile.api). The old 0666 here
-    # masked a real bug where a root-owned 0600 store locked the pod out.
-    os.chmod(K7_API_KEYS_FILE, 0o600)
-    os.chown(K7_API_KEYS_FILE, 1000, 1000)
+    token, _key_id, _entry = generate(
+        _keys_kubectl(),
+        name,
+        role=role,
+        tenant=tenant,
+        expires_days=1,
+        namespaces=list(namespaces or []),
+        nodes=list(nodes or []),
+    )
+    _wait_key_live(token)
     return token
 
 
 def _revoke_test_api_key(name: str) -> None:
-    """Remove a test key by name from the on-disk store (try/finally cleanup)."""
-    import os
+    """Remove test keys by name from the Secret (try/finally cleanup)."""
+    from k7.deploy.k7_api_keys import revoke
 
-    if not K7_API_KEYS_FILE.exists():
-        return
-    keys = json.loads(K7_API_KEYS_FILE.read_text())
-    keys = {h: d for h, d in keys.items() if d.get("name") != name}
-    K7_API_KEYS_FILE.write_text(json.dumps(keys, indent=2))
-    os.chmod(K7_API_KEYS_FILE, 0o600)
-    os.chown(K7_API_KEYS_FILE, 1000, 1000)
+    revoke(_keys_kubectl(), name)
 
 
 @pytest.fixture(scope="module")
@@ -165,8 +165,12 @@ def api_base_url() -> str:
 
 
 @pytest.fixture(scope="module")
-def api_key() -> str:
-    return _generate_test_api_key()
+def api_key() -> Iterator[str]:
+    name = f"integ-api-{uuid4().hex[:8]}"
+    try:
+        yield _generate_test_api_key(name=name)
+    finally:
+        _revoke_test_api_key(name)
 
 
 @pytest.fixture(scope="module")
@@ -226,7 +230,7 @@ class TestApiSandboxLifecycle:
         # Create
         r = httpx.post(
             f"{api_base_url}/api/v1/sandboxes",
-            json={"name": self.SANDBOX_NAME, "image": "alpine:latest", "namespace": test_namespace},
+            json={"name": self.SANDBOX_NAME, "image": "alpine:3.20", "namespace": test_namespace},
             headers=api_headers,
             timeout=30,
         )
@@ -310,8 +314,7 @@ def _wait_for_sandbox_ready(api_base_url: str, api_headers: dict, name: str, nam
 def _replicas(name: str, namespace: str) -> int:
     out = subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "get",
             "deployment",
             name,
@@ -331,8 +334,7 @@ def _replicas(name: str, namespace: str) -> int:
 def _snapshot_exists(name: str, namespace: str) -> bool:
     out = subprocess.run(
         [
-            "k3s",
-            "kubectl",
+            *KUBECTL,
             "get",
             "volumesnapshot",
             name,
@@ -476,8 +478,7 @@ class TestApiPauseResumeFork:
         finally:
             subprocess.run(
                 [
-                    "k3s",
-                    "kubectl",
+                    *KUBECTL,
                     "delete",
                     "volumesnapshot",
                     snap,
@@ -599,6 +600,23 @@ class TestApiPauseResumeFork:
         )
         assert fr.status_code == 404, fr.text
 
+    @pytest.mark.parametrize("op, body", [("pause", {}), ("snapshot", {"snapshot_name": "snap"})])
+    def test_pause_and_snapshot_missing_sandbox_return_404(
+        self,
+        api_base_url: str,
+        api_headers: dict,
+        test_namespace: str,
+        op: str,
+        body: dict,
+    ):
+        r = httpx.post(
+            f"{api_base_url}/api/v1/sandboxes/does-not-exist/{op}",
+            json={**body, "namespace": test_namespace},
+            headers=api_headers,
+            timeout=30,
+        )
+        assert r.status_code == 404, r.text
+
     def test_fork_missing_new_name_returns_400(
         self,
         api_base_url: str,
@@ -710,7 +728,7 @@ class TestApiSsrfGuard:
                 f"{api_base_url}/api/v1/sandboxes",
                 json={
                     "name": "ssrf-loopback",
-                    "image": f"127.0.0.1:{port}/x:latest",
+                    "image": f"127.0.0.1:{port}/x:1",
                     "namespace": test_namespace,
                 },
                 headers=api_headers,
@@ -732,7 +750,7 @@ class TestApiSsrfGuard:
             f"{api_base_url}/api/v1/sandboxes",
             json={
                 "name": "ssrf-metadata",
-                "image": "169.254.169.254/latest/meta-data:latest",
+                "image": "169.254.169.254/latest/meta-data:1",
                 "namespace": test_namespace,
             },
             headers=api_headers,
@@ -759,84 +777,80 @@ class TestApiSsrfGuard:
 class TestApiNamespaceAuthz:
     """Scoped API keys may only operate in their listed namespaces."""
 
-    def test_scoped_key_alpha_ok_beta_forbidden(self, api_base_url: str, test_namespace: str, cleanup_sandbox):
-        # Ensure namespaces exist (create via unscoped key / kubectl).
-        for ns in ("alpha", "beta"):
-            subprocess.run(
-                ["k3s", "kubectl", "create", "namespace", ns],
-                capture_output=True,
-                text=True,
+    def test_scoped_key_alpha_ok_beta_forbidden(self, api_base_url: str, make_namespace, cleanup_sandbox):
+        alpha, beta = make_namespace("alpha"), make_namespace("beta")
+        scoped_name, unscoped_name = f"integ-scoped-{alpha}", f"integ-unscoped-{alpha}"
+        try:
+            scoped_headers = {"X-API-Key": _generate_test_api_key(name=scoped_name, namespaces=[alpha])}
+            unscoped_headers = {"X-API-Key": _generate_test_api_key(name=unscoped_name)}
+
+            name = "ns-authz-sb"
+            cleanup_sandbox(name, alpha)
+            cleanup_sandbox(name, beta)
+
+            # Scoped key: create in alpha OK
+            r = httpx.post(
+                f"{api_base_url}/api/v1/sandboxes",
+                json={"name": name, "image": "alpine:3.21", "namespace": alpha},
+                headers=scoped_headers,
+                timeout=30,
             )
+            assert r.status_code == 201, f"scoped create alpha failed: {r.text}"
 
-        scoped = _generate_test_api_key(name="integ-scoped-alpha", namespaces=["alpha"])
-        scoped_headers = {"X-API-Key": scoped}
-        unscoped = _generate_test_api_key(name="integ-unscoped")
-        unscoped_headers = {"X-API-Key": unscoped}
+            # List/delete in alpha OK
+            lr = httpx.get(
+                f"{api_base_url}/api/v1/sandboxes",
+                params={"namespace": alpha},
+                headers=scoped_headers,
+                timeout=10,
+            )
+            assert lr.status_code == 200
 
-        name = "ns-authz-sb"
-        cleanup_sandbox(name, "alpha")
-        cleanup_sandbox(name, "beta")
+            # beta denied
+            br = httpx.get(
+                f"{api_base_url}/api/v1/sandboxes",
+                params={"namespace": beta},
+                headers=scoped_headers,
+                timeout=10,
+            )
+            assert br.status_code == 403
 
-        # Scoped key: create in alpha OK
-        r = httpx.post(
-            f"{api_base_url}/api/v1/sandboxes",
-            json={"name": name, "image": "alpine:3.21", "namespace": "alpha"},
-            headers=scoped_headers,
-            timeout=30,
-        )
-        assert r.status_code == 201, f"scoped create alpha failed: {r.text}"
+            br2 = httpx.post(
+                f"{api_base_url}/api/v1/sandboxes",
+                json={"name": name, "image": "alpine:3.21", "namespace": beta},
+                headers=scoped_headers,
+                timeout=15,
+            )
+            assert br2.status_code == 403
 
-        # List/delete in alpha OK
-        lr = httpx.get(
-            f"{api_base_url}/api/v1/sandboxes",
-            params={"namespace": "alpha"},
-            headers=scoped_headers,
-            timeout=10,
-        )
-        assert lr.status_code == 200
+            # all-namespaces list denied
+            ar = httpx.get(
+                f"{api_base_url}/api/v1/sandboxes",
+                headers=scoped_headers,
+                timeout=10,
+            )
+            assert ar.status_code == 403
 
-        # beta denied
-        br = httpx.get(
-            f"{api_base_url}/api/v1/sandboxes",
-            params={"namespace": "beta"},
-            headers=scoped_headers,
-            timeout=10,
-        )
-        assert br.status_code == 403
+            # Unscoped key still works on beta
+            ur = httpx.get(
+                f"{api_base_url}/api/v1/sandboxes",
+                params={"namespace": beta},
+                headers=unscoped_headers,
+                timeout=10,
+            )
+            assert ur.status_code == 200
 
-        br2 = httpx.post(
-            f"{api_base_url}/api/v1/sandboxes",
-            json={"name": name, "image": "alpine:3.21", "namespace": "beta"},
-            headers=scoped_headers,
-            timeout=15,
-        )
-        assert br2.status_code == 403
-
-        # all-namespaces list denied
-        ar = httpx.get(
-            f"{api_base_url}/api/v1/sandboxes",
-            headers=scoped_headers,
-            timeout=10,
-        )
-        assert ar.status_code == 403
-
-        # Unscoped key still works on beta
-        ur = httpx.get(
-            f"{api_base_url}/api/v1/sandboxes",
-            params={"namespace": "beta"},
-            headers=unscoped_headers,
-            timeout=10,
-        )
-        assert ur.status_code == 200
-
-        # Cleanup via scoped key in alpha
-        dr = httpx.delete(
-            f"{api_base_url}/api/v1/sandboxes/{name}",
-            params={"namespace": "alpha"},
-            headers=scoped_headers,
-            timeout=30,
-        )
-        assert dr.status_code == 200, dr.text
+            # Cleanup via scoped key in alpha
+            dr = httpx.delete(
+                f"{api_base_url}/api/v1/sandboxes/{name}",
+                params={"namespace": alpha},
+                headers=scoped_headers,
+                timeout=30,
+            )
+            assert dr.status_code == 200, dr.text
+        finally:
+            _revoke_test_api_key(scoped_name)
+            _revoke_test_api_key(unscoped_name)
 
     def test_scoped_key_nodes_storage_forbidden(self, api_base_url: str, api_headers: dict):
         """Cluster-scoped GET /nodes/storage is 403 for a scoped key; unscoped still 200."""
@@ -925,3 +939,164 @@ class TestApiNodeAuthz:
             assert "cluster-wide node" in scoped_r.json()["error"]["message"]
         finally:
             _revoke_test_api_key(scoped_name)
+
+
+def _kubectl_out(*args: str) -> str:
+    r = subprocess.run([*KUBECTL, *args], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+class TestApiSecurityHardening:
+    """Acceptance checks that are safe to automate on a shared node."""
+
+    def test_authenticate_never_writes_key_secret(self, api_base_url: str, api_headers: dict):
+        rv = "jsonpath={.metadata.resourceVersion}"
+        before = _kubectl_out("-n", system_ns(), "get", "secret", "k7-api-keys", "-o", rv)
+        with httpx.Client() as client:
+            for _ in range(200):
+                assert (
+                    client.get(f"{api_base_url}/api/v1/sandboxes", headers=api_headers, timeout=10).status_code == 200
+                )
+        assert _kubectl_out("-n", system_ns(), "get", "secret", "k7-api-keys", "-o", rv) == before
+
+    def test_revoke_takes_effect_within_10s(self, api_base_url: str):
+        name = f"revoke-{int(time.time())}"
+        token = _generate_test_api_key(name=name)
+        try:
+            _revoke_test_api_key(name)
+            time.sleep(10)
+            for _ in range(10):  # spread across both replicas
+                r = httpx.get(f"{api_base_url}/api/v1/sandboxes", headers={"X-API-Key": token}, timeout=5)
+                assert r.status_code == 401
+        finally:
+            _revoke_test_api_key(name)
+
+    def test_mutating_request_audited_without_token(self, api_base_url: str):
+        name = f"audit-{int(time.time())}"
+        token = _generate_test_api_key(name=name)
+        try:
+            r = httpx.delete(
+                f"{api_base_url}/api/v1/sandboxes/audit-nonexistent",
+                params={"namespace": "default"},
+                headers={"X-API-Key": token},
+                timeout=30,
+            )
+            request_id = r.headers["X-Request-ID"]
+            logs = _kubectl_out("-n", system_ns(), "logs", "-l", "app=k7-api", "-c", "k7-api", "--tail=2000")
+            lines = [json.loads(line) for line in logs.splitlines() if request_id in line]
+            lines = [line for line in lines if line.get("logger") == "k7.audit"]
+            assert len(lines) == 1, lines
+            assert lines[0]["key_name"] == name
+            assert lines[0]["route"] == "/api/v1/sandboxes/{name}"
+            assert lines[0]["method"] == "DELETE"
+            assert token not in logs
+        finally:
+            _revoke_test_api_key(name)
+
+    def test_auth_failures_are_audited_on_reads(self, api_base_url: str):
+        """401 and 403 are audited even for GET, with the key id but never the token."""
+        unknown = "k7_abcdefgh_" + "A" * 43
+        r401 = httpx.get(f"{api_base_url}/api/v1/sandboxes", headers={"X-API-Key": unknown}, timeout=5)
+        assert r401.status_code == 401
+        name = f"audit-scoped-{int(time.time())}"
+        token = _generate_test_api_key(name=name, namespaces=["alpha"])
+        try:
+            r403 = httpx.get(
+                f"{api_base_url}/api/v1/sandboxes",
+                params={"namespace": "beta"},
+                headers={"X-API-Key": token},
+                timeout=5,
+            )
+            assert r403.status_code == 403
+            logs = _kubectl_out("-n", system_ns(), "logs", "-l", "app=k7-api", "-c", "k7-api", "--tail=2000")
+            by_id = {}
+            for r in (r401, r403):
+                rid = r.headers["X-Request-ID"]
+                found = [json.loads(line) for line in logs.splitlines() if rid in line]
+                # kubectl merges stdout and stderr. The access line (k7.api) carries the
+                # same request id; only the k7.audit line is the audit entry.
+                found = [line for line in found if line.get("logger") == "k7.audit"]
+                assert len(found) == 1, (rid, found)
+                by_id[r.status_code] = found[0]
+            assert by_id[401]["key_id"] == "abcdefgh" and by_id[401]["key_name"] is None
+            assert by_id[401]["method"] == "GET" and by_id[401]["status"] == 401
+            assert by_id[403]["key_name"] == name and by_id[403]["status"] == 403
+            assert unknown not in logs and token not in logs
+        finally:
+            _revoke_test_api_key(name)
+
+    def test_legacy_key_in_secret_authenticates(self, api_base_url: str):
+        """A migrated bare token (``legacy-<sha256[:8]>`` entry, given its role the way
+        ``k7 api keys migrate`` does) is matched by hash scan."""
+        import secrets
+
+        from k7.deploy.k7_api_keys import KEYS_SECRET, legacy_entries, migrate_roles, sha256_hex
+
+        token = secrets.token_hex(24)
+        name = f"integ-legacy-{int(time.time())}"
+        now = int(time.time())
+        legacy = {"name": name, "created": now, "expires": now + 3600, "admin": True}
+        entries = legacy_entries({sha256_hex(token): legacy})
+        assert list(entries) == [f"legacy-{sha256_hex(token)[:8]}"]
+        roles, _ = migrate_roles(entries)
+        assert json.loads(roles[f"legacy-{sha256_hex(token)[:8]}"])["role"] == "admin"
+        try:
+            _keys_kubectl().patch(KEYS_SECRET, roles)
+            _wait_key_live(token)
+            for _ in range(4):  # both replicas
+                r = httpx.get(f"{api_base_url}/api/v1/sandboxes", headers={"X-API-Key": token}, timeout=5)
+                assert r.status_code == 200, r.text
+        finally:
+            _revoke_test_api_key(name)
+
+    def test_health_reports_a_synced_secret_store(self, api_base_url: str):
+        from k7.api.keystore import POLL_SECONDS
+
+        for _ in range(4):
+            store = httpx.get(f"{api_base_url}/health", timeout=5).json()["key_store"]
+            assert store["store"] == "secret" and store["sync_error"] is None, store
+            assert store["synced_age_s"] is not None and store["synced_age_s"] < 3 * POLL_SECONDS, store
+
+    @pytest.mark.skipif(
+        os.environ.get("K7_ITEST_SLOW") != "1", reason="waits one usage flush period (~5 min); set K7_ITEST_SLOW=1"
+    )
+    def test_last_used_is_flushed_to_usage_secret(self, api_base_url: str):
+        from k7.api.keystore import FLUSH_SECONDS
+        from k7.deploy.k7_api_keys import USAGE_SECRET, token_key_id
+
+        name = f"usage-{int(time.time())}"
+        token = _generate_test_api_key(name=name)
+        key_id = token_key_id(token)
+        assert key_id
+        try:
+            used_at = int(time.time())
+            assert httpx.get(f"{api_base_url}/api/v1/sandboxes", headers={"X-API-Key": token}, timeout=5).is_success
+            deadline = time.monotonic() + FLUSH_SECONDS + 60
+            while time.monotonic() < deadline:
+                if int((_keys_kubectl().read(USAGE_SECRET) or {}).get(key_id) or 0) >= used_at:
+                    return
+                time.sleep(10)
+            raise AssertionError(f"last_used of {key_id} not in Secret {USAGE_SECRET} within {FLUSH_SECONDS + 60}s")
+        finally:
+            _revoke_test_api_key(name)
+
+    def test_api_and_agent_run_one_pinned_image(self):
+        """One image for k7-api and k7-agent: a digest pulled IfNotPresent, or the
+        locally built k7-api:local with Never."""
+        from k7.deploy.images import DIGEST_REF, LOCAL_API_IMAGE_REF
+
+        def containers(app: str, name: str) -> list[dict]:
+            pods = json.loads(_kubectl_out("-n", system_ns(), "get", "pods", "-l", f"app={app}", "-o", "json"))
+            found = [c for p in pods["items"] for c in p["spec"]["containers"] if c["name"] == name]
+            assert found, f"no {name} containers in app={app} pods"
+            return found
+
+        api = containers("k7-api", "k7-api")
+        images = {c["image"] for c in api}
+        assert len(images) == 1, images
+        image = images.pop()
+        policy = "Never" if image == LOCAL_API_IMAGE_REF else "IfNotPresent"
+        assert image == LOCAL_API_IMAGE_REF or DIGEST_REF.match(image), image
+        for c in [*api, *containers("k7-agent", "k7-agent")]:
+            assert (c["image"], c["imagePullPolicy"]) == (image, policy)

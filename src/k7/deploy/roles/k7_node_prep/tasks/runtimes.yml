@@ -1,0 +1,487 @@
+---
+# Section: Firecracker + Jailer Installation (only if FD backend on this host)
+- name: Download Firecracker & Jailer binaries
+  vars:
+    fc_tgz: "firecracker-{{ firecracker_version }}-{{ ansible_architecture }}.tgz"
+    fc_base: "https://github.com/firecracker-microvm/firecracker/releases/download"
+  ansible.builtin.get_url:
+    url: "{{ fc_base }}/{{ firecracker_version }}/{{ fc_tgz }}"
+    dest: "/tmp/{{ fc_tgz }}"
+    checksum: "sha256:{{ firecracker_sha256 }}"
+    mode: '0644'
+    timeout: 60
+  register: fc_dl
+  retries: 5
+  delay: 10
+  until: fc_dl is success
+  when:
+    - k7_has_devmapper
+    - k7_artifact_dir | length == 0
+  tags: ['firecracker']
+
+- name: Stage Firecracker & Jailer tarball from k7_artifact_dir
+  ansible.builtin.copy:
+    src: "{{ k7_artifact_dir }}/firecracker-{{ firecracker_version }}-{{ ansible_architecture }}.tgz"
+    dest: "/tmp/firecracker-{{ firecracker_version }}-{{ ansible_architecture }}.tgz"
+    mode: '0644'
+  when:
+    - k7_has_devmapper
+    - k7_artifact_dir | length > 0
+  tags: ['firecracker']
+
+- name: Create firecracker bin directory
+  ansible.builtin.file:
+    path: /opt/firecracker
+    state: directory
+    mode: '0755'
+  when: k7_has_devmapper
+
+- name: Extract Firecracker release
+  ansible.builtin.unarchive:
+    src: "/tmp/firecracker-{{ firecracker_version }}-{{ ansible_architecture }}.tgz"
+    dest: "/opt/firecracker/"
+    remote_src: true
+    extra_opts: [--strip-components=1]
+  when: k7_has_devmapper
+  tags: ['firecracker']
+
+- name: Find firecracker binary
+  ansible.builtin.find:
+    paths: /opt/firecracker
+    patterns: "firecracker*"
+    recurse: false
+  register: firecracker_binaries
+  when: k7_has_devmapper
+
+- name: Install `file` utility required for lookup('pipe', 'file ...')
+  ansible.builtin.apt:
+    name: file
+    state: present
+  when: k7_has_devmapper
+  tags: ['utils', 'firecracker']
+
+- name: Copy firecracker binary to final path (only if ELF)
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "/usr/local/bin/firecracker"
+    remote_src: true
+    mode: '0755'
+  loop: "{{ firecracker_binaries.files | default([]) }}"
+  when:
+    - k7_has_devmapper
+    - "'firecracker' in item.path"
+    - not item.path.endswith('.debug')
+    - lookup('pipe', 'file ' ~ k7_host_root ~ item.path) is search('ELF .* executable')
+
+- name: Find jailer binary
+  ansible.builtin.find:
+    paths: /opt/firecracker
+    patterns: "jailer*"
+    recurse: false
+  register: jailer_binaries
+  when: k7_has_devmapper
+
+- name: Copy jailer binary to final path (only if ELF)
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "/usr/local/bin/jailer"
+    remote_src: true
+    mode: '0755'
+  loop: "{{ jailer_binaries.files | default([]) }}"
+  when:
+    - k7_has_devmapper
+    - "'jailer' in item.path"
+    - not item.path.endswith('.debug')
+    - lookup('pipe', 'file ' ~ k7_host_root ~ item.path) is search('ELF .* executable')
+
+- name: Remove bundled Firecracker & jailer
+  ansible.builtin.file:
+    path: "/opt/kata/bin/{{ item }}"
+    state: absent
+  loop: [firecracker, jailer]
+  when: k7_has_devmapper
+  tags: ['kata', 'cleanup', 'firecracker', 'jailer']
+
+- name: Ensure jailer is set‑uid root
+  ansible.builtin.file:
+    path: /usr/local/bin/jailer
+    mode: '4755'
+    owner: root
+    group: root
+  when: k7_has_devmapper
+  tags: ['kata', 'firecracker', 'jailer']
+
+- name: Check Firecracker version
+  ansible.builtin.command: /usr/local/bin/firecracker --version
+  changed_when: false
+  when: k7_has_devmapper
+  tags: ['firecracker']
+
+- name: Check Jailer version
+  ansible.builtin.command: /usr/local/bin/jailer --version
+  changed_when: false
+  when: k7_has_devmapper
+  tags: ['firecracker', 'jailer']
+
+# Section: Install Kata Container (always — both runtimes ship in kata-static)
+- name: Check whether Kata is already installed (skip re-extract if so)
+  ansible.builtin.stat:
+    path: /opt/kata/bin/containerd-shim-kata-v2
+  register: kata_shim_present
+  tags: ['kata']
+
+- name: Download and install Kata Containers
+  register: kata_install
+  retries: 3
+  delay: 15
+  until: kata_install is success
+  ansible.builtin.shell: |
+    set -eu
+    KATA_VERSION="{{ kata_version }}"
+    mkdir -p /opt/kata
+
+    TARBALL_ZST="kata-static-${KATA_VERSION}-{{ deb_arch }}.tar.zst"
+    URL_ZST="https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/${TARBALL_ZST}"
+    TAR_OUT="/tmp/kata-static-${KATA_VERSION}-{{ deb_arch }}.tar"
+
+    # curl -f errors on >=400; idempotent re-download is fine.
+    curl -fsSL "$URL_ZST" -o "/tmp/$TARBALL_ZST"
+    echo "{{ kata_static_sha256 }}  /tmp/$TARBALL_ZST" | sha256sum -c -
+    if ! command -v zstd >/dev/null 2>&1; then
+      apt-get update && apt-get install -y zstd
+    fi
+    # -f: never prompt on existing file; needed for idempotency on re-runs.
+    zstd -d -f "/tmp/$TARBALL_ZST" -o "$TAR_OUT"
+    tar -xf "$TAR_OUT" -C /
+    # Free space — these are multi-GB artifacts.
+    rm -f "/tmp/$TARBALL_ZST" "$TAR_OUT"
+  args:
+    executable: /bin/bash
+  when:
+    - not kata_shim_present.stat.exists
+    - k7_artifact_dir | length == 0
+  changed_when: true
+  tags: ['kata']
+
+- name: Stage the Kata static tarball from k7_artifact_dir
+  ansible.builtin.copy:
+    src: "{{ k7_artifact_dir }}/kata-static-{{ kata_version }}-{{ deb_arch }}.tar.zst"
+    dest: "/tmp/kata-static-{{ kata_version }}-{{ deb_arch }}.tar.zst"
+    mode: '0644'
+  when:
+    - not kata_shim_present.stat.exists
+    - k7_artifact_dir | length > 0
+  tags: ['kata']
+
+- name: Install zstd for the staged Kata tarball
+  ansible.builtin.apt:
+    name: zstd
+    state: present
+  when:
+    - not kata_shim_present.stat.exists
+    - k7_artifact_dir | length > 0
+  tags: ['kata']
+
+- name: Extract the staged Kata static tarball
+  ansible.builtin.shell: |
+    set -euo pipefail
+    zstd -dc "/tmp/kata-static-{{ kata_version }}-{{ deb_arch }}.tar.zst" | tar -xf - -C /
+    rm -f "/tmp/kata-static-{{ kata_version }}-{{ deb_arch }}.tar.zst"
+  args:
+    executable: /bin/bash
+  when:
+    - not kata_shim_present.stat.exists
+    - k7_artifact_dir | length > 0
+  changed_when: true
+  tags: ['kata']
+
+# Kata execs jailer_path and records its PID. The stock jailer --daemonize
+# (hardcoded in kata 3.24.0 fcInit) double-forks, so that PID is a dead
+# parent and delete never signals Firecracker. This wrapper drops the flag
+# and execs the real jailer; the PID stays the VMM. k7d-fc keeps using
+# /usr/local/bin/jailer directly.
+- name: Install Kata jailer wrapper that does not daemonize
+  ansible.builtin.copy:
+    src: "{{ k7_deploy_dir }}/kata/k7-kata-jailer.sh"
+    dest: /usr/local/bin/k7-kata-jailer
+    mode: '0755'
+  when: k7_has_devmapper
+  tags: ['kata', 'config', 'jailer']
+
+- name: Point Kata to Firecracker / jailer
+  ansible.builtin.replace:
+    path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+    regexp: '^({{ item.key }}\s*=\s*).*'
+    replace: '\1"/usr/local/bin/{{ item.name }}"'
+  loop:
+    - {key: 'path', name: 'firecracker'}
+    - {key: 'jailer_path', name: 'k7-kata-jailer'}
+  when: k7_has_devmapper
+  tags: ['kata', 'config', 'firecracker', 'jailer']
+
+- name: Set valid_hypervisor_paths
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+    regexp: '^valid_hypervisor_paths'
+    line: 'valid_hypervisor_paths = ["/usr/local/bin/firecracker"]'
+  when: k7_has_devmapper
+  tags: ['kata', 'config', 'firecracker']
+
+- name: Set valid_jailer_paths
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+    regexp: '^valid_jailer_paths'
+    line: 'valid_jailer_paths = ["/usr/local/bin/k7-kata-jailer"]'
+  when: k7_has_devmapper
+  tags: ['kata', 'config', 'jailer']
+
+# The kql-r3 dind IO wedge (CHALLENGES.md): kata's default
+# virtiofsd runs with --thread-pool-size=1, so ALL virtio-fs IO of a
+# kata-qemu sandbox (container rootfs + every Longhorn PVC mount,
+# e.g. a dind /var/lib/docker) serializes through ONE thread. Under a
+# sustained fsync burst against an r>=2 Longhorn volume that thread
+# saturates for minutes; any kata-agent RPC that touches virtio-fs
+# blocks behind it, the shim's agent health ping (CheckRequest) times
+# out, and the shim kills the (perfectly healthy) VM. A 16-thread pool
+# keeps agent-touched IO out of the write burst's convoy.
+- name: Widen virtiofsd thread pool for kata-qemu (IO wedge fix)
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+    regexp: '^virtio_fs_extra_args\s*='
+    line: 'virtio_fs_extra_args = ["--thread-pool-size=16", "--announce-submounts"]'
+  when: k7_has_longhorn
+  tags: ['kata', 'config']
+
+# Core stamps io.katacontainers.config.hypervisor.default_memory on
+# kata sandboxes with a memory limit; kata rejects the whole pod
+# ("annotation ... is not enabled") unless the annotation is
+# allowlisted here. Found in testing: `k7 create --backend kql
+# --memory 2Gi` could not create a pod at all. Tenant network limits
+# stamp the rate limiters. Nothing else: kata's stock list adds
+# virtio_fs_extra_args (host virtiofsd argv) and kernel_params.
+- name: Allow hypervisor memory annotation for kata-qemu
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+    regexp: '^enable_annotations\s*='
+    line: 'enable_annotations = ["default_memory", "rx_rate_limiter_max_rate", "tx_rate_limiter_max_rate"]'
+  when: k7_has_longhorn
+  tags: ['kata', 'config']
+
+# Same stamp/allowlist as kata-qemu above. Without this (and without
+# pod_annotations on runtimes.kata), `k7 create --backend kfd --memory`
+# silently boots the default 2048 MiB VM.
+- name: Allow hypervisor memory annotation for kata-fc
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+    regexp: '^enable_annotations\s*='
+    line: 'enable_annotations = ["default_memory", "rx_rate_limiter_max_rate", "tx_rate_limiter_max_rate"]'
+  when: k7_has_devmapper
+  tags: ['kata', 'config']
+
+# Kata ships with guest seccomp
+# bypassed, so the sandbox container's RuntimeDefault never reaches
+# guest runc. Turn the bypass off for every Kata guest (not
+# --docker-only). Fail loud if the key is missing — do not append
+# it outside [runtime].
+- name: Assert disable_guest_seccomp exists in kata-qemu config
+  ansible.builtin.command:
+    cmd: grep -E '^#?\s*disable_guest_seccomp\s*=' /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+  register: qemu_guest_seccomp
+  changed_when: false
+  failed_when: false
+  when: k7_has_longhorn
+  tags: ['kata', 'config']
+
+- name: Fail loud if kata-qemu config has no disable_guest_seccomp
+  ansible.builtin.fail:
+    msg: >-
+      configuration-qemu.toml has no disable_guest_seccomp key.
+      Refusing to leave Kata guest seccomp bypassed or to append the
+      key outside [runtime].
+  when:
+    - k7_has_longhorn
+    - qemu_guest_seccomp.rc != 0
+  tags: ['kata', 'config']
+
+- name: Enforce guest seccomp in kata-qemu guests
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-qemu.toml
+    regexp: '^#?\s*disable_guest_seccomp\s*='
+    line: 'disable_guest_seccomp = false'
+  when: k7_has_longhorn
+  tags: ['kata', 'config']
+
+- name: Assert disable_guest_seccomp exists in kata-fc config
+  ansible.builtin.command:
+    cmd: grep -E '^#?\s*disable_guest_seccomp\s*=' /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+  register: fc_guest_seccomp
+  changed_when: false
+  failed_when: false
+  when: k7_has_devmapper
+  tags: ['kata', 'config']
+
+- name: Fail loud if kata-fc config has no disable_guest_seccomp
+  ansible.builtin.fail:
+    msg: >-
+      configuration-fc.toml has no disable_guest_seccomp key.
+      Refusing to leave Kata guest seccomp bypassed or to append the
+      key outside [runtime].
+  when:
+    - k7_has_devmapper
+    - fc_guest_seccomp.rc != 0
+  tags: ['kata', 'config']
+
+- name: Enforce guest seccomp in kata-fc guests
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+    regexp: '^#?\s*disable_guest_seccomp\s*='
+    line: 'disable_guest_seccomp = false'
+  when: k7_has_devmapper
+  tags: ['kata', 'config']
+
+- name: Create containerd shim symlink
+  ansible.builtin.file:
+    src: "/opt/kata/bin/containerd-shim-kata-v2"
+    dest: "/usr/local/bin/containerd-shim-kata-v2"
+    state: link
+  tags: ['kata', 'containerd']
+
+# ------------------------------------------------------------------
+# Orphaned VMM reaper (CHALLENGES.md #6 / #28).
+#
+# kfd delete itself must kill the VMM: /usr/local/bin/k7-kata-jailer
+# strips --daemonize so Kata's recorded PID is Firecracker. This timer
+# is only a backstop for a shim that died without StopVM. It has to
+# match the versioned binary name. The jailer canonicalizes
+# /usr/local/bin/firecracker (a symlink to firecracker-v1.16.2) and
+# execs that filename, so comm is "firecracker-v1." (Linux truncates
+# to 15 bytes). An exact pgrep of the unversioned name never saw them.
+#  - firecracker: --id is 32 hex (Kata's sandbox prefix) and no
+#    containerd-shim-kata-v2 has that -id. k7d-fc's ids are vm-* / fcf-*;
+#    those VMs have no kata shim, so reaping every firecracker-* kills them.
+#  - qemu: reparented to PID 1 (qemu stays a shim child while healthy)
+# ------------------------------------------------------------------
+- name: Install orphaned VMM reaper script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/k7-vmm-reaper.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      # Reap orphaned kata VMM processes.
+      set -u
+      for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        comm=$(cat "$comm_file" 2>/dev/null || true)
+        case "$comm" in
+          firecracker|firecracker-*) ;;
+          *) continue ;;
+        esac
+        pid=${comm_file#/proc/}
+        pid=${pid%/comm}
+        id=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | awk 'prev=="--id"{print; exit} {prev=$0}')
+        [ -n "$id" ] || continue
+        # Kata only. k7d-fc Firecracker ids look like vm-22528-172 / fcf-22528-24.
+        if [[ ! "$id" =~ ^[0-9a-f]{32}$ ]]; then
+          continue
+        fi
+        if ! pgrep -f -- "containerd-shim-kata-v2.*-id ${id}" >/dev/null; then
+          echo "reaping orphaned firecracker pid=$pid comm=$comm id=$id (no kata shim)"
+          kill -9 "$pid" || true
+        fi
+      done
+      for pid in $(pgrep -f 'qemu-system'); do
+        ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo "")
+        if [ "$ppid" = "1" ]; then
+          echo "reaping orphaned qemu pid=$pid (reparented to init — kata shim gone)"
+          kill -9 "$pid" || true
+        fi
+      done
+  when: k7_has_devmapper or k7_has_longhorn
+  tags: ['kata', 'reaper']
+
+- name: Install VMM reaper systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/k7-vmm-reaper.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Reap orphaned kata VMM processes
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/k7-vmm-reaper.sh
+  when: k7_has_devmapper or k7_has_longhorn
+  tags: ['kata', 'reaper']
+
+- name: Install VMM reaper systemd timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/k7-vmm-reaper.timer
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Run the k7 VMM reaper every minute
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=1min
+
+      [Install]
+      WantedBy=timers.target
+  when: k7_has_devmapper or k7_has_longhorn
+  tags: ['kata', 'reaper']
+
+- name: Enable and start VMM reaper timer
+  ansible.builtin.systemd:
+    name: k7-vmm-reaper.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: k7_has_devmapper or k7_has_longhorn
+  tags: ['kata', 'reaper']
+
+- name: Ensure /opt/kata/share/kata-containers exists
+  ansible.builtin.file:
+    path: /opt/kata/share/kata-containers
+    state: directory
+    mode: '0755'
+  tags: ['kata']
+
+# ------------------------------------------------------------------
+# Kata kernel (vmlinux.container) — only needed for FC backend
+# ------------------------------------------------------------------
+- name: Check if vmlinux.container already exists (provided by kata-static)
+  ansible.builtin.stat:
+    path: /opt/kata/share/kata-containers/vmlinux.container
+  register: kata_kernel
+  when: k7_has_devmapper
+  tags: ['kata']
+
+# kata-static ships the guest kernel; the release has no separate
+# vmlinux.container asset to fetch (checked for 3.24.0).
+- name: Fail when kata-static did not ship vmlinux.container
+  ansible.builtin.fail:
+    msg: >-
+      /opt/kata/share/kata-containers/vmlinux.container is missing after
+      installing kata-static {{ kata_version }}.
+  when:
+    - k7_has_devmapper
+    - not kata_kernel.stat.exists
+  tags: ['kata']
+
+- name: Ensure kernel path is configured in configuration-fc.toml
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+    regexp: '^#?\s*kernel\s*='
+    line: 'kernel = "/opt/kata/share/kata-containers/vmlinux.container"'
+    backrefs: true
+  when: k7_has_devmapper
+  tags: ['kata']
+
+- name: Ensure image path is configured in configuration-fc.toml
+  ansible.builtin.lineinfile:
+    path: /opt/kata/share/defaults/kata-containers/configuration-fc.toml
+    regexp: '^#?\s*image\s*='
+    line: 'image = "/opt/kata/share/kata-containers/kata-containers.img"'
+    backrefs: true
+  when: k7_has_devmapper
+  tags: ['kata']
